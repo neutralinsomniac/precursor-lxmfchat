@@ -1,0 +1,16 @@
+[package]
+name = "reticulum-host-client"
+version = "0.1.0"
+edition = "2021"
+description = "Host (std) Reticulum/LXMF client used to interop-test the portable core against real rnsd"
+
+# Standalone workspace so it builds fast on the host without pulling in the
+# whole xous-core workspace. Uses path deps into the portable crates.
+[workspace]
+
+[dependencies]
+reticulum-core = { path = "../xous-core/libs/reticulum-core" }
+lxmf = { path = "../xous-core/libs/lxmf" }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+log = "0.4"
+env_logger = "0.11"
