@@ -452,7 +452,13 @@ pub fn server(
             Some(ChatOp::DialogueSave) => {
                 log::info!("ChatOp::DialogueSave");
                 ui.dialogue_save().expect("failed to save Dialogue");
-                ui.dialogue_read().expect("failed to read Dialogue");
+                // Reload from disk to canonicalize + reposition the view. This is
+                // best-effort: the in-memory dialogue was just saved and is already
+                // correct, so a read-back failure (e.g. a transient PDDB glitch) is
+                // NOT fatal — keep the in-memory copy rather than crashing.
+                if let Err(e) = ui.dialogue_read() {
+                    log::warn!("dialogue read-back after save failed (keeping in-memory copy): {e}");
+                }
                 if allow_redraw {
                     ui.redraw().expect("CHAT couldn't redraw");
                 }

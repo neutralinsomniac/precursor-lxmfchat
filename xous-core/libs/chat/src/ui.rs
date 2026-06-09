@@ -199,42 +199,40 @@ impl Ui {
                 return Err(Error::new(ErrorKind::InvalidData, "missing"));
             }
         };
-        let mut bytes = [0u8; dialogue::MAX_BYTES + 2];
-        let pos = match pddb_key.read(&mut bytes) {
-            Ok(pos) => pos,
-            Err(e) => {
-                log::warn!("failed to read {}: {e}", key);
-                return Err(Error::new(ErrorKind::InvalidData, "unreadable"));
-            }
-        };
+        // Read the WHOLE value (a single `read` can return a short read, which the
+        // envelope check below would then mis-flag as corrupt). Bound it so a
+        // pathologically large key can't blow the heap.
+        let mut buf = Vec::new();
+        let cap = (dialogue::MAX_BYTES + dialogue::ENVELOPE_HEADER + 2) as u64;
+        if let Err(e) = (&mut pddb_key).take(cap).read_to_end(&mut buf) {
+            log::warn!("failed to read {}: {e}", key);
+            return Err(Error::new(ErrorKind::InvalidData, "unreadable"));
+        }
+        let pos = buf.len();
 
         // Validate the envelope (MAGIC | len | crc | body) before trusting any of
-        // it. A failure here means the value is legacy (pre-envelope), truncated,
-        // stale-tailed, or otherwise corrupt — none of which can be fed to rkyv's
-        // unchecked accessor (it would read a bogus length and abort with a huge
-        // allocation on every launch). Delete it (a shorter rewrite would not
-        // shrink the key) and report unreadable; `dialogue_set` then creates a
-        // fresh empty thread, recovering the app without a PDDB wipe. Only this
-        // one thread's history is lost.
-        let valid = pos >= dialogue::ENVELOPE_HEADER && bytes[..4] == dialogue::ENVELOPE_MAGIC && {
-            let len = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
-            let crc = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        // it. A failure means the value is legacy (pre-envelope), truncated, or
+        // otherwise corrupt — none of which can be fed to rkyv's unchecked accessor
+        // (it would read a bogus length and abort). On failure we DON'T touch
+        // `self.dialogue` or delete the key: the caller decides — `dialogue_set`
+        // overwrites it with a fresh empty thread (delete-then-write), while a
+        // post-save read-back simply keeps the (correct) in-memory copy it just
+        // saved, so a transient read glitch can't lose data.
+        let valid = pos >= dialogue::ENVELOPE_HEADER && buf[..4] == dialogue::ENVELOPE_MAGIC && {
+            let len = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+            let crc = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
             let end = dialogue::ENVELOPE_HEADER + len;
             end <= pos
                 && len <= dialogue::MAX_BYTES
-                && dialogue::checksum(&bytes[dialogue::ENVELOPE_HEADER..end]) == crc
+                && dialogue::checksum(&buf[dialogue::ENVELOPE_HEADER..end]) == crc
         };
         if !valid {
-            log::warn!("Dialogue {dict}:{key} failed envelope validation ({pos} bytes) — resetting it");
-            self.dialogue = None;
-            drop(pddb_key);
-            self.pddb.delete_key(&dict, &key, None).ok();
-            self.pddb.sync().ok();
+            log::warn!("Dialogue {dict}:{key} failed envelope validation ({pos} bytes)");
             return Err(Error::new(ErrorKind::InvalidData, "corrupt dialogue"));
         }
 
-        let len = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
-        let body = &bytes[dialogue::ENVELOPE_HEADER..dialogue::ENVELOPE_HEADER + len];
+        let len = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+        let body = &buf[dialogue::ENVELOPE_HEADER..dialogue::ENVELOPE_HEADER + len];
         // Safe: the checksum guarantees `body` is exactly what we serialized.
         let archive = unsafe { rkyv::access_unchecked::<dialogue::ArchivedDialogue>(body) };
         self.dialogue = match rkyv::deserialize::<Dialogue, rkyv::rancor::Error>(archive) {
@@ -273,10 +271,13 @@ impl Ui {
                 // the app after a bubble's mark shrank (e.g. "○" 3B → "»" 2B).
                 self.pddb.delete_key(&dict, &key, None).ok();
                 match self.pddb.get(&dict, &key, None, true, true, Some(val.len()), None::<fn()>) {
-                    Ok(mut pddb_key) => match pddb_key.write(&val) {
-                        Ok(len) => {
+                    // write_all (not write): a single `write` may be a short write,
+                    // which would truncate the stored value and fail the reader's
+                    // envelope check.
+                    Ok(mut pddb_key) => match pddb_key.write_all(&val).and_then(|_| pddb_key.flush()) {
+                        Ok(()) => {
                             self.pddb.sync().ok();
-                            log::info!("Wrote {} bytes to {}:{}", len, dict, key);
+                            log::info!("Wrote {} bytes to {}:{}", val.len(), dict, key);
                         }
                         Err(e) => log::warn!("Error writing {}:{}: {:?}", dict, key, e),
                     },
