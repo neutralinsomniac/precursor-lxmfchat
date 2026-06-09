@@ -117,6 +117,11 @@ pub enum Event {
     /// `packet_hash` matches the value returned by [`Transport::make_link_data`],
     /// so the caller can mark that specific message delivered.
     Delivered { packet_hash: [u8; 32] },
+    /// Decrypted DATA received on an outbound link **we** initiated — e.g. a
+    /// propagation node responding to a sync request. `context` distinguishes a
+    /// `RESPONSE` from the `RESOURCE_ADV` / `RESOURCE` / `RESOURCE_HMU` transfer
+    /// packets; the app's sync client / Resource receiver dispatches on it.
+    OutLinkData { link_id: [u8; TRUNCATED_HASHLENGTH], context: u8, plaintext: Vec<u8> },
     /// A DATA packet addressed to us that we could not decrypt.
     DataUndecryptable { destination_hash: [u8; TRUNCATED_HASHLENGTH], reason: &'static str },
     /// A non-DATA packet addressed to one of our destinations that we don't yet
@@ -397,6 +402,19 @@ impl Transport {
             };
         }
 
+        // 0b-2. Decrypted DATA on an established outbound link — a response or a
+        // resource-transfer packet from a node we're syncing from. RNS link-
+        // decrypts every context, so we do too, and surface it by context for the
+        // app's sync client / Resource receiver to dispatch.
+        if packet.packet_type == PACKET_DATA && self.out_links.contains_key(&packet.destination_hash) {
+            let lid = packet.destination_hash;
+            let key = self.out_links[&lid].key;
+            return match link::decrypt(&key, &packet.data) {
+                Ok(plaintext) => Event::OutLinkData { link_id: lid, context: packet.context, plaintext },
+                Err(reason) => Event::DataUndecryptable { destination_hash: lid, reason },
+            };
+        }
+
         // 0c. Delivery proof for an opportunistic packet we sent (the recipient's
         // LXMF layer proves every delivered packet). Addressed to the truncated
         // packet hash; validated against the recipient's identity.
@@ -671,6 +689,32 @@ impl Transport {
         self.insert_receipt(packet_hash, *link_id);
         Some((packet.encode(), packet_hash))
     }
+
+    /// Identify ourselves over an established outbound link (`LINKIDENTIFY`), so a
+    /// propagation node knows which stored messages are ours. `iv` is fresh random.
+    pub fn make_out_link_identify(
+        &self,
+        link_id: &[u8; TRUNCATED_HASHLENGTH],
+        iv: &[u8; IV_LENGTH],
+    ) -> Option<Vec<u8>> {
+        let key = self.out_links.get(link_id)?.key;
+        link::make_identify(link_id, &key, &self.identity, iv).ok()
+    }
+
+    /// Build an encrypted DATA packet with an arbitrary `context` on an established
+    /// outbound link — for sending RNS requests (`REQUEST`), resource part requests
+    /// (`RESOURCE_REQ`), and resource proofs (`RESOURCE_PRF`) while syncing from a
+    /// propagation node. `iv` is fresh random. None if the link isn't established.
+    pub fn make_out_link_context(
+        &self,
+        link_id: &[u8; TRUNCATED_HASHLENGTH],
+        context: u8,
+        plaintext: &[u8],
+        iv: &[u8; IV_LENGTH],
+    ) -> Option<Vec<u8>> {
+        let key = self.out_links.get(link_id)?.key;
+        link::make_link_context_packet(link_id, &key, context, plaintext, iv).ok()
+    }
 }
 
 #[cfg(test)]
@@ -768,6 +812,21 @@ mod tests {
         match initiator.handle_frame(&receipt, &mut eph) {
             Event::Delivered { packet_hash: ph } => assert_eq!(ph, packet_hash),
             _ => panic!("expected delivered"),
+        }
+
+        // 5. The peer sends a RESPONSE-context packet on the link (as a propagation
+        //    node would when answering a sync request): the initiator surfaces it
+        //    as OutLinkData with the context preserved and the plaintext decrypted.
+        let key = responder.links[&lid].key; // both sides hold the same session key
+        let resp = link::make_link_context_packet(&lid, &key, CONTEXT_RESPONSE, b"sync payload", &[4u8; IV_LENGTH])
+            .expect("response packet");
+        match initiator.handle_frame(&resp, &mut eph) {
+            Event::OutLinkData { link_id, context, plaintext } => {
+                assert_eq!(link_id, lid);
+                assert_eq!(context, CONTEXT_RESPONSE);
+                assert_eq!(plaintext, b"sync payload");
+            }
+            other => panic!("expected out-link data, got {:?}", core::mem::discriminant(&other)),
         }
     }
 

@@ -373,6 +373,11 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
         Event::Delivered { packet_hash } => {
             mark_delivered(shared, chat_cid, pddb, &packet_hash);
         }
+        // Response / resource-transfer data on a link we opened (propagation-node
+        // sync). Dispatched by the sync client (task #19); logged for now.
+        Event::OutLinkData { link_id, context, plaintext } => {
+            log::info!("out-link {} data ctx=0x{:02x} ({} bytes)", hex(&link_id), context, plaintext.len());
+        }
         Event::DataUndecryptable { destination_hash, reason } => {
             // Log-only — NEVER a persisted post. A repeated undecryptable packet
             // (stale ratchet, retransmit, AP-hub cross-traffic) would otherwise
