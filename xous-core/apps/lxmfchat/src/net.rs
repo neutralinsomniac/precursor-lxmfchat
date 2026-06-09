@@ -146,6 +146,13 @@ pub struct SyncState {
     /// pump thread, so the actual link + hub writes never run on the main thread
     /// (a blocking hub write there would freeze the whole UI).
     requested: bool,
+    /// Earliest time the sync thread should act on `requested` — the retry
+    /// backoff while we wait for the node's key/route to resolve.
+    next_attempt: u64,
+    /// Times a requested sync was deferred for want of the node's key/route.
+    /// Bounded by [`SYNC_ROUTE_TRIES`] so an unreachable node fails visibly
+    /// instead of "finding the propagation node…" forever.
+    route_tries: u8,
 }
 
 impl SyncState {
@@ -157,6 +164,8 @@ impl SyncState {
             deadline: 0,
             auto_done: false,
             requested: false,
+            next_attempt: 0,
+            route_tries: 0,
         }
     }
 }
@@ -291,6 +300,15 @@ pub fn connection_manager(shared: Arc<Shared>, chat_cid: CID) {
                         request_propagation_path(&shared, &trng);
                         read_until_closed(&shared, chat_cid, &pddb, &trng, reader);
                         *shared.writer.lock().unwrap() = None;
+                        // The hub routes link traffic and proofs by interface
+                        // session: every link / pending request / receipt is dead
+                        // after a reconnect. Drop them so nothing reuses a link
+                        // the hub can no longer route responses back on.
+                        shared.transport.lock().unwrap().connection_reset();
+                        let sync_active = { shared.sync.lock().unwrap().phase != SyncPhase::Idle };
+                        if sync_active {
+                            sync_finish(&shared, chat_cid, "connection lost — try again");
+                        }
                         chat::cf_set_status_text(chat_cid, "hub connection lost — reconnecting…");
                     }
                     Err(e) => {
@@ -438,6 +456,19 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
         // sync): drive the sync state machine.
         Event::OutLinkData { link_id, context, plaintext } => {
             sync_on_outlink_data(shared, chat_cid, pddb, trng, link_id, context, plaintext);
+        }
+        // The responder closed a link we initiated (transport already forgot it).
+        // If a sync was mid-flight on it, abort now and let the user retry over a
+        // fresh link instead of waiting out the 2-minute watchdog.
+        Event::OutLinkClosed { link_id } => {
+            log::info!("outbound link {} closed by responder", hex(&link_id));
+            let sync_was_on_it = {
+                let s = shared.sync.lock().unwrap();
+                s.phase != SyncPhase::Idle && s.link_id == Some(link_id)
+            };
+            if sync_was_on_it {
+                sync_finish(shared, chat_cid, "node closed the link — try again");
+            }
         }
         Event::DataUndecryptable { destination_hash, reason } => {
             // Log-only — NEVER a persisted post. A repeated undecryptable packet
@@ -667,10 +698,18 @@ fn write_to_hub(shared: &Arc<Shared>, raw: &[u8]) {
 
 /// LXMF `/get` request path; its hash selects the node's message-get handler.
 const SYNC_GET_PATH: &[u8] = b"/get";
-/// Per-transfer message size limit we advertise (KB) — LXMF `DELIVERY_LIMIT`.
-const SYNC_DELIVERY_LIMIT: i64 = 1000;
+/// Per-transfer message size limit we advertise (KB). LXMF's default is 1000, but
+/// our Resource receiver is single-segment only (no hashmap updates): ~74 parts ≈
+/// 31 KB max. Advertise less than that so the node trims each batch to what we
+/// can actually receive — anything left over comes on the next sync.
+const SYNC_DELIVERY_LIMIT: i64 = 28;
 /// Abort a sync that stalls past this many seconds.
 const SYNC_DEADLINE_SECS: u64 = 120;
+/// Retry cadence and bound while a requested sync waits for the propagation
+/// node's key/route (a path request is in flight): every 3 s, up to 20 tries
+/// (~1 min), then fail visibly.
+const SYNC_ROUTE_RETRY_SECS: u64 = 3;
+const SYNC_ROUTE_TRIES: u8 = 20;
 
 /// Begin a propagation-node sync (from the menu or auto on first connect). Ensures
 /// the node's key + route, (re)uses or opens the link, and kicks the exchange.
@@ -690,46 +729,80 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         let tp = shared.transport.lock().unwrap();
         (tp.known(&pn).cloned(), tp.has_path(&pn))
     };
+    let now = now_secs();
     let known = match (known, have_path) {
         (Some(k), true) => k,
         _ => {
+            // No key/route for the node yet: fire a path request and RE-ARM the
+            // request flag so the sync thread retries once the response lands —
+            // consuming the flag here with no retry left the status stuck at
+            // "finding…" forever. Bounded so an unreachable node fails visibly.
+            let give_up = {
+                let mut s = shared.sync.lock().unwrap();
+                s.route_tries = s.route_tries.saturating_add(1);
+                if s.route_tries <= SYNC_ROUTE_TRIES {
+                    s.requested = true;
+                    s.next_attempt = now + SYNC_ROUTE_RETRY_SECS;
+                    false
+                } else {
+                    true
+                }
+            };
+            if give_up {
+                sync_finish(shared, chat_cid, "no route to the propagation node");
+                return;
+            }
             // Status BEFORE the hub write, so it shows even if the write stalls.
             chat::cf_set_status_text_forced(chat_cid, "sync: finding the propagation node…");
             request_peer_key(shared, trng, &pn);
             return;
         }
     };
-    let now = now_secs();
     {
         let mut s = shared.sync.lock().unwrap();
         s.phase = SyncPhase::Linking;
         s.receiver = None;
         s.deadline = now + SYNC_DEADLINE_SECS;
         s.link_id = None;
+        s.route_tries = 0;
+        s.next_attempt = 0;
     }
-    match { shared.transport.lock().unwrap().outbound_link_for(&pn) } {
+    match { shared.transport.lock().unwrap().outbound_link_for(&pn, now) } {
         Some(lid) => {
             shared.sync.lock().unwrap().link_id = Some(lid);
             sync_send_identify_and_list(shared, chat_cid, trng, lid);
         }
         None => {
             chat::cf_set_status_text_forced(chat_cid, "sync: contacting propagation node…");
-            let raw = {
-                let mut tp = shared.transport.lock().unwrap();
-                if tp.pending_link_to(&pn) {
-                    None
-                } else {
-                    let mut ex = [0u8; KEY_HALF];
-                    let mut ed = [0u8; KEY_HALF];
-                    crate::fill_random(trng, &mut ex);
-                    crate::fill_random(trng, &mut ed);
-                    Some(tp.make_link_request(&pn, &known.identity, &ex, &ed).0)
-                }
-            };
-            if let Some(raw) = raw {
-                write_to_hub(shared, &raw);
-            }
+            send_pn_link_request(shared, trng, &pn, &known.identity, now);
         }
+    }
+}
+
+/// Send a LINKREQUEST to the propagation node unless one is already pending and
+/// recent (expired pending entries are pruned by `pending_link_to`, which is what
+/// lets a lost request be retried at all).
+fn send_pn_link_request(
+    shared: &Arc<Shared>,
+    trng: &Trng,
+    pn: &[u8; TRUNCATED_HASHLENGTH],
+    pn_identity: &reticulum_core::identity::PublicIdentity,
+    now: u64,
+) {
+    let raw = {
+        let mut tp = shared.transport.lock().unwrap();
+        if tp.pending_link_to(pn, now) {
+            None
+        } else {
+            let mut ex = [0u8; KEY_HALF];
+            let mut ed = [0u8; KEY_HALF];
+            crate::fill_random(trng, &mut ex);
+            crate::fill_random(trng, &mut ed);
+            Some(tp.make_link_request(pn, pn_identity, &ex, &ed, now).0)
+        }
+    };
+    if let Some(raw) = raw {
+        write_to_hub(shared, &raw);
     }
 }
 
@@ -831,10 +904,15 @@ fn sync_on_outlink_data(
             if !complete {
                 return;
             }
+            // The receiver can vanish between these lock acquisitions (the sync
+            // thread's watchdog may sync_finish a stalled sync at any moment), so
+            // never unwrap it — bail out instead of panicking the read thread.
             let (stream, encrypted) = {
                 let s = shared.sync.lock().unwrap();
-                let rx = s.receiver.as_ref().unwrap();
-                (rx.concat(), rx.encrypted())
+                match s.receiver.as_ref() {
+                    Some(rx) => (rx.concat(), rx.encrypted()),
+                    None => return,
+                }
             };
             let plain = if encrypted {
                 match { shared.transport.lock().unwrap().decrypt_out_link(&link_id, &stream) } {
@@ -847,7 +925,13 @@ fn sync_on_outlink_data(
             } else {
                 stream
             };
-            let finished = { shared.sync.lock().unwrap().receiver.as_ref().unwrap().finish(&plain) };
+            let finished = {
+                let s = shared.sync.lock().unwrap();
+                match s.receiver.as_ref() {
+                    Some(rx) => rx.finish(&plain),
+                    None => return,
+                }
+            };
             match finished {
                 Ok((payload, proof)) => {
                     if let Some(raw) = { shared.transport.lock().unwrap().make_out_link_resource_proof(&link_id, &proof) } {
@@ -941,13 +1025,22 @@ fn deliver_synced_message(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng
     deliver_lxmf(shared, chat_cid, pddb, trng, &full, false); // synced: batch-buzz instead
 }
 
-/// End the current sync (success or failure) and reset the state machine.
+/// End the current sync (success or failure) and reset the state machine. The
+/// link to the node is dropped either way — sync links are one-shot (mirrors the
+/// reference client): on failure the link is suspect (a timeout usually MEANS
+/// it's dead), and we send no keepalives, so a kept link would quietly die and
+/// hang the next sync. Establishment is cheap relative to a 2-minute hang.
 fn sync_finish(shared: &Arc<Shared>, chat_cid: CID, msg: &str) {
-    {
+    let link = {
         let mut s = shared.sync.lock().unwrap();
         s.phase = SyncPhase::Idle;
-        s.link_id = None;
         s.receiver = None;
+        s.requested = false;
+        s.route_tries = 0;
+        s.link_id.take()
+    };
+    if let Some(lid) = link {
+        shared.transport.lock().unwrap().drop_out_link(&lid);
     }
     let line = format!("sync: {msg}");
     // Persist the result as idle text (so it stays after the transient paint) AND
@@ -1073,20 +1166,39 @@ fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         Some(p) => p,
         None => return,
     };
+    let now = now_secs();
     // Time out a stuck sync.
     let stalled = {
         let s = shared.sync.lock().unwrap();
-        s.phase != SyncPhase::Idle && now_secs() > s.deadline
+        s.phase != SyncPhase::Idle && now > s.deadline
     };
     if stalled {
         sync_finish(shared, chat_cid, "timed out");
         return;
     }
-    // A manual sync request (from the menu) is executed HERE — on the pump thread
+    // Mid-sync, still waiting for the link: if the LINKREQUEST was lost (its
+    // pending entry expired with no proof), send a fresh one — otherwise a single
+    // lost request used to mean nothing more ever went out and the sync just sat
+    // until the watchdog. `send_pn_link_request` no-ops while one is still pending.
+    let linking = { shared.sync.lock().unwrap().phase == SyncPhase::Linking };
+    if linking {
+        let known = { shared.transport.lock().unwrap().known(&pn).cloned() };
+        if let Some(k) = known {
+            send_pn_link_request(shared, trng, &pn, &k.identity, now);
+        }
+        return;
+    }
+    // A manual sync request (from the menu) is executed HERE — on the sync thread
     // — never on the main thread, so a blocking hub write can't freeze the UI.
+    // `next_attempt` is the backoff while the node's route is being resolved.
     let requested = {
         let mut s = shared.sync.lock().unwrap();
-        core::mem::replace(&mut s.requested, false)
+        if s.requested && now >= s.next_attempt {
+            s.requested = false;
+            true
+        } else {
+            false
+        }
     };
     if requested {
         start_sync(shared, chat_cid, trng); // handles not-ready / already-running itself
@@ -1267,27 +1379,13 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                     i += 1;
                     continue;
                 }
-                let link = { shared.transport.lock().unwrap().outbound_link_for(&target) };
+                let link = { shared.transport.lock().unwrap().outbound_link_for(&target, now) };
                 let link = match link {
                     Some(l) => l,
                     None => {
-                        let raw = {
-                            let mut tp = shared.transport.lock().unwrap();
-                            if tp.pending_link_to(&target) {
-                                None
-                            } else {
-                                let mut ex = [0u8; KEY_HALF];
-                                let mut ed = [0u8; KEY_HALF];
-                                crate::fill_random(trng, &mut ex);
-                                crate::fill_random(trng, &mut ed);
-                                Some(tp.make_link_request(&target, &known.identity, &ex, &ed).0)
-                            }
-                        };
-                        if let Some(raw) = raw {
-                            write_to_hub(shared, &raw);
-                            let label = peer_label(shared, &outbox[i].peer);
-                            chat::cf_set_status_text(chat_cid, &format!("{label}: contacting propagation node…"));
-                        }
+                        send_pn_link_request(shared, trng, &target, &known.identity, now);
+                        let label = peer_label(shared, &outbox[i].peer);
+                        chat::cf_set_status_text(chat_cid, &format!("{label}: contacting propagation node…"));
                         outbox[i].next_action = now + LINK_RETRY;
                         i += 1;
                         continue;

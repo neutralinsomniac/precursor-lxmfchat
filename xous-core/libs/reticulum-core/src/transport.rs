@@ -28,6 +28,15 @@ const MAX_LINKS: usize = 64;
 const MAX_OUT_LINKS: usize = 32;
 const MAX_PENDING_OUT: usize = 32;
 const MAX_RECEIPTS: usize = 64;
+/// A LINKREQUEST that hasn't been proven within this window is considered lost;
+/// `pending_link_to` stops reporting it so the caller sends a fresh request.
+/// Generous vs. real link establishment (a few RTTs, ≤ ~15 s on a slow hub).
+const PENDING_LINK_EXPIRY_SECS: u64 = 20;
+/// Established outbound links older than this are dropped instead of reused. We
+/// send no link keepalives, so the responder tears an idle link down after a few
+/// minutes (silently, from our perspective, if its LINKCLOSE doesn't reach us) —
+/// reusing it then means every packet vanishes until the sync watchdog fires.
+const OUT_LINK_EXPIRY_SECS: u64 = 300;
 
 use crate::announce::{ParsedAnnounce, build_announce, parse_and_validate, random_hash};
 use crate::constants::*;
@@ -53,6 +62,9 @@ struct PendingOut {
     target: [u8; TRUNCATED_HASHLENGTH],
     eph_secret: [u8; KEY_HALF],
     identity: PublicIdentity,
+    /// When the LINKREQUEST was sent; expired entries (no LRPROOF within
+    /// `PENDING_LINK_EXPIRY_SECS`) are pruned so a lost request can be retried.
+    created: u64,
 }
 
 /// An established outbound link, reusable for further messages to `target`.
@@ -61,6 +73,9 @@ struct OutLink {
     key: [u8; DERIVED_KEY_LENGTH],
     /// The peer's identity, to validate the packet proofs (receipts) it returns.
     identity: PublicIdentity,
+    /// When the link was requested; stale links (past `OUT_LINK_EXPIRY_SECS`) are
+    /// dropped by `outbound_link_for` instead of reused (see the const's note).
+    created: u64,
 }
 
 /// A sent opportunistic packet awaiting its delivery proof. The recipient's LXMF
@@ -122,6 +137,10 @@ pub enum Event {
     /// `RESPONSE` from the `RESOURCE_ADV` / `RESOURCE` / `RESOURCE_HMU` transfer
     /// packets; the app's sync client / Resource receiver dispatches on it.
     OutLinkData { link_id: [u8; TRUNCATED_HASHLENGTH], context: u8, plaintext: Vec<u8> },
+    /// The responder closed an outbound link we initiated (LINKCLOSE). The link
+    /// has been forgotten; anything mid-flight on it (e.g. a sync) should abort
+    /// and re-establish rather than wait out its timeout.
+    OutLinkClosed { link_id: [u8; TRUNCATED_HASHLENGTH] },
     /// A DATA packet addressed to us that we could not decrypt.
     DataUndecryptable { destination_hash: [u8; TRUNCATED_HASHLENGTH], reason: &'static str },
     /// A non-DATA packet addressed to one of our destinations that we don't yet
@@ -366,7 +385,8 @@ impl Transport {
             return match link::complete_handshake(&lid, &pend.eph_secret, &packet.data, &pend.identity) {
                 Some(key) => {
                     let target = pend.target;
-                    self.insert_out_link(lid, OutLink { target, key, identity: pend.identity });
+                    let created = pend.created;
+                    self.insert_out_link(lid, OutLink { target, key, identity: pend.identity, created });
                     Event::OutboundLinkUp { link_id: lid, target }
                 }
                 None => Event::Dropped("invalid LRPROOF for initiated link"),
@@ -417,6 +437,15 @@ impl Transport {
             }
             let key = self.out_links[&lid].key;
             return match link::decrypt(&key, &packet.data) {
+                // The responder tore the link down (RNS sends the link id,
+                // encrypted, as the LINKCLOSE payload). Forget the link so it
+                // can't be reused — every packet on it would silently vanish.
+                Ok(plaintext)
+                    if packet.context == CONTEXT_LINKCLOSE && plaintext.as_slice() == &lid[..] =>
+                {
+                    self.remove_out_link(&lid);
+                    Event::OutLinkClosed { link_id: lid }
+                }
                 Ok(plaintext) => Event::OutLinkData { link_id: lid, context: packet.context, plaintext },
                 Err(reason) => Event::DataUndecryptable { destination_hash: lid, reason },
             };
@@ -635,15 +664,17 @@ impl Transport {
 
     /// Begin opening a link to `target` (whose `peer_identity` we know from its
     /// announce/contact). `eph_x25519`/`eph_ed25519` are fresh random 32-byte
-    /// values (the TRNG on device). Records the pending link and returns the
-    /// encoded LINKREQUEST plus its link id. The link becomes usable when the
-    /// matching LRPROOF arrives (surfaced as [`Event::OutboundLinkUp`]).
+    /// values (the TRNG on device); `now` is the current unix time, recorded so a
+    /// lost request expires instead of blocking retries forever. Records the
+    /// pending link and returns the encoded LINKREQUEST plus its link id. The link
+    /// becomes usable when the matching LRPROOF arrives ([`Event::OutboundLinkUp`]).
     pub fn make_link_request(
         &mut self,
         target: &[u8; TRUNCATED_HASHLENGTH],
         peer_identity: &PublicIdentity,
         eph_x25519: &[u8; KEY_HALF],
         eph_ed25519: &[u8; KEY_HALF],
+        now: u64,
     ) -> (Vec<u8>, [u8; TRUNCATED_HASHLENGTH]) {
         let (raw, link_id) = link::initiate_request(target, eph_x25519, eph_ed25519);
         // The link request is addressed to the destination hash, so it must be
@@ -653,20 +684,84 @@ impl Transport {
         let raw = self.apply_transport(target, raw);
         self.insert_pending_out(
             link_id,
-            PendingOut { target: *target, eph_secret: *eph_x25519, identity: peer_identity.clone() },
+            PendingOut {
+                target: *target,
+                eph_secret: *eph_x25519,
+                identity: peer_identity.clone(),
+                created: now,
+            },
         );
         (raw, link_id)
     }
 
-    /// An established outbound link to `target`, if one exists (for reuse).
-    pub fn outbound_link_for(&self, target: &[u8; TRUNCATED_HASHLENGTH]) -> Option<[u8; TRUNCATED_HASHLENGTH]> {
+    /// An established, still-fresh outbound link to `target`, if one exists (for
+    /// reuse). Links past `OUT_LINK_EXPIRY_SECS` are dropped, not returned: the
+    /// responder has almost certainly torn an idle link down by then (we send no
+    /// keepalives), and packets on a dead link vanish without any error.
+    pub fn outbound_link_for(
+        &mut self,
+        target: &[u8; TRUNCATED_HASHLENGTH],
+        now: u64,
+    ) -> Option<[u8; TRUNCATED_HASHLENGTH]> {
+        let expired: Vec<[u8; TRUNCATED_HASHLENGTH]> = self
+            .out_links
+            .iter()
+            .filter(|(_, l)| now > l.created.saturating_add(OUT_LINK_EXPIRY_SECS))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            self.remove_out_link(&id);
+        }
         self.out_links.iter().find(|(_, l)| l.target == *target).map(|(id, _)| *id)
     }
 
-    /// True if we already have a link to `target` pending establishment (so the
-    /// caller can avoid sending a duplicate request).
-    pub fn pending_link_to(&self, target: &[u8; TRUNCATED_HASHLENGTH]) -> bool {
+    /// True if a link to `target` is pending establishment and its request is
+    /// recent enough that an LRPROOF may still arrive (so the caller avoids a
+    /// duplicate request). Expired pending entries are pruned here, which is what
+    /// lets a *lost* LINKREQUEST be retried at all.
+    pub fn pending_link_to(&mut self, target: &[u8; TRUNCATED_HASHLENGTH], now: u64) -> bool {
+        let expired: Vec<[u8; TRUNCATED_HASHLENGTH]> = self
+            .pending_out
+            .iter()
+            .filter(|(_, p)| now > p.created.saturating_add(PENDING_LINK_EXPIRY_SECS))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            self.pending_out.remove(&id);
+            self.pending_out_order.retain(|i| i != &id);
+        }
         self.pending_out.values().any(|p| p.target == *target)
+    }
+
+    /// Forget an established outbound link (e.g. after a sync on it times out —
+    /// the timeout usually means the link is dead, so reusing it would just hang
+    /// the next attempt too).
+    pub fn drop_out_link(&mut self, link_id: &[u8; TRUNCATED_HASHLENGTH]) {
+        self.remove_out_link(link_id);
+    }
+
+    fn remove_out_link(&mut self, link_id: &[u8; TRUNCATED_HASHLENGTH]) {
+        self.out_links.remove(link_id);
+        self.out_links_order.retain(|i| i != link_id);
+    }
+
+    /// Drop all state scoped to the current hub connection. Call when the TCP
+    /// session to the hub drops: the hub routes link traffic and proofs back via
+    /// the *interface session* they arrived on, so every inbound/outbound link,
+    /// pending link request, and outstanding receipt is unreachable after a
+    /// reconnect — keeping them only makes later sends reuse dead links. Learned
+    /// peers (`known`) and routes (`paths`) survive; they're not session-scoped.
+    pub fn connection_reset(&mut self) {
+        self.links.clear();
+        self.links_order.clear();
+        self.pending_out.clear();
+        self.pending_out_order.clear();
+        self.out_links.clear();
+        self.out_links_order.clear();
+        self.receipts.clear();
+        self.receipts_order.clear();
+        self.opp_receipts.clear();
+        self.opp_receipts_order.clear();
     }
 
     /// Build the RTT activation packet for an established outbound link (see
@@ -807,7 +902,7 @@ mod tests {
 
         // 1. Initiator builds + sends a link request; responder accepts it.
         let peer_pub = PrivateIdentity::from_bytes(&[0x50; KEY_HALF], &[0x51; KEY_HALF]).public().clone();
-        let (req, lid) = initiator.make_link_request(&responder_dh, &peer_pub, &[1; KEY_HALF], &[2; KEY_HALF]);
+        let (req, lid) = initiator.make_link_request(&responder_dh, &peer_pub, &[1; KEY_HALF], &[2; KEY_HALF], 1000);
         let proof = match responder.handle_frame(&req, &mut eph) {
             Event::LinkEstablished { link_id, proof } => {
                 assert_eq!(link_id, lid);
@@ -825,7 +920,7 @@ mod tests {
             Event::Dropped(e) => panic!("LRPROOF dropped: {e}"),
             _ => panic!("expected outbound link up"),
         }
-        assert_eq!(initiator.outbound_link_for(&responder_dh), Some(lid));
+        assert_eq!(initiator.outbound_link_for(&responder_dh, 1001), Some(lid));
 
         // 3. Initiator sends LXMF data over the link; responder decrypts + proves.
         let (data, packet_hash) =
@@ -859,6 +954,80 @@ mod tests {
             }
             other => panic!("expected out-link data, got {:?}", core::mem::discriminant(&other)),
         }
+
+        // 6. The responder closes the link (LINKCLOSE, payload = link id): the
+        //    initiator forgets it instead of reusing a dead link.
+        let close = link::make_link_context_packet(&lid, &key, CONTEXT_LINKCLOSE, &lid, &[5u8; IV_LENGTH])
+            .expect("close packet");
+        match initiator.handle_frame(&close, &mut eph) {
+            Event::OutLinkClosed { link_id } => assert_eq!(link_id, lid),
+            other => panic!("expected out-link closed, got {:?}", core::mem::discriminant(&other)),
+        }
+        assert_eq!(initiator.outbound_link_for(&responder_dh, 1002), None);
+    }
+
+    /// A full link setup between two in-process transports, returning the
+    /// initiator, the responder's dest hash, and the established link id.
+    fn established_out_link(now: u64) -> (Transport, [u8; TRUNCATED_HASHLENGTH], [u8; TRUNCATED_HASHLENGTH]) {
+        let initiator_id = id(0x42);
+        let responder_id = id(0x52);
+        let responder_dh = single_destination_hash("lxmf", &["delivery"], &responder_id.hash());
+        let mut initiator = Transport::new(initiator_id);
+        let mut responder = Transport::new(responder_id);
+        responder.register_destination(responder_dh);
+        let mut eph = || [0xCDu8; KEY_HALF];
+        let peer_pub = PrivateIdentity::from_bytes(&[0x52; KEY_HALF], &[0x53; KEY_HALF]).public().clone();
+        let (req, lid) = initiator.make_link_request(&responder_dh, &peer_pub, &[1; KEY_HALF], &[2; KEY_HALF], now);
+        let proof = match responder.handle_frame(&req, &mut eph) {
+            Event::LinkEstablished { proof, .. } => proof,
+            _ => panic!("responder should accept the link"),
+        };
+        match initiator.handle_frame(&proof, &mut eph) {
+            Event::OutboundLinkUp { .. } => {}
+            _ => panic!("expected outbound link up"),
+        }
+        (initiator, responder_dh, lid)
+    }
+
+    #[test]
+    fn lost_link_request_expires_so_it_can_be_retried() {
+        let responder_id = id(0x52);
+        let responder_dh = single_destination_hash("lxmf", &["delivery"], &responder_id.hash());
+        let mut tp = Transport::new(id(0x42));
+        let peer_pub = PrivateIdentity::from_bytes(&[0x52; KEY_HALF], &[0x53; KEY_HALF]).public().clone();
+        let now = 1000;
+        let _ = tp.make_link_request(&responder_dh, &peer_pub, &[1; KEY_HALF], &[2; KEY_HALF], now);
+        // Recent request: still pending, callers must not duplicate it.
+        assert!(tp.pending_link_to(&responder_dh, now + 5));
+        // No LRPROOF within the expiry window: the request was lost; pending no
+        // longer reported (and pruned), so a fresh request can be sent.
+        assert!(!tp.pending_link_to(&responder_dh, now + PENDING_LINK_EXPIRY_SECS + 1));
+        assert!(tp.pending_out.is_empty(), "expired pending entry must be pruned");
+    }
+
+    #[test]
+    fn stale_out_link_is_dropped_not_reused() {
+        let now = 1000;
+        let (mut initiator, responder_dh, lid) = established_out_link(now);
+        assert_eq!(initiator.outbound_link_for(&responder_dh, now + 60), Some(lid));
+        // Past the expiry the responder has long torn the idle link down: don't
+        // hand it out for reuse, drop it so a fresh link gets established.
+        assert_eq!(initiator.outbound_link_for(&responder_dh, now + OUT_LINK_EXPIRY_SECS + 1), None);
+        assert!(initiator.out_links.is_empty(), "stale out-link must be pruned");
+    }
+
+    #[test]
+    fn connection_reset_clears_session_scoped_state() {
+        let now = 1000;
+        let (mut initiator, responder_dh, lid) = established_out_link(now);
+        // An outstanding receipt on the link, too.
+        let _ = initiator.make_link_data(&lid, b"in flight", &[3u8; IV_LENGTH]).expect("link data");
+        initiator.connection_reset();
+        assert_eq!(initiator.outbound_link_for(&responder_dh, now + 1), None);
+        assert!(!initiator.pending_link_to(&responder_dh, now + 1));
+        assert!(initiator.receipts.is_empty());
+        // Knowledge (peers/paths) is not session-scoped and must survive — checked
+        // implicitly: connection_reset doesn't touch known/paths maps.
     }
 
     #[test]

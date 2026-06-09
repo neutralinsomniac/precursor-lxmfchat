@@ -179,7 +179,7 @@ fn main() {
                                     let mut ed = [0u8; 32];
                                     rand_core::RngCore::fill_bytes(&mut OsRng, &mut ex);
                                     rand_core::RngCore::fill_bytes(&mut OsRng, &mut ed);
-                                    let (req, lid) = tp.make_link_request(&t, &known.identity, &ex, &ed);
+                                    let (req, lid) = tp.make_link_request(&t, &known.identity, &ex, &ed, now());
                                     writer.write_all(&frame(&req)).ok();
                                     writer.flush().ok();
                                     println!("sent link request to {} (link {})", reticulum_core::hex(&t), reticulum_core::hex(&lid));
@@ -254,6 +254,9 @@ fn main() {
                     }
                     Event::OutLinkData { link_id, context, plaintext } => {
                         sync_handle_outlink(&mut writer, &tp, &mut sync_phase, &mut sync_rx, &link_id, context, plaintext);
+                    }
+                    Event::OutLinkClosed { link_id } => {
+                        println!("outbound link {} closed by responder", reticulum_core::hex(&link_id));
                     }
                     Event::Unhandled { packet_type, context, .. } => {
                         log::debug!("unhandled packet type={} ctx={}", packet_type, context);
