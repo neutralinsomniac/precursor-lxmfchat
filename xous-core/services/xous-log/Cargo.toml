@@ -1,0 +1,62 @@
+[package]
+authors = ["Sean Cross <sean@xobs.io>"]
+description = "Log output program"
+edition = "2018"
+name = "xous-log"
+version = "0.1.28"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/betrusted-io/xous-core/"
+homepage = "https://betrusted.io/xous-book/"
+
+# Dependency versions enforced by Cargo.lock.
+[dependencies]
+xous-api-log = { package = "xous-api-log", version = "0.1.69" }
+xous = "0.9.70"
+xous-ipc = "0.10.10"
+log = "0.4.14"
+num-derive = { version = "0.4.2", default-features = false }
+num-traits = { version = "0.2.14", default-features = false }
+
+utralib = { version = "0.1.27", optional = true, default-features = false }
+
+# for USB serial logging
+rkyv = { version = "0.8.8", default-features = false, features = [
+    "std",
+    "alloc",
+], optional = true }
+
+bao1x-hal = { path = "../../libs/bao1x-hal", optional = true, default-features = false, features = [
+    "std",
+] }
+
+# FIXME: bring atsama5d27 target up to date so utralib dependency does not conflict
+# [target.'cfg(target_arch = "arm")'.dependencies]
+# atsama5d27 = { git = "https://github.com/Foundation-Devices/atsama5d27.git", branch = "master", features = [
+#     "lcd-console",
+# ] }
+# xous = { version = "0.9.58", features = [
+#     "v2p",
+# ] } # v2p feature is used when lcd-console feature is turned on
+
+[features]
+bao1x = ["utralib/bao1x", "bao1x-hal"]
+board-baosec = ["bao1x-hal/board-baosec"]
+board-baosor = ["bao1x-hal/board-baosor"]
+board-dabao = ["bao1x-hal/board-dabao"]
+hosted-baosec = []
+hwsim = []
+# when activated, disables the console so the kernel GDB stub can claim it.
+gdb-stub = []
+
+precursor = ["utralib/precursor"]
+hosted = ["utralib/hosted"]
+renode = ["utralib/renode"]
+atsama5d27 = ["utralib/atsama5d27"]
+
+lcd-console = []
+debugprint = []  # adding this allocates the UART for debugging the logger
+logging = []     # adding this allocates the hardware UART for console interactions
+usb = ["rkyv"]
+#default = []
+default = ["logging", "usb"]
+# default = ["debugprint", "logging"]

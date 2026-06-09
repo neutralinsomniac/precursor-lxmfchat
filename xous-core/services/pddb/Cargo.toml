@@ -1,0 +1,163 @@
+[package]
+name = "pddb"
+version = "0.1.0"
+authors = ["bunnie <bunnie@kosagi.com>"]
+edition = "2018"
+description = "Plausibly Deniable Database"
+
+# Dependency versions enforced by Cargo.lock.
+[dependencies]
+bitflags = { version = "1" }
+xous = "0.9.70"
+xous-ipc = "0.10.10"
+log-server = { package = "xous-api-log", version = "0.1.69" }
+ticktimer-server = { package = "xous-api-ticktimer", version = "0.9.70" }
+xous-names = { package = "xous-api-names", version = "0.9.71" }
+susres = { path = "../../api/xous-api-susres", package = "xous-api-susres", optional = true }
+log = "0.4.14"
+num-derive = { version = "0.4.2", default-features = false }
+num-traits = { version = "0.2.14", default-features = false }
+rkyv = { version = "0.8.8", default-features = false, features = [
+    "std",
+    "alloc",
+] }
+trng = { path = "../trng", optional = true }
+spinor = { path = "../spinor", optional = true }
+aes = { path = "../aes", default-features = false }
+root-keys = { path = "../root-keys", optional = true }
+keystore-api = { path = "../../libs/keystore-api" }
+cipher = "0.4.2"
+bitfield = "0.13.2"
+aes-gcm-siv = { version = "0.11.1", default-features = false, features = [
+    "alloc",
+    "aes",
+] }
+# aes-gcm-siv = {git="https://github.com/RustCrypto/AEADs.git", branch="master"}
+llio = { path = "../llio", optional = true }
+precursor-hal = { path = "../../libs/precursor-hal", optional = true }
+
+subtle = { version = "2.4.1", default-features = false }
+tts-frontend = { path = "../tts", optional = true }
+rand_core = "0.6.4"
+
+# passwords
+sha2 = { version = "0.10.8" }
+digest = "0.10.7"
+hkdf = "0.12.4"
+zeroize = { version = "1.7.0", features = ["zeroize_derive"] }
+zeroize_derive = "1.4.2"
+
+# bcrypt
+blowfish = { version = "0.9.1", features = ["bcrypt"] }
+
+# UX (for password entry and notifications)
+gam = { path = "../gam", optional = true }
+ux-api = { path = "../../libs/ux-api" }
+locales = { path = "../../locales" }
+modals = { path = "../modals", optional = true }
+
+utralib = { version = "0.1.27", optional = true, default-features = false }
+
+# performance profiling
+perflib = { path = "../../libs/perflib", optional = true }
+
+# Gen-2 dependencies
+keystore = { path = "../keystore", optional = true }                             # contains all key handlers
+xous-swapper = { path = "../xous-swapper", optional = true }                     # contains spinor
+bao1x-hal-service = { path = "../bao1x-hal-service", optional = true }
+bao1x-emu = { path = "../bao1x-emu", optional = true, default-features = false }
+bao1x-hal = { path = "../../libs/bao1x-hal", optional = true }
+
+hex = { version = "0.4.3", default-features = false, features = [
+    "alloc",
+], optional = true }
+
+[target.'cfg(any(windows,unix))'.dependencies]
+rand = "0.8.5"
+rand_chacha = "0.3.1"
+
+
+[features]
+gen1 = [
+    "susres",
+    "trng",
+    "spinor",
+    "root-keys",
+    "keystore-api/gen1",
+    "llio",
+    "tts-frontend",
+    "gam",
+    "modals",
+    "precursor-hal",
+]
+gen2 = ["keystore", "keystore-api/gen2", "hex"]
+# gen 1 targets
+precursor = ["utralib/precursor", "sha2/precursor", "gen1", "aes/precursor"]
+vexii-test = ["precursor-hal/vexii-test", "aes/vexii-test"]
+hosted = ["utralib/hosted", "sha2/hosted", "gen1"]
+renode = ["utralib/renode", "sha2/renode", "gen1", "aes/renode"]
+
+# gen 2 targets
+board-baosec = [
+    "gen2",
+    "xous-swapper/board-baosec",
+    "bao1x-hal-service/board-baosec",
+    "bao1x-hal/board-baosec",
+    # modals is needed exclusively to know the type to make a None for
+    "modals/board-baosec",
+    "keystore/board-baosec",
+    "aes/bao1x",
+] # USB form factor token
+oem-baosec-lite = []
+hosted-baosec = [
+    "gen2",
+    "bao1x-emu",
+    "modals/hosted-baosec",
+    "bao1x-hal/hosted-baosec",
+] # emulated hardware on x86 platform
+board-baosor = [
+    "gen2",
+    "xous-swapper/board-baosor",
+    "bao1x-hal-service/board-baosor",
+    "bao1x-hal/board-baosor",
+    "keystore/board-baosor",
+    "aes/bao1x",
+] # Precursor form factor
+# board-dabao is not a valid target as it lacks external SPI flash
+key-testing = ["bao1x-hal/key-testing"]
+
+doc-deps = ["precursor-hal"]
+
+# when selected, physical disk addresses are set to 64 bits, otherwise, they are 32 bits.
+# 32 bit addressing is recommended for Precursor, as its disk is only 128MiB and it has limited RAM for bookkeeping.
+u64_pa = []
+# selecting mbbb employs a "make before break" update on the page table. This minimizes risk of corruption of
+# the page table when being updated in the case of a power loss, in exchange for more than doubling the time it
+# takes to update the page table.
+mbbb = []
+# selecting deterministic makes the allocation and page replacement algorithms deterministic. normally we don't want
+# this but it's helpful for debugging.
+deterministic = []
+# this flag adds CI tests to the build
+ci = []
+# hosted mode manual tests
+pddbtest = []
+# turns on automatic basis tracking. must also be used in conjunction with pddbtest
+autobasis = []
+# this feature is for text-to-speech support
+tts = []
+# support migration type 1, from version 00.00.01.01 -> 00.00.02.01, incurs a 42kiB penalty in binary size
+migration1 = []
+# hazardous debug flag decorates any debug paths that might accidentally leak key material
+hazardous-debug = []
+test-rekey = []
+# hardware tests
+hwtest = []
+# routines to help with performance profiling of the PDDB in hosted mode
+pddb-flamegraph = ["hex"]
+perfcounter = ["perflib"]
+# introduce a slight delay after UX boxes swap, in case of race conditions. Shouldn't be necessary anymore, but kept around in case there's a new edge case we missed.
+ux-swap-delay = []
+# make the PDDB very small (4MiB). Note that booting a device with an incompatible `smalldb` setting will break the PDDB image. Use with caution.
+smalldb = []
+default = ["mbbb"]

@@ -1,0 +1,57 @@
+[package]
+name = "modals"
+version = "0.1.0"
+authors = ["bunnie <bunnie@kosagi.com>"]
+edition = "2018"
+description = "Ux modals server"
+
+# Dependency versions enforced by Cargo.lock.
+[dependencies]
+xous = "0.9.70"
+log-server = { package = "xous-api-log", version = "0.1.69" }
+ticktimer-server = { package = "xous-api-ticktimer", version = "0.9.70" }
+xous-names = { package = "xous-api-names", version = "0.9.71" }
+log = "0.4.14"
+num-derive = { version = "0.4.2", default-features = false }
+num-traits = { version = "0.2.14", default-features = false }
+xous-ipc = "0.10.10"
+rkyv = { version = "0.8.8", default-features = false, features = [
+    "std",
+    "alloc",
+] }
+gam = { path = "../gam", optional = true }
+trng = { path = "../trng", optional = true }
+bao1x-hal-service = { path = "../bao1x-hal-service", optional = true } # provides trng for bao1x
+tts-frontend = { path = "../tts", optional = true }
+locales = { path = "../../locales" }
+bit_field = "0.9.0"
+bao1x-api = { path = "../../libs/bao1x-api", optional = true }
+bao1x-emu = { path = "../bao1x-emu", optional = true }
+blitstr2 = { path = "../../libs/blitstr2" }
+ux-api = { path = "../../libs/ux-api", optional = true, features = ["std"] }
+
+
+[features]
+no-gam = []
+precursor = ["trng", "gam", "tts-frontend"]
+hosted = ["trng", "gam", "tts-frontend"]
+renode = ["trng", "gam", "tts-frontend"]
+
+bao1x = ["bao1x-hal-service", "no-gam"]
+hosted-baosec = ["ux-api/hosted-baosec", "bao1x-emu", "bao1x-api", "no-gam"]
+board-baosec = [
+    "ux-api/board-baosec",
+    "bao1x-api",
+    "no-gam",
+    "bao1x-hal-service/board-baosec",
+    "bao1x",
+    "blitstr2/bao1x",
+]
+doc-deps = ["gam", "ux-api/doc-deps"]
+modal-testing = []
+
+tts = []
+ditherpunk = []
+hazardous-debug = []
+# "gam" is required for cargo doc to run successfully
+default = []

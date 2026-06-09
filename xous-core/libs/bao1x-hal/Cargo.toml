@@ -1,0 +1,136 @@
+[package]
+name = "bao1x-hal"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+xous-api-names = { version = "0.9.71", optional = true }
+xous-api-ticktimer = { version = "0.9.70", optional = true }
+log = { version = "0.4.14", optional = true }
+utralib = { version = "0.1.27", default-features = false, optional = true }
+rkyv = { version = "0.8.8", default-features = false, features = [
+    "std",
+    "alloc",
+], optional = true }
+num-derive = { version = "0.4.2", default-features = false }
+num-traits = { version = "0.2.14", default-features = false }
+riscv = { version = "0.5.6", package = "xous-riscv" }
+
+usb-device = { git = "https://github.com/betrusted-io/usb-device.git", branch = "main", features = [
+    "log",
+    "control-buffer-256",
+], optional = true }
+
+# usb-device = { path = "../../../usb-device", features = [
+#     "log",
+#     "control-buffer-256",
+# ], optional = true }
+
+bitfield = "0.13.2"
+either = { version = "1.9.0", default-features = false }
+ux-api = { path = "../ux-api", default-features = false, optional = true }
+bao1x-api = { path = "../bao1x-api", default-features = false }
+
+digest = { version = "^0.10.7", optional = true }
+ed25519-dalek = { package = "ed25519-dalek-bao1x", path = "../../bao1x-boot/ed25519-dalek-bao1x", default-features = false, features = [
+    "digest",
+    "zeroize",
+], optional = true }
+sha2-bao1x = { path = "../../bao1x-boot/sha2-bao1x", optional = true, default-features = false }
+linked_list_allocator = { version = "0.10.5", optional = true }
+
+# for generating glitch-protection delays
+rand_chacha = { version = "0.3.1", default-features = false }
+
+# [target.'cfg(target_os = "xous")'.dependencies]
+xous = { version = "0.9.70", features = ["v2p"] }
+xous-ipc = { version = "0.10.10", optional = true }
+
+bitflags = "1.2.1"
+# TODO: migrate from bitflags to this crate
+bitbybit = "1.4.0"
+arbitrary-int = "1.2"
+bytemuck = "1.24.0"
+
+[features]
+camera-ov2640 = []
+camera-gc2145 = []
+display-sh1107 = []
+sensor-lis2dh12 = []
+axp2101 = []
+bmp180 = []
+sigcheck = ["ed25519-dalek", "sha2-bao1x", "digest", "linked_list_allocator"]
+board-baosec = [
+    "std",
+    "camera-gc2145",
+    "display-sh1107",
+    "axp2101",
+    "bmp180",
+    "utralib/bao1x",
+    "ux-api/board-baosec",
+    "ux-api/std",
+] # USB form factor token
+# "lite" variant of baosec. Shares the same basic flags but some things remapped when this is added.
+accel-kbd = []
+oem-baosec-lite = ["sensor-lis2dh12"]
+
+loader-baosec = [
+    "utralib/bao1x",
+    "camera-gc2145",
+    "display-sh1107",
+    "axp2101",
+    "bmp180",
+    "ux-api/loader-baosec",
+]
+kernel = []
+kernel-baosec = ["utralib/bao1x", "kernel"]
+kernel-baosor = ["utralib/bao1x", "kernel"]
+kernel-dabao = ["utralib/bao1x", "kernel"]
+test-baosec = ["ux-api/loader-baosec", "camera-gc2145"]
+hosted-baosec = ["std"] # emulated hardware on x86 platform
+board-baosor = [
+    "std",
+    "camera-gc2145",
+    "axp2101",
+    "utralib/bao1x",
+    "ux-api/std",
+] # Precursor form factor
+loader-baosor = []
+board-dabao = ["utralib/bao1x"] # Dev board form factor
+loader-dabao = []
+verilator-only = ["utralib/bao1x"]
+mpw = ["utralib/bao1x"]
+hdl-test = ["utralib/bao1x"]
+verbose-debug = []
+debug-print = []
+debug-print-duart = ["debug-print", "debug-countermeasures"]
+debug-print-uart = ["debug-print"]
+debug-countermeasures = []
+debug-wfi = []
+security = ["sigcheck"]
+qe-debug = []
+
+udma-stress-test = [
+] # For RTL simulation testing - aggravates a key corner case
+
+key-testing = ["bao1x-api/key-testing"]
+
+compress-entropy = []
+magic-manual = []
+std = [
+    "log",
+    "xous-api-names",
+    "usb-device",
+    "xous-api-ticktimer",
+    "bao1x-api/std",
+    "xous-ipc",
+    "rkyv",
+]
+derive-rkyv = ["rkyv"]
+
+# flag for bypassing extra software checks so that hardware can be redteamed
+redteam = []
+
+default = []

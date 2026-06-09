@@ -1,1 +1,6 @@
 target/
+
+# vendored xous-core: exclude upstream test/emulation blobs (not needed to build)
+xous-core/precursors/*.wav
+xous-core/emulation/versatile-vmlinux
+xous-core/emulation/*.jffs2

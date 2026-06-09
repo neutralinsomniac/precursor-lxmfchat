@@ -1,0 +1,148 @@
+{
+    "app-loader": {
+        "context_name": "App Loader",
+        "menu_name": {
+            "appmenu.app-loader": {
+                "en": "App Loader",
+                "en-tts": "App Loader",
+                "fr": "App Loader *EN*",
+                "ja": "App Loader *EN*",
+                "zh": "App Loader *EN*"
+            }
+        },
+        "submenu": 2
+    },
+    "ball": {
+        "context_name": "ball demo app",
+        "menu_name": {
+            "appmenu.ball": {
+                "en": "Simple ball demo",
+                "en-tts": "Simple ball demo",
+                "fr": "Démonstration de balle simple",
+                "ja": "シンプルなボールのデモ",
+                "zh": "简单的球演示"
+            }
+        }
+    },
+    "chat-test": {
+        "context_name": "Chat UI test",
+        "menu_name": {
+            "appmenu.chat-test": {
+                "en": "Chat UI test",
+                "en-tts": "Chat UI test",
+                "fr": "Chat UI test *EN*",
+                "ja": "Chat UI test *EN*",
+                "zh": "Chat UI test *EN*"
+            }
+        },
+        "submenu": 1
+    },
+    "hello": {
+        "context_name": "Hello World",
+        "menu_name": {
+            "appmenu.hello": {
+                "en": "Hello World!",
+                "en-tts": "Hello World!",
+                "fr": "Bonjour le monde!",
+                "ja": "Hello World!",
+                "zh": "大家好!"
+            }
+        }
+    },
+    "hidv2": {
+        "context_name": "HID v2 demo",
+        "menu_name": {
+            "appmenu.hidv2": {
+                "en": "HID v2 demo"
+            }
+        }
+    },
+    "lxmfchat": {
+        "context_name": "[reticulum]",
+        "menu_name": {
+            "appmenu.lxmfchat": {
+                "en": "Reticulum LXMF",
+                "en-tts": "Reticulum LXMF messaging",
+                "fr": "Reticulum LXMF *EN*",
+                "ja": "Reticulum LXMF *EN*",
+                "zh": "Reticulum LXMF *EN*"
+            }
+        },
+        "submenu": 1
+    },
+    "mtxchat": {
+        "context_name": "[matrix]",
+        "menu_name": {
+            "appmenu.mtxchat": {
+                "en": "[matrix]",
+                "en-tts": "[matrix]",
+                "fr": "[matrix] *EN*",
+                "ja": "[matrix] *EN*",
+                "zh": "[matrix] *EN*"
+            }
+        },
+        "submenu": 1
+    },
+    "mtxcli": {
+        "context_name": "Matrix cli",
+        "menu_name": {
+            "appmenu.mtxcli": {
+                "en": "Matrix cli",
+                "en-tts": "MATRIX demo",
+                "fr": "Matrix messagerie",
+                "ja": "シンプルなMATRIXデモ",
+                "zh": "基本 MATRIX 演示"
+            }
+        }
+    },
+    "repl": {
+        "context_name": "repl demo app",
+        "menu_name": {
+            "appmenu.repl": {
+                "en": "Basic REPL demo",
+                "en-tts": "Basic REPL demo",
+                "fr": "Démonstration REPL",
+                "ja": "シンプルなREPLデモ",
+                "zh": "基本 REPL 演示"
+            }
+        }
+    },
+    "sigchat": {
+        "context_name": "signal",
+        "menu_name": {
+            "appmenu.sigchat": {
+                "en": "Signal",
+                "en-tts": "Signal",
+                "fr": "Signal *EN*",
+                "ja": "Signal *EN*",
+                "zh": "Signal *EN*"
+            }
+        },
+        "submenu": 1
+    },
+    "transientdisk": {
+        "context_name": "Transient USB disk",
+        "menu_name": {
+            "appmenu.transientdisk": {
+                "en": "Transient USB disk",
+                "en-tts": "Transient USB disk",
+                "fr": "Transient USB disk *EN*",
+                "ja": "Transient USB disk *EN*",
+                "zh": "Transient USB disk *EN*"
+            }
+        }
+    },
+    "vault": {
+        "context_name": "Key Vault",
+        "menu_name": {
+            "appmenu.vault": {
+                "en": "Key Vault",
+                "en-tts": "Key Vault",
+                "fr": "Coffre de clés",
+                "ja": "キーボールト",
+                "zh": "密钥库"
+            }
+        },
+        "submenu": 1
+    }
+}

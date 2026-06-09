@@ -1,0 +1,11 @@
+[package]
+name = "rkyv-test1"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rkyv = { version = "0.8.8", default-features = false, features = [
+    "std",
+    "alloc",
+] }
+xous = "0.9.70"

@@ -1,0 +1,35 @@
+[package]
+name = "bao1x-api"
+version = "0.1.0"
+edition = "2021"
+description = "Baochip-1x API Crate"
+license = "Apache-2.0"
+
+# Maintainer's note: changes to things like the size of the signature field or
+# offsets in memory will require a version bump and publish to crates.io, so that
+# it can be picked up by the xous-tools package, which is also published to
+# crates.io.
+
+[dependencies]
+xous = "0.9.70"
+xous-ipc = { version = "0.10.10", optional = true }
+xous-names = { package = "xous-api-names", version = "0.9.71", optional = true }
+num-derive = { version = "0.4.2", default-features = false }
+num-traits = { version = "0.2.14", default-features = false }
+rkyv = { version = "0.8.8", default-features = false, features = [
+    "std",
+    "alloc",
+], optional = true }
+bytemuck = { version = "1.24", features = ["derive"] }
+bitbybit = "1.4.0"
+arbitrary-int = "1.2"
+num_enum = { version = "0.5", default-features = false }
+
+[features]
+# testing flag that causes the PDDB to be small
+key-testing = []
+
+std = ["derive-rkyv", "xous-names", "xous-ipc"]
+derive-rkyv = ["rkyv"]
+bio = []
+default = []

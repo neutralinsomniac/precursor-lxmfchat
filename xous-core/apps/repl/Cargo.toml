@@ -1,0 +1,32 @@
+[package]
+name = "repl"
+version = "0.1.0"
+authors = ["bunnie <bunnie@kosagi.com>"]
+edition = "2018"
+description = "REPL demo app"
+
+# Dependency versions enforced by Cargo.lock.
+[dependencies]
+log = "0.4.14"
+num-derive = { version = "0.4.2", default-features = false }
+num-traits = { version = "0.2.14", default-features = false }
+xous = "0.9.70"
+xous-ipc = "0.10.10"
+log-server = { package = "xous-api-log", version = "0.1.69" }
+ticktimer-server = { package = "xous-api-ticktimer", version = "0.9.70" }
+xous-names = { package = "xous-api-names", version = "0.9.71" }
+gam = { path = "../../services/gam" }
+ux-api = { path = "../../libs/ux-api" }
+blitstr2 = { path = "../../libs/blitstr2" }
+trng = { path = "../../services/trng" }
+locales = { path = "../../locales" }
+ime-plugin-api = { path = "../../services/ime-plugin-api" }
+ime-plugin-shell = { path = "../../services/ime-plugin-shell" }
+content-plugin-api = { path = "../../services/content-plugin-api" }       # all content canvas providers must provide this API
+com = { path = "../../services/com" }
+llio = { path = "../../services/llio" }
+codec = { path = "../../services/codec" }
+cos_table = { path = "../../libs/cos_table" }
+
+[features]
+default = []

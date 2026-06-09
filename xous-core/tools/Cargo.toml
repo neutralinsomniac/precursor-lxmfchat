@@ -1,0 +1,76 @@
+[package]
+authors = ["Sean Cross <sean@xobs.io>", "bunnie <bunnie@baochip.com>"]
+default-run = "xous-app-uf2"
+edition = "2018"
+name = "xous-tools"
+version = "0.1.2"
+description = "A set of tools for managing Xous ecosystem binaries"
+license = "Apache-2.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+# Dependency versions enforced by Cargo.lock.
+[dependencies]
+bitflags = "1.2.1"
+clap = "2.33.3"
+crc = "1.8.1"
+csv = "1.1.5"
+ring = "0.17.7"
+env_logger = "0.7.1"
+log = "0.4.14"
+pem = "0.8.3"
+svd2utra = "0.1.25"
+xmas-elf = "0.9.0"
+xous-semver = "0.1.5"
+ed25519-dalek = { version = "2.1.0", features = ["digest", "rand_core"] }
+sha2 = { version = "0.10.8" }
+pkcs8 = { version = "0.8.0", features = ["pem"] }
+base64 = "0.20.0"
+rand = "0.8.5"
+aes-gcm-siv = "0.11.1"
+hex-literal = "1.0.0"
+byteorder = "1.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Maintainer's note: bao1x-api has to be bumped anytime parameters such as the
+# size of the signature block or offsets in RRAM are changed, so that it can be
+# absorbed into this package.
+# bao1x-api = { path = "../libs/bao1x-api" }
+bao1x-api = "0.1.0" # use crates.io to refer to this
+
+# for remote resolution of github version in out-of-tree builds. Note that pulling
+# in this dependency tree *greatly* increases the attack surface of the SBOM. I don't
+# think the convenience is worth it. But these are noted here in case we need to revisit
+# this decision later.
+# reqwest = { version = "0.11", features = ["blocking", "json"] }
+# anyhow = "1.0"
+# toml = "0.8"
+
+[[bin]]
+name = "xous-copy-object"
+
+[[bin]]
+name = "xous-create-image"
+
+[[bin]]
+name = "xous-make-tags"
+
+[[bin]]
+name = "xous-read-tags"
+
+[[bin]]
+name = "xous-sign-image"
+
+[[bin]]
+name = "xous-create-detached-app"
+
+[[bin]]
+name = "xous-app-uf2"
+
+[features]
+precursor = []
+renode = []
+bao1x = []
+atsama5d2 = []
+default = []

@@ -1,0 +1,39 @@
+[package]
+name = "usb-test"
+version = "0.1.0"
+authors = ["bunnie <bunnie@kosagi.com>"]
+edition = "2018"
+description = "USB test & development stub"
+
+# Dependency versions enforced by Cargo.lock.
+[dependencies]
+xous = "0.9.70"
+log-server = { package = "xous-api-log", version = "0.1.69" }
+ticktimer-server = { package = "xous-api-ticktimer", version = "0.9.70" }
+xous-names = { package = "xous-api-names", version = "0.9.71" }
+log = "0.4.14"
+num-derive = { version = "0.4.2", default-features = false }
+num-traits = { version = "0.2.14", default-features = false }
+susres = { path = "../../api/xous-api-susres", package = "xous-api-susres" }
+keyboard = { path = "../keyboard" }
+bitfield = "0.13.2"
+vcell = "0.1.3"
+utralib = { version = "0.1.27", optional = true, default-features = false }
+
+xous-usb-hid = { git = "https://github.com/betrusted-io/xous-usb-hid.git", branch = "main" }
+embedded-time = "0.12.1"                                                                     # required by the keyboard interface
+
+[dependencies.usb-device]
+# see top level Cargo.toml for patch.crates-io directive to help with dev work
+version = "0.2.8"
+features = ["log"]
+
+[dev-dependencies]
+rand = "0.8.5"
+rand_chacha = "0.3.1"
+
+[features]
+precursor = ["utralib/precursor"]
+hosted = ["utralib/hosted"]
+renode = ["utralib/renode"]
+default = []

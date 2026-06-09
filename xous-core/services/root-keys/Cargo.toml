@@ -1,0 +1,112 @@
+[package]
+name = "root-keys"
+version = "0.1.0"
+authors = ["bunnie <bunnie@kosagi.com>"]
+edition = "2018"
+description = "Xous root keys server"
+
+# Dependency versions enforced by Cargo.lock.
+[dependencies]
+xous = "0.9.70"
+log-server = { package = "xous-api-log", version = "0.1.69" }
+ticktimer-server = { package = "xous-api-ticktimer", version = "0.9.70" }
+xous-names = { package = "xous-api-names", version = "0.9.71" }
+log = "0.4.14"
+susres = { path = "../../api/xous-api-susres", package = "xous-api-susres" }
+trng = { path = "../trng" }
+spinor = { path = "../spinor" }
+llio = { path = "../llio" }
+com = { path = "../com" }
+xous-semver = "0.1.5"
+utralib = { version = "0.1.27", optional = true, default-features = false }
+blitstr2 = { path = "../../libs/blitstr2" }
+keystore-api = { path = "../../libs/keystore-api" }
+precursor-hal = { path = "../../libs/precursor-hal" }
+
+xous-ipc = "0.10.10"
+num-derive = { version = "0.4.1", default-features = false }
+num-traits = { version = "0.2.14", default-features = false }
+rkyv = { version = "0.8.8", default-features = false, features = [
+    "std",
+    "alloc",
+] }
+zeroize = { version = "1.7.0", features = ["zeroize_derive"] }
+rand_core = "0.6.4"
+
+aes-kw = { version = "0.2.1", features = ["alloc"] }
+
+# bcrypt
+cipher = "0.4.3"
+blowfish = { version = "0.9.1", features = ["bcrypt"] }
+
+# password modals - keep them in this crate to minimize plaintext password manipulations
+gam = { path = "../gam" }
+locales = { path = "../../locales" }
+# non-password modals are outsourced to a common crate
+modals = { path = "../modals" }
+
+# to access font maps for signing verification
+ux-api = { path = "../../libs/ux-api" }
+
+# for reboots and fuse operations
+jtag = { path = "../jtag" }
+
+# for text to speech support
+tts-frontend = { path = "../tts" }
+
+# backups
+aes-gcm-siv = { version = "0.11.1", default-features = false, features = [
+    "alloc",
+    "aes",
+] }
+#aes-gcm-siv = {git="https://github.com/RustCrypto/AEADs.git", branch="master"}
+subtle = { version = "2.4.1", default-features = false }
+usb-device-xous = { path = "../usb-device-xous" }
+keyboard = { path = "../keyboard" }
+
+# private keys
+#sha2 = {version = "0.9.5", default-features = false, features = []}
+sha2 = { version = "0.10.8" }
+digest = "0.10.7"
+aes = { path = "../aes" }
+# engine-25519 = { path = "../engine-25519" }
+byteorder = "1.4.3" # used by keywrap
+# hardware acceleration adaptations are inserted into a fork of the main branch.
+hex = { version = "0.4.3", default-features = false, features = [] }
+
+[dependencies.curve25519-dalek]
+version = "=4.1.2"                           # note this is patched to our fork in ./Cargo.toml
+default-features = false
+features = ["auto-release", "warn-fallback"]
+
+[dependencies.ed25519-dalek]
+version = "2.1.0"
+#path = "../../../ed25519-dalek"
+default-features = false
+features = ["rand_core", "digest"]
+
+[features]
+vexii-test = ["aes/vexii-test"]
+precursor = [
+    "utralib/precursor",
+    "sha2/precursor",
+    "keystore-api/precursor",
+    "aes/precursor",
+]
+hosted = ["utralib/hosted", "sha2/hosted", "keystore-api/hosted"]
+renode = ["utralib/renode", "sha2/renode", "keystore-api/renode", "aes/renode"]
+policy-menu = [
+    "keystore-api/policy-menu",
+] # provisions for users to set their password retention policies (on the block for deprecation) (note: to re-enable you need to add "rootkeys menu" to the tokens.rs in the GAM)
+hazardous-debug = [
+] # this feature enables the printing of secret materials for debug purposes
+tts = []
+efuse = ["keystore-api/efuse"]
+default = []
+
+[lib]
+test = true
+
+[[bin]]
+name = "root-keys"
+test = false

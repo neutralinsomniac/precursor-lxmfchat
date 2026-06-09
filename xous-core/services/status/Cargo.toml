@@ -1,0 +1,73 @@
+[package]
+authors = ["bunnie <bunnie@kosagi.com>"]
+description = "Status bar for Xous"
+edition = "2018"
+name = "status"
+version = "0.1.0"
+
+# Dependency versions enforced by Cargo.lock.
+[dependencies]
+com = { path = "../com" }
+content-plugin-api = { path = "../content-plugin-api" }
+log = "0.4.14"
+log-server = { package = "xous-api-log", version = "0.1.69" }
+ticktimer-server = { package = "xous-api-ticktimer", version = "0.9.70" }
+trng = { path = "../trng" }
+llio = { path = "../llio" }
+xous = "0.9.70"
+xous-ipc = "0.10.10"
+xous-names = { package = "xous-api-names", version = "0.9.71" }
+ux-api = { path = "../../libs/ux-api" }
+gam = { path = "../gam" }
+locales = { path = "../../locales" }
+susres = { path = "../../api/xous-api-susres", package = "xous-api-susres" }
+root-keys = { path = "../root-keys" }
+keystore-api = { path = "../../libs/keystore-api", features = ["gen1"] }
+modals = { path = "../modals" }
+pddb = { path = "../pddb" }
+net = { path = "../net" }
+keyboard = { path = "../keyboard" }
+usb-device-xous = { path = "../usb-device-xous" }
+codec = { path = "../codec" }
+userprefs = { path = "../../libs/userprefs" }
+dns = { path = "../dns" }
+early_settings = { path = "../early_settings" }
+blitstr2 = { path = "../../libs/blitstr2" }
+precursor-hal = { path = "../../libs/precursor-hal" }
+
+num-derive = { version = "0.4.2", default-features = false }
+num-traits = { version = "0.2.14", default-features = false }
+rkyv = { version = "0.8.8", default-features = false, features = [
+    "std",
+    "alloc",
+] }
+
+chrono = { version = "0.4.33", default-features = false, features = ["std"] }
+crossbeam = "0.8.2"
+
+sha2 = { version = "0.10.8" }
+digest = "0.10.7"
+xous-semver = "0.1.5"
+com_rs = { git = "https://github.com/betrusted-io/com_rs", rev = "891bdd3ca8e41f81510d112483e178aea3e3a921" }
+
+utralib = { version = "0.1.27", optional = true, default-features = false }
+
+# short circuit the datetime call on hosted mode
+[target.'cfg(any(windows,unix))'.dependencies]
+chrono = "0.4.33"
+
+[features]
+precursor = ["utralib/precursor", "sha2/precursor"]
+hosted = ["utralib/hosted", "sha2/hosted"]
+renode = ["utralib/renode", "sha2/renode"]
+debugprint = []
+braille = []                                        # used for braille mode, so console isn't overwhelmed with status
+tts = []
+# default = ["debugprint"] # "debugprint"
+dbg-ecupdate = []
+ditherpunk = []
+test-rekey = []
+efuse = []
+no-codec = []
+minimal-testing = []
+default = []

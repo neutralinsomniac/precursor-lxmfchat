@@ -1,0 +1,48 @@
+[package]
+name = "cram-console"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+utralib = { version = "0.1.27", optional = true, default-features = false }
+xous-names = { package = "xous-api-names", version = "0.9.71" }
+ticktimer = { package = "xous-api-ticktimer", version = "0.9.70" }
+xous = "0.9.70"
+xous-ipc = "0.10.10"
+log-server = { package = "xous-api-log", version = "0.1.69" }
+log = "0.4.14"
+num-derive = { version = "0.4.2", default-features = false }
+num-traits = { version = "0.2.14", default-features = false }
+
+# xous-pio = { path = "../../libs/xous-pio", optional = true }
+# xous-pl230 = { path = "../../libs/xous-pl230", optional = true }
+# this is temporary, until we get GAM/modals pulled in
+ux-api = { path = "../../libs/ux-api" }
+modals = { path = "../modals", features = ["bao1x"] }
+locales = { path = "../../locales" }
+usb-device-xous = { path = "../usb-device-xous", default-features = false, optional = true }
+bao1x-hal = { path = "../../libs/bao1x-hal", features = ["std"] }
+bao1x-hal-service = { path = "../bao1x-hal-service" }
+ime-plugin-shell = { path = "../ime-plugin-shell" }
+xous-swapper = { path = "../xous-swapper" }
+
+[features]
+"bao1x" = ["utralib/bao1x"]
+"board-baosec" = ["modals/board-baosec"]
+"hosted-baosec" = ["modals/hosted-baosec"]
+
+"hwsim" = []
+"shellperf" = []
+"mass-storage" = []
+"clifford-poll" = []
+"tts" = []
+"early-ball" = []
+# "pio-test" = ["xous-pio"]
+# "pl230-test" = ["xous-pl230"]
+"hwtest" = []
+"pddb" = []
+"gam" = []
+"usb" = ["usb-device-xous"]
+default = []

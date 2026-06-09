@@ -1,0 +1,13 @@
+[package]
+name = "lxmf"
+version = "0.1.0"
+authors = ["precursor-reticulum"]
+edition = "2021"
+description = "Sans-IO LXMF (Lightweight Extensible Message Format) for Xous/Precursor"
+
+[dependencies]
+log = "0.4.14"
+reticulum-core = { path = "../reticulum-core" }
+
+[dev-dependencies]
+hex = "0.4.3"

@@ -1,0 +1,57 @@
+[package]
+authors = ["Sean Cross <sean@xobs.io>"]
+description = "Manage the video output"
+edition = "2018"
+name = "graphics-server"
+version = "0.1.0"
+
+# Dependency versions enforced by Cargo.lock.
+[dependencies]
+keyboard = { path = "../keyboard" }
+log = "0.4.14"
+log-server = { package = "xous-api-log", version = "0.1.69" }
+xous = "0.9.70"
+susres = { path = "../../api/xous-api-susres", package = "xous-api-susres" }
+ticktimer-server = { package = "xous-api-ticktimer", version = "0.9.70" }
+locales = { path = "../../locales" }
+blitstr2 = { path = "../../libs/blitstr2" }
+ux-api = { path = "../../libs/ux-api" }
+
+xous-ipc = "0.10.10"
+xous-names = { package = "xous-api-names", version = "0.9.71" }
+num-derive = { version = "0.4.2", default-features = false }
+num-traits = { version = "0.2.14", default-features = false }
+rkyv = { version = "0.8.8", default-features = false, features = [
+    "std",
+    "alloc",
+] }
+
+utralib = { version = "0.1.27", optional = true, default-features = false }
+
+bao1x-hal-service = { path = "../bao1x-hal-service", optional = true, features = [
+] }
+bao1x-hal = { path = "../../libs/bao1x-hal", optional = true, features = [
+    "derive-rkyv",
+    "std",
+] }
+
+[target.'cfg(any(windows,unix))'.dependencies]
+minifb = "0.26.0"
+
+[features]
+bao1x = ["utralib/bao1x", "bao1x-hal-service", "bao1x-hal", "bao1x-hal/std"]
+board-baosor = ["bao1x-hal/board-baosor", "blitstr2/board-baosor"]
+
+precursor = [
+    "utralib/precursor",
+    "blitstr2/precursor",
+    "ux-api/precursor",
+    "ux-api/std",
+]
+hosted = ["utralib/hosted", "blitstr2/hosted", "ux-api/hosted", "ux-api/std"]
+renode = ["utralib/renode", "blitstr2/renode", "ux-api/renode", "ux-api/std"]
+debugprint = []
+braille = []
+gfx-testing = []
+ditherpunk = ["ux-api/ditherpunk"]
+default = []

@@ -1,0 +1,59 @@
+[package]
+name = "bao1x-hal-service"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+utralib = { version = "0.1.27", optional = true, default-features = false, features = [
+    "bao1x",
+] }
+xous-names = { package = "xous-api-names", version = "0.9.71" }
+ticktimer = { package = "xous-api-ticktimer", version = "0.9.70" }
+xous = { version = "0.9.70", features = ["raw-trng"] }
+xous-ipc = "0.10.10"
+log-server = { package = "xous-api-log", version = "0.1.69" }
+log = "0.4.14"
+xous-api-susres = { path = "../../api/xous-api-susres", features = ["bao1x"] }
+bao1x-hal = { path = "../../libs/bao1x-hal", default-features = false }
+bao1x-api = { path = "../../libs/bao1x-api", features = ["derive-rkyv", "std"] }
+bio-lib = { path = "../../libs/bio-lib", features = ["av-trng"] }
+# I'm not entirely in love with the aborted attempt to use flatipc in Xous, but we use
+# this because it makes the API backward-compatible with older Xous code.
+flatipc = { path = "../../libs/flatipc" }
+flatipc-derive = { path = "../../libs/flatipc-derive" }
+rand = "0.8.5"
+rand_core = "0.6.4"
+rand_chacha = "0.3.1"
+bitfield = "0.13.2"
+# TODO: migrate from bitfield to bitbybit
+bitbybit = "1.4.0"
+arbitrary-int = "1.2"
+bytemuck = "1.24.0"
+chrono = { version = "0.4.33", default-features = false, features = ["std"] }
+
+num-derive = { version = "0.4.2", default-features = false }
+num-traits = { version = "0.2.14", default-features = false }
+rkyv = { version = "0.8.8", default-features = false, features = [
+    "std",
+    "alloc",
+] }
+
+[features]
+keyboard-testing = []
+app-uart = []
+rawserial = []
+pinger = []
+swap = []
+mpw = ["bao1x-hal/mpw"]
+bmp180 = ["bao1x-hal/bmp180"]
+board-baosec = ["bao1x-hal/board-baosec"]
+board-baosor = ["bao1x-hal/board-baosor"]
+board-dabao = ["bao1x-hal/board-dabao"]
+
+accel-kbd = []
+oem-baosec-lite = ["bao1x-hal/oem-baosec-lite"]
+
+with-duart = ["bao1x-hal/debug-print-duart"]
+default = ["app-uart", "utralib"]

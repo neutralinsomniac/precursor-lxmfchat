@@ -1,0 +1,31 @@
+[package]
+name = "early_settings"
+version = "0.1.0"
+authors = ["gsora <gsora@disroot.org>"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+log = { version = "0.4", features = [
+    "max_level_trace",
+    "release_max_level_trace",
+] }
+log-server = { package = "xous-api-log", version = "0.1.69" }
+ticktimer-server = { package = "xous-api-ticktimer", version = "0.9.70" }
+xous = "0.9.70"
+xous-ipc = "0.10.10"
+xous-names = { package = "xous-api-names", version = "0.9.71" }
+susres = { path = "../../api/xous-api-susres", package = "xous-api-susres" }
+spinor = { path = "../../services/spinor" }
+precursor-hal = { path = "../../libs/precursor-hal" }
+
+num-derive = { version = "0.4.2", default-features = false }
+num-traits = { version = "0.2.14", default-features = false }
+rkyv = { version = "0.8.8", default-features = false, features = [
+    "std",
+    "alloc",
+] }
+
+utralib = { version = "0.1.27", optional = true, default-features = false }
+once_cell = "1.17.1"

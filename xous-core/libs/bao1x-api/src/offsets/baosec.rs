@@ -1,0 +1,162 @@
+use xous::arch::PAGE_SIZE;
+
+use crate::offsets::{PartitionAccess, RwPerms, SlotIndex};
+
+pub const SPI_FLASH_LEN: usize = 8192 * 1024;
+pub const SPI_FLASH_ID_MASK: u32 = 0xff_ff_ff;
+
+// details of the SPINOR device
+pub const SPINOR_PAGE_LEN: u32 = 0x100;
+pub const SPINOR_ERASE_SIZE: u32 = 0x1000; // this is the smallest sector size.
+pub const SPINOR_BULK_ERASE_SIZE: u32 = 0x1_0000; // this is the bulk erase size.
+
+// 4MiB vs 8MiB memory price is a very nominal difference (~$0.20 off of $2.40 budgetary)
+// So it's either all-or-nothing: either we have 8MiB, or we have none, in the final
+// configuration.
+pub const SWAP_RAM_LEN: usize = 8192 * 1024;
+pub const SWAP_RAM_ID_MASK: u32 = 0xff_ff;
+// KGD 5D, mfg ID 9D; remainder of bits are part of the EID
+pub const SWAP_RAM_IDS: [u32; 2] = [0x5d9d, 0x559d];
+
+// Location of things in external SPIM flash
+pub const SWAP_FLASH_ORIGIN: usize = 0x0000_0000;
+// maximum length of a swap image
+pub const SWAP_FLASH_RESERVED_LEN: usize = 4096 * 1024;
+// Total area reserved for the swap header, including the signature block.
+pub const SWAP_HEADER_LEN: usize = PAGE_SIZE;
+
+// PDDB takes up "the rest of the space" - about 4MiB envisioned. Should be
+// "enough" for storing a few hundred, passwords, dozens of x.509 certs, dozens of private keys, etc.
+pub const PDDB_ORIGIN: usize = SWAP_FLASH_ORIGIN + SWAP_FLASH_RESERVED_LEN;
+#[cfg(not(feature = "key-testing"))]
+pub const PDDB_LEN: usize = SPI_FLASH_LEN - PDDB_ORIGIN;
+#[cfg(feature = "key-testing")]
+pub const PDDB_LEN: usize = 256 * 1024; // 256k - big enough to do something with, but much faster to init
+
+// Location of on-chip application segment, as offset from RRAM start
+pub const APP_RRAM_OFFSET: usize = 0;
+pub const APP_RRAM_LEN: usize = 0;
+
+// Regulator voltage target at boot
+pub const CPU_VDD_LDO_BOOT_MV: u32 = 810;
+pub const DEFAULT_FCLK_FREQUENCY: u32 = 700_000_000;
+
+// =========== KEY SLOTS ==============
+/// `NUISANCE_KEYS` are hashed together with `ROOT_SEED` to derive the core secret.
+/// Their primary purpose is to annoy microscopists trying to read the secret key by
+/// directly imaging the RRAM array. They also exist to reduce power side channels
+/// created upon accessing keys in combination with `CHAFF_KEYS`. Note there is ECC
+/// on the data (2C2D on top of 128 bits) so any readout with better than 97% accuracy
+/// can trivially rely on ECC to repair the results (and now you have a metric for how
+/// reliable your readout needs to be).
+///
+/// The placement is picked based upon two competing theories:
+///   - Data stored next to each other will be harder to read out because the simultaneous activation of
+///     read-out word line transistors via secondary electron leakage will cause the data in adjacent cells to
+///     super-impose on the bitline. You want to have several random bits superimposed to defeat probabilistic
+///     models of leakage behavior.
+///   - Data stored far from each other will be harder to read out based on the difficulty of achieving
+///     flatness & uniformity in delayering over long distances.
+///
+/// Thus 2x 4k pages on either end of the key range are carved out for the nuisance keys. 4k page size
+/// is convenient because that's the natural page size over which the key range will be carved up before
+/// handing to other processes.
+///
+/// The first 8 keys in bank 0 of NUISANCE_KEYS alias with data slots 0..7. This is because due to an ECO in
+/// the A1 spin of silicon that effectively removes the key bank, meaning only data banks exist.
+/// The IFR-managed access control on these is going to be tied to those on the similarly numbered data slots,
+/// and the control happens on a stride of 8 slots at a time.
+///
+/// Notice there is a second range of nuisance keys at the end of the slot range (1920..2048), stuck there
+/// to force spatial diversity in the nuisance keys.
+pub const NUISANCE_KEYS_0: SlotIndex = SlotIndex::DataRange(8..128, PartitionAccess::Fw0, RwPerms::ReadWrite);
+
+/// `CHAFF_KEYS` are a bank of keys that are hashed into the key array, but instead of
+/// being read out in strict order, they are read in a random permutation every time.
+/// The read-out data is XOR'd together into a single 256-bit key, and then hashed into
+/// the key. The reason for this procedure is if there are strong power side channels in
+/// the key read-out, the CHAFF_KEYS have a random ordering that frustrates attempts to
+/// correlate the power signature over repeated reboots. The read-out of the CHAFF_KEYS
+/// needs to be strictly constant time, i.e. the permutation function can't leak a
+/// side channel that reveals what the ordering is. Better yet, CHAFF_KEYS can be read
+/// out interleaved with the NUISANCE_KEY readout, where the selection to read a CHAFF_KEY
+/// or a NUISANCE_KEY is done randomly, thus introducing some disorder in the power side
+/// channel timing of the NUISANCE_KEY readout.
+///
+/// This block has ReadWrite permissions because it's what gets blanked when the system
+/// goes to developer mode. We don't blank *all* the keys because write-permission on a key
+/// can lead to "oracle" attacks where portions of the key can be guessed by setting individual
+/// bits. But this is enough bits that it should make the original key unrecoverable. Once
+/// the chaff is cleared, we also don't care as much about side channels since we're now operating
+/// in a fundamentally insecure regime (e.g. developer mode - you can just read out the data by
+/// running your own code on the device).
+pub const CHAFF_KEYS: SlotIndex = SlotIndex::DataRange(128..256, PartitionAccess::Fw0, RwPerms::ReadWrite);
+
+/// This is intentionally the very last key in the chaff key range. It's "sampled" by copying
+/// the full value of this key into the BURAM, which is later passed on to the loader. It's then
+/// checked for a value being equal to the erasure value to confirm that a device is in developer
+/// mode or not. This process does introduce a risk that this one key is leaked but it also
+/// closes a loophole where an attacker can simply manipulate the value of the DEVELOPER_KEY
+/// one way counter and fool the system into running a developer-key signed image without the
+/// secret keys being erased.
+///
+/// Placing this at the end of the key array ostensibly means that all the keys before it were
+/// erased; it might be possible to glitch all the way to the end and just have this one erased
+/// but I think that is reasonably unlikely...
+pub const ERASE_PROOF: SlotIndex = SlotIndex::Data(255, PartitionAccess::Fw0, RwPerms::ReadWrite);
+
+/// The `ROOT_SEED` is the "mothership" secret that all device identity and secrets
+/// are derived from. The seed may be blended with other bits of data scattered about
+/// the RRAM array, other device identifiers and hardware measurements to create the final
+/// device secret key.
+pub const ROOT_SEED: SlotIndex = SlotIndex::Data(256, PartitionAccess::Fw0, RwPerms::ReadWrite);
+
+/// The `RMA_KEY` is a secret parameter that is unique per-device secret which is recorded
+/// at manufacturing time. Its purpose is to facilitate the creation of a signed RMA
+/// authorization certificate which upon receipt would blank the device and unlock various
+/// features for debugging failed hardware.
+pub const RMA_KEY: SlotIndex = SlotIndex::Data(257, PartitionAccess::Fw0, RwPerms::ReadWrite);
+
+/// Reserved for use as a CP to FT tracking cookie. This is used to help track inventory
+/// between CP and FT, if such a feature is desired in the supply chain. Blanked on entry
+/// to developer mode.
+pub const CP_COOKIE: SlotIndex = SlotIndex::Data(258, PartitionAccess::Fw0, RwPerms::ReadWrite);
+
+/// The swap encryption key. Used to protect swap images beyond the signing key, if we so desire.
+pub const SWAP_KEY: SlotIndex = SlotIndex::Data(259, PartitionAccess::Fw0, RwPerms::ReadWrite);
+
+/// A test value placed by FT into the memory array. If you can read the original value, you've captured a
+/// flag!
+/// There is a second flag stored somewhere else. Can you find it?
+pub const THE_FLAG_1: SlotIndex = SlotIndex::Data(260, PartitionAccess::Fw0, RwPerms::ReadWrite);
+
+// [261..=383] reserved for Baochip data slot usage, see the "common" page for more details
+// NOTE: COLLATERAL is from 261..265, but it is in the "common" page
+
+// [384..=1919] are unused and available for third party use
+
+pub const NUISANCE_KEYS_1: SlotIndex =
+    SlotIndex::DataRange(1920..2048, PartitionAccess::Fw0, RwPerms::ReadWrite);
+pub const NUISANCE_KEYS: [SlotIndex; 2] = [NUISANCE_KEYS_0, NUISANCE_KEYS_1];
+
+/// All the slots of concern located in a single iterator. The idea is that everything is
+/// condensed here and used to check for access integrity using the array below.
+pub const DATA_SLOTS: [SlotIndex; 12] = [
+    crate::offsets::SERIAL_NUMBER,
+    crate::offsets::UUID,
+    crate::offsets::IFR_HASH,
+    crate::offsets::CP_ID,
+    crate::offsets::BAO1_PUBKEY,
+    crate::offsets::BAO2_PUBKEY,
+    crate::offsets::BETA_PUBKEY,
+    crate::offsets::DEV_PUBKEY,
+    crate::offsets::BOOT1_PK_RECEIPT_SLOT0,
+    crate::offsets::BOOT1_PK_RECEIPT_SLOT1,
+    crate::offsets::BOOT1_PK_RECEIPT_SLOT2,
+    crate::offsets::BOOT1_PK_RECEIPT_SLOT3,
+];
+
+/// In addition to these KEY_SLOTS, the DEVELOPER_MODE one way counter is a security-important parameter
+/// that should be included as domain separation in any KDF.
+pub const KEY_SLOTS: [SlotIndex; 8] =
+    [THE_FLAG_1, CP_COOKIE, RMA_KEY, ROOT_SEED, NUISANCE_KEYS_0, NUISANCE_KEYS_1, SWAP_KEY, CHAFF_KEYS];

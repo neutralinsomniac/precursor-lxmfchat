@@ -1,0 +1,21 @@
+[package]
+authors = ["bunnie <bunnie@kosagi.com>"]
+description = "IME Plugin Common APIs"
+edition = "2018"
+name = "ime-plugin-api"
+version = "0.1.0"
+
+# Dependency versions enforced by Cargo.lock.
+[dependencies]
+ux-api = { path = "../../libs/ux-api" }
+log = "0.4.14"
+xous = "0.9.70"
+xous-ipc = "0.10.10"
+xous-names = { package = "xous-api-names", version = "0.9.71" } # used by the IMEF for registering listeners
+
+num-derive = { version = "0.4.2", default-features = false }
+num-traits = { version = "0.2.14", default-features = false }
+rkyv = { version = "0.8.8", default-features = false, features = [
+    "std",
+    "alloc",
+] }

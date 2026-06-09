@@ -1,0 +1,25 @@
+[package]
+name = "xous-bio"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+log = "0.4.14"
+defmt = { version = "0.3", optional = true }
+utralib = { version = "0.1.27", default-features = false, features = ["bao1x"] }
+
+[target.'cfg(target_os = "xous")'.dependencies]
+xous = "0.9.70"
+
+[features]
+bao1x = ["utralib/bao1x"]
+precursor = []
+hosted = []
+renode = []
+# may be activated in conjunction with "bao1x", "rp2040" targets when not running Xous
+baremetal = []
+
+tests = []
+default = ["tests", "bao1x"]

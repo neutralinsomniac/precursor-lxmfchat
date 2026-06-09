@@ -1,0 +1,40 @@
+[package]
+name = "reticulum-core"
+version = "0.1.0"
+authors = ["precursor-reticulum"]
+edition = "2021"
+description = "Sans-IO subset of the Reticulum Network Stack (RNS) for Xous/Precursor"
+
+# This crate is deliberately I/O-free and Xous-free so it can be unit- and
+# interop-tested with plain `cargo test` on the host, and reused unchanged by
+# both the Xous app and the host interop client. Randomness, time, storage and
+# the transport socket are all injected by the caller.
+
+[dependencies]
+log = "0.4.14"
+sha2 = { version = "0.10.8" }
+hmac = "0.12.1"
+hkdf = "0.12.4"
+aes = "0.8.4"
+cbc = { version = "0.1.2", features = ["alloc"] }
+subtle = { version = "2.6.1", default-features = false }
+zeroize = { version = "1.8.1", default-features = false }
+rand_core = { version = "0.6.4", default-features = false }
+
+[dependencies.curve25519-dalek]
+version = "=4.1.2" # patched to the betrusted fork in the workspace root Cargo.toml
+default-features = false
+
+[dependencies.x25519-dalek]
+version = "2.0.1"
+default-features = false
+features = ["static_secrets"]
+
+[dependencies.ed25519-dalek]
+version = "2.1.0"
+default-features = false
+features = ["rand_core", "digest"]
+
+[dev-dependencies]
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+hex = "0.4.3"

@@ -1,0 +1,12 @@
+target/
+build/
+*.uf2
+.direnv
+.github
+.vscode
+.envrc
+.gitattributes
+.gitignore
+*.nix
+*~
+*.swp

@@ -1,0 +1,76 @@
+[package]
+name = "bao-video"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bao1x-hal = { path = "../../libs/bao1x-hal", features = [
+    "std",
+], optional = true, default-features = false }
+utralib = { version = "0.1.27", optional = true, default-features = false }
+xous-names = { package = "xous-api-names", version = "0.9.71" }
+ticktimer = { package = "xous-api-ticktimer", version = "0.9.70" }
+xous = "0.9.70"
+log-server = { package = "xous-api-log", version = "0.1.69" }
+log = "0.4.14"
+num-derive = { version = "0.4.2", default-features = false }
+num-traits = { version = "0.2.14", default-features = false }
+bao1x-hal-service = { path = "../bao1x-hal-service", optional = true }
+ux-api = { path = "../../libs/ux-api" }
+bao1x-emu = { path = "../bao1x-emu", optional = true }
+bao1x-api = { path = "../../libs/bao1x-api" }
+blitstr2 = { path = "../../libs/blitstr2" }
+xous-ipc = "0.10.10"
+rkyv = { version = "0.8.8", default-features = false, features = [
+    "std",
+    "alloc",
+] }
+modals = { path = "../modals", optional = true }
+susres = { package = "xous-api-susres", path = "../../api/xous-api-susres" }
+
+# QR decoding
+libm = { version = "0.2.8" }
+nalgebra = { version = "0.33", default-features = false, features = ["libm"] }
+rqrr = { git = "https://github.com/betrusted-io/rqrr.git", branch = "rv32-opt" }
+base64 = { version = "0.22.1", optional = true }
+
+locales = { path = "../../locales" }
+
+# diffusion dithering
+rand = { version = "0.8.5", features = ["getrandom"] }
+rand_core = "0.6.4"
+getrandom = "=0.2.12"
+
+[features]
+no-gam = ["modals/no-gam"]
+gfx-testing = []
+ditherpunk = []
+
+# This crate is baosec specific; these flags switch between hosted mode emulation
+# (for UI development) and actual hardware targets. In UI development all camera data
+# is "faked"
+board-baosec = [
+    "bao1x-hal-service",
+    "bao1x-hal",
+    "ux-api/board-baosec",
+    "blitstr2/board-baosec",
+    "no-gam",
+]
+oem-baosec-lite = ["bao1x-hal/oem-baosec-lite"]
+hosted-baosec = ["bao1x-emu", "ux-api/hosted-baosec", "no-gam"]
+
+# temporary feature - remove after we have properly created a camera control API
+autotest = []
+# factory feature - makes it keep on scanning forever - used for calibrating factory test jigs
+eternal-scan = []
+
+with-logo = []
+bao1x = ["utralib/bao1x", "blitstr2/bao1x"]
+b64-export = ["base64"]
+default = [
+    # "b64-export",
+    # "decongest-udma",
+    # "autotest",
+    # "gfx-testing",
+    # "hosted-baosec",
+] # hosted-baosec should be removed for commit, this is only here to make vscode happy

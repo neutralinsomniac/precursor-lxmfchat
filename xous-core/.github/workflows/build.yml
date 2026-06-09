@@ -1,0 +1,43 @@
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+
+name: Build xous-core
+
+jobs:
+  build:
+    name: Setup Rust
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        task: ["bao1x-boot0", "bao1x-boot1", "bao1x-alt-boot1", "bao1x-baremetal-dabao", "dabao", "baosec", "hosted-bao1x-ci", "hosted-ci", "renode-image"]
+    steps:
+      - name: Install Ubuntu dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y libxkbcommon-dev
+
+      - name: Update to latest toolchain
+        run: rustup update
+
+      - name: Checkout sources
+        uses: actions/checkout@v4
+      - name: Fetch tags
+        run: git fetch --prune --unshallow --tags
+
+      - uses: Swatinem/rust-cache@v1
+
+      - name: Install RISC-V toolkit
+        run: cargo xtask install-toolkit --force --no-verify
+
+      - name: Clean out old target directory (in case of libstd change)
+        run: rm -rf target/*
+
+      - name: Build CI targets
+        run: cargo xtask ${{ matrix.task }} --no-verify

@@ -1,0 +1,62 @@
+[package]
+authors = ["bunnie <bunnie@kosagi.com>"]
+description = "Provide high-resolution, non-rollover system time"
+edition = "2018"
+name = "xous-ticktimer"
+version = "0.1.32"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/betrusted-io/xous-core/"
+homepage = "https://betrusted.io/xous-book/"
+
+# Dependency versions enforced by Cargo.lock.
+[dependencies]
+xous-api-ticktimer = "0.9.70"
+xous = "0.9.70"
+xous-ipc = "0.10.10"
+xous-names = { package = "xous-api-names", version = "0.9.71" }
+log-server = { package = "xous-api-log", version = "0.1.69" }
+susres = { path = "../../api/xous-api-susres", package = "xous-api-susres" }
+log = "0.4.14"
+rkyv = { version = "0.8.8", default-features = false, features = [
+    "std",
+    "alloc",
+] }
+num-derive = { version = "0.4.2", default-features = false }
+num-traits = { version = "0.2.14", default-features = false }
+xous-semver = "0.1.5"
+utralib = { version = "0.1.27", optional = true, default-features = false }
+loader = { path = "../../loader", optional = true }
+bao1x-api = { path = "../../libs/bao1x-api", optional = true }
+rand_chacha = { version = "0.3.1", optional = true }
+
+# TODO: fix this
+#[target.'cfg(target_arch = "arm")'.dependencies]
+#atsama5d27 = { git = "https://github.com/Foundation-Devices/atsama5d27.git", branch = "master" }
+
+[features]
+#atsama5d27 = ["utralib/atsama5d27"]
+atsama5d27 = []
+
+# you may want to remove the watchdog feature if you're debugging a crash, as it will force the system to reboot automatically
+precursor = ["utralib/precursor", "susres/precursor", "watchdog"]
+hosted = ["utralib/hosted", "susres/hosted", "watchdog"]
+renode = ["utralib/renode", "susres/renode", "watchdog"]
+
+board-dabao = []
+board-baosec = []
+bao1x = [
+    "utralib/bao1x",
+    "utralib/std",
+    "bao1x-api",
+    "rand_chacha",
+    "susres/bao1x",
+]
+hosted-baosec = []
+
+susres = []
+debug-print = []
+watchdog = []
+timestamp = []
+default = []     # watchdog option is now moved into individual platform configs
+# default = []
+# default = ["debug-print"]

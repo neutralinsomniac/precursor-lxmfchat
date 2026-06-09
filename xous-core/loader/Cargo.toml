@@ -1,0 +1,148 @@
+[package]
+name = "loader"
+version = "0.1.0"
+authors = [
+    "Sean Cross <sean@xobs.io>",
+    "Foundation Devices, Inc. <hello@foundationdevices.com>",
+]
+edition = "2018"
+description = "Initial kernel loader for Xous"
+
+[dependencies]
+xous = "0.9.70"
+ed25519-dalek-loader = { path = "ed25519-dalek-loader", default-features = false, optional = true }
+curve25519-dalek-loader = { path = "curve25519-dalek-loader", default-features = false, features = [
+    "u32e_backend",
+], optional = true }
+ed25519-dalek-bao1x = { path = "../bao1x-boot/ed25519-dalek-bao1x", default-features = false, features = [
+    "digest",
+], optional = true }
+sha2-bao1x = { path = "../bao1x-boot/sha2-bao1x", optional = true, default-features = false }
+utralib = { version = "0.1.27", optional = true, default-features = false }
+armv7 = { git = "https://github.com/Foundation-Devices/armv7.git", branch = "update", optional = true }
+atsama5d27 = { git = "https://github.com/Foundation-Devices/atsama5d27.git", branch = "master", optional = true }
+sha2-loader = { path = "./sha2-loader", default-features = false, optional = true }
+bao1x-hal = { path = "../libs/bao1x-hal", optional = true, default-features = false }
+bao1x-api = { path = "../libs/bao1x-api", default-features = false }
+ux-api = { path = "../libs/ux-api", optional = true, default-features = false }
+xous-pl230 = { path = "../libs/xous-pl230", optional = true, features = [
+    "tests",
+    "pio",
+    "bao1x",
+    "baremetal",
+    # "dma-mainram",  # PL-230 option - this fails on MPW
+] }
+# xous-pio = { path = "../libs/xous-pio", optional = true, features = [
+#     "tests",
+#     "bao1x",
+#     "baremetal",
+# ] }
+aes-gcm-siv = { version = "0.11.1", default-features = false, features = [
+    "aes",
+], optional = true }
+aes = { path = "../services/aes", default-features = false, optional = true, features = [
+    "chaffing",
+] }
+crc = { version = "1.8.1", default-features = false }
+rand_chacha = { version = "0.3.1", optional = true, default-features = false }
+pio-proc = { version = "0.2.2", optional = true }
+pio = { version = "0.2.1", optional = true }
+vexriscv = { version = "0.5.6", package = "xous-riscv" }
+libm = { version = "0.2.8", optional = true }
+nalgebra = { version = "0.33", default-features = false, features = [
+    "libm",
+], optional = true }
+simple-fatfs = { git = "https://github.com/betrusted-io/simple-fatfs.git", branch = "baosec", optional = true, default-features = false }
+linked_list_allocator = { version = "0.10.5" }
+sha2 = { version = "0.10.8", optional = true, default-features = false }
+digest = { version = "0.10.7", optional = true }
+critical-section = { version = "1.2.0", optional = true }
+riscv = { version = "0.14.0", features = ["critical-section-single-hart"] }
+hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
+
+[dependencies.ed25519-dalek]
+version = "=2.1.0"
+optional = true
+default-features = false
+features = ["rand_core", "digest"]
+
+[dependencies.com_rs]
+git = "https://github.com/betrusted-io/com_rs"
+branch = "main"
+
+[dev-dependencies]
+lazy_static = "1.4.0"
+
+[features]
+precursor = [
+    "utralib/precursor",
+    "ed25519-dalek-loader/precursor",
+    "curve25519-dalek-loader/precursor",
+    "resume",
+    "secboot",
+    "sha2-loader",
+]
+renode = [
+    "utralib/renode",
+    "ed25519-dalek-loader/renode",
+    "curve25519-dalek-loader/renode",
+    "secboot",
+    "sha2-loader",
+]
+bao1x = [
+    "dep:aes",
+    "aes/bao1x",
+    "utralib/bao1x",
+    # caution: leaving this on will force debug-print-usb in *all* bao1x-hal configs!!
+    # "bao1x-hal/debug-print-uart",
+    "debug-print",
+    "bao1x-hal",
+    "rand_chacha",
+]
+board-baosec = [
+    "bao1x-hal/loader-baosec",
+    "ed25519-dalek-bao1x",
+    "sha2-bao1x",
+    "digest",
+    "ux-api/loader-baosec",
+    "aes/loader-baosec",
+    "bao1x-hal/security",
+]
+oem-baosec-lite = []
+board-baosor = ["bao1x-hal/loader-baosor"]
+board-dabao = [
+    "bao1x-hal/loader-dabao",
+    "bao1x-hal/board-dabao",
+    "aes/loader-dabao",
+    "bao1x-hal/security",
+]
+atsama5d27 = ["utralib/atsama5d27", "armv7", "dep:atsama5d27"]
+
+# precursor flags
+vexii-test = []     # integration test for vexii, not a production configuration
+platform-tests = []
+renode-bypass = []
+secboot = []
+#default = ["debug-print"]
+
+# swap flag
+swap = ["dep:aes-gcm-siv"]
+
+# bao1x target flags
+board-bringup = []
+simulation-only = []
+verilator-only = []
+spim-test = []
+irq-test = []
+fast-fclk = []
+clock-tests = []
+reset-debug = []
+bao1x-mpw = ["bao1x-hal/mpw"]
+userspace-swap-debug = []     # sets up app UART mapping.
+
+# general flags
+debug-print = []
+early-printk = []
+resume = []       # suspend/resume pathway code
+
+default = []
