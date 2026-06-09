@@ -18,11 +18,16 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lxmf::message::{self, Fields};
+use lxmf::msgpack::{self, Value};
 use rand_core::OsRng;
-use reticulum_core::constants::KEY_HALF;
+use reticulum_core::constants::{
+    CONTEXT_REQUEST, CONTEXT_RESOURCE, CONTEXT_RESOURCE_ADV, CONTEXT_RESOURCE_REQ, CONTEXT_RESPONSE, KEY_HALF,
+};
+use reticulum_core::crypto::{full_hash, truncated_hash};
 use reticulum_core::destination::single_destination_hash;
 use reticulum_core::hdlc::{Deframer, frame};
 use reticulum_core::identity::PrivateIdentity;
+use reticulum_core::resource::ResourceReceiver;
 use reticulum_core::transport::{Event, Transport};
 
 fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() }
@@ -81,13 +86,20 @@ fn main() {
     println!("sent announce ({} bytes)", ann.len());
 
     let is_send = mode == "send" || mode == "send-direct";
+    // `sync <host:port> <pn_propagation_dest_hex> [seconds]` downloads stored
+    // messages from a propagation node (validates the Resource receiver + sync).
+    let needs_target = is_send || mode == "sync";
     let listen_secs: u64 = match mode {
         "listen" => args.get(3).and_then(|s| s.parse().ok()).unwrap_or(30),
+        "sync" => args.get(4).and_then(|s| s.parse().ok()).unwrap_or(30),
         _ if is_send => args.get(5).and_then(|s| s.parse().ok()).unwrap_or(30),
         _ => 30,
     };
 
-    let target: Option<[u8; 16]> = if is_send {
+    let mut sync_phase: u8 = 0; // 0 idle, 1 list requested, 2 messages requested
+    let mut sync_rx: Option<ResourceReceiver> = None;
+
+    let target: Option<[u8; 16]> = if needs_target {
         let v = unhex(&args[3]);
         let mut h = [0u8; 16];
         h.copy_from_slice(&v);
@@ -160,8 +172,8 @@ fn main() {
                         // If we're sending and just learned the target, send now.
                         if let Some(t) = target {
                             if destination_hash == t && !sent {
-                                if mode == "send-direct" {
-                                    // Initiate a link; we deliver once it's up.
+                                if mode == "send-direct" || mode == "sync" {
+                                    // Initiate a link; we deliver / sync once it's up.
                                     let known = tp.known(&t).expect("target known").clone();
                                     let mut ex = [0u8; 32];
                                     let mut ed = [0u8; 32];
@@ -189,15 +201,29 @@ fn main() {
                             writer.flush().ok();
                             println!("sent link RTT ({} bytes)", rtt.len());
                         }
-                        let msg = message::pack(
-                            tp.identity(), &lt, &our_dh, now() as f64, b"", text.as_bytes(), &Fields::new(), None,
-                        );
-                        let mut iv = [0u8; 16];
-                        rand_core::RngCore::fill_bytes(&mut OsRng, &mut iv);
-                        if let Some((raw, ph)) = tp.make_link_data(&link_id, &msg.packed, &iv) {
-                            writer.write_all(&frame(&raw)).ok();
-                            writer.flush().ok();
-                            println!("sent direct LXMF over link ({} bytes), awaiting proof {}", raw.len(), reticulum_core::hex(&ph));
+                        if mode == "sync" {
+                            // Identify to the node, then request the message-id list.
+                            let mut iiv = [0u8; 16];
+                            rand_core::RngCore::fill_bytes(&mut OsRng, &mut iiv);
+                            if let Some(idp) = tp.make_out_link_identify(&link_id, &iiv) {
+                                writer.write_all(&frame(&idp)).ok();
+                                writer.flush().ok();
+                                println!("sync: identified to node");
+                            }
+                            sync_send_get(&mut writer, &tp, &link_id, Value::Array(vec![Value::Nil, Value::Nil]));
+                            sync_phase = 1;
+                            println!("sync: requested message list");
+                        } else {
+                            let msg = message::pack(
+                                tp.identity(), &lt, &our_dh, now() as f64, b"", text.as_bytes(), &Fields::new(), None,
+                            );
+                            let mut iv = [0u8; 16];
+                            rand_core::RngCore::fill_bytes(&mut OsRng, &mut iv);
+                            if let Some((raw, ph)) = tp.make_link_data(&link_id, &msg.packed, &iv) {
+                                writer.write_all(&frame(&raw)).ok();
+                                writer.flush().ok();
+                                println!("sent direct LXMF over link ({} bytes), awaiting proof {}", raw.len(), reticulum_core::hex(&ph));
+                            }
                         }
                     }
                     Event::Delivered { packet_hash } => {
@@ -226,6 +252,9 @@ fn main() {
                             Err(e) => println!("inbound data, but LXMF parse failed: {:?}", e),
                         }
                     }
+                    Event::OutLinkData { link_id, context, plaintext } => {
+                        sync_handle_outlink(&mut writer, &tp, &mut sync_phase, &mut sync_rx, &link_id, context, plaintext);
+                    }
                     Event::Unhandled { packet_type, context, .. } => {
                         log::debug!("unhandled packet type={} ctx={}", packet_type, context);
                     }
@@ -242,6 +271,174 @@ fn main() {
         std::process::exit(1);
     }
     println!("done");
+}
+
+// ---- propagation-node sync (validates the Resource receiver + /get exchange) ---
+
+fn sync_send_get(writer: &mut TcpStream, tp: &Transport, link_id: &[u8; 16], data: Value) {
+    let path_hash = truncated_hash(b"/get");
+    let req = Value::Array(vec![Value::F64(now() as f64), Value::Bin(path_hash.to_vec()), data]);
+    let packed = msgpack::encode(&req);
+    let mut iv = [0u8; 16];
+    rand_core::RngCore::fill_bytes(&mut OsRng, &mut iv);
+    if let Some(raw) = tp.make_out_link_context(link_id, CONTEXT_REQUEST, &packed, &iv) {
+        writer.write_all(&frame(&raw)).ok();
+        writer.flush().ok();
+    }
+}
+
+fn parse_resp(payload: &[u8]) -> Option<Value> {
+    let v = msgpack::decode(payload).ok()?;
+    let arr = v.as_array()?;
+    if arr.len() < 2 {
+        return None;
+    }
+    Some(arr[1].clone())
+}
+
+fn sync_handle_outlink(
+    writer: &mut TcpStream,
+    tp: &Transport,
+    phase: &mut u8,
+    rx: &mut Option<ResourceReceiver>,
+    link_id: &[u8; 16],
+    context: u8,
+    plaintext: Vec<u8>,
+) {
+    match context {
+        CONTEXT_RESPONSE => {
+            if let Some(resp) = parse_resp(&plaintext) {
+                sync_response(writer, tp, phase, link_id, resp);
+            }
+        }
+        CONTEXT_RESOURCE_ADV => match ResourceReceiver::accept(&plaintext) {
+            Ok(r) => {
+                let req = r.request_data();
+                *rx = Some(r);
+                let mut iv = [0u8; 16];
+                rand_core::RngCore::fill_bytes(&mut OsRng, &mut iv);
+                if let Some(raw) = tp.make_out_link_context(link_id, CONTEXT_RESOURCE_REQ, &req, &iv) {
+                    writer.write_all(&frame(&raw)).ok();
+                    writer.flush().ok();
+                }
+                println!("sync: receiving resource…");
+            }
+            Err(e) => println!("sync: resource advertisement rejected: {e}"),
+        },
+        CONTEXT_RESOURCE => {
+            let complete = match rx.as_mut() {
+                Some(r) => {
+                    r.receive_part(&plaintext);
+                    r.is_complete()
+                }
+                None => false,
+            };
+            if !complete {
+                return;
+            }
+            let r = rx.as_ref().unwrap();
+            let stream = r.concat();
+            let plain = if r.encrypted() {
+                match tp.decrypt_out_link(link_id, &stream) {
+                    Some(p) => p,
+                    None => {
+                        println!("sync: resource stream decrypt failed");
+                        return;
+                    }
+                }
+            } else {
+                stream
+            };
+            match r.finish(&plain) {
+                Ok((payload, proof)) => {
+                    if let Some(p) = tp.make_out_link_resource_proof(link_id, &proof) {
+                        writer.write_all(&frame(&p)).ok();
+                        writer.flush().ok();
+                    }
+                    *rx = None;
+                    if let Some(resp) = parse_resp(&payload) {
+                        sync_response(writer, tp, phase, link_id, resp);
+                    }
+                }
+                Err(e) => println!("sync: resource finish failed: {e}"),
+            }
+        }
+        _ => {}
+    }
+}
+
+fn sync_response(writer: &mut TcpStream, tp: &Transport, phase: &mut u8, link_id: &[u8; 16], resp: Value) {
+    if let Value::Int(code) = resp {
+        println!("sync: node returned error code {code}");
+        *phase = 0;
+        return;
+    }
+    match *phase {
+        1 => {
+            let ids: Vec<Value> = resp.as_array().map(|a| a.to_vec()).unwrap_or_default();
+            println!("sync: node lists {} message(s)", ids.len());
+            if ids.is_empty() {
+                *phase = 0;
+                return;
+            }
+            sync_send_get(
+                writer,
+                tp,
+                link_id,
+                Value::Array(vec![Value::Array(ids), Value::Array(Vec::new()), Value::Int(1000)]),
+            );
+            *phase = 2;
+        }
+        2 => {
+            let blobs: Vec<Value> = resp.as_array().map(|a| a.to_vec()).unwrap_or_default();
+            let mut haves: Vec<Value> = Vec::new();
+            let mut count = 0;
+            for b in &blobs {
+                if let Some(bin) = b.as_bin() {
+                    sync_deliver(tp, bin);
+                    haves.push(Value::Bin(full_hash(bin).to_vec()));
+                    count += 1;
+                }
+            }
+            println!("sync: downloaded {count} message(s)");
+            if !haves.is_empty() {
+                let hn = haves.len();
+                sync_send_get(writer, tp, link_id, Value::Array(vec![Value::Nil, Value::Array(haves)]));
+                println!("sync: sent delete-confirm for {hn} message(s)");
+            }
+            *phase = 0;
+        }
+        _ => {}
+    }
+}
+
+fn sync_deliver(tp: &Transport, blob: &[u8]) {
+    if blob.len() <= 16 {
+        return;
+    }
+    match tp.identity().decrypt(&blob[16..], &[]) {
+        Ok(plain) => {
+            let mut full = blob[..16].to_vec();
+            full.extend_from_slice(&plain);
+            let src = if full.len() >= 32 {
+                let mut h = [0u8; 16];
+                h.copy_from_slice(&full[16..32]);
+                tp.known(&h).map(|k| k.identity.clone())
+            } else {
+                None
+            };
+            match message::parse(&full, src.as_ref()) {
+                Ok(m) => println!(
+                    ">>> SYNCED MSG from {} | content={:?} | sig_valid={}",
+                    reticulum_core::hex(&m.source_hash),
+                    m.content_string(),
+                    m.signature_validated
+                ),
+                Err(e) => println!("sync: synced message parse failed: {:?}", e),
+            }
+        }
+        Err(e) => println!("sync: synced message decrypt failed: {e}"),
+    }
 }
 
 fn send_message(
