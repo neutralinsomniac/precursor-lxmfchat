@@ -1000,7 +1000,11 @@ pub fn enqueue_outbound(
         created: now_secs(),
         deadline: now_secs() + DIRECT_DEADLINE,
     });
-    pump_outbox(shared, chat_cid, pddb, trng);
+    // Do NOT send here: enqueue_outbound runs on the MAIN (UI) thread (via post()),
+    // and pump_outbox does blocking hub writes — a stalled write would freeze the
+    // UI and the message bubble would never render. The pump thread picks the
+    // message up on its next tick (≤2s) and sends it; the bubble already shows ○.
+    let _ = (chat_cid, pddb, trng);
 }
 
 /// Background thread: re-drives the outbox every couple of seconds so timeouts,

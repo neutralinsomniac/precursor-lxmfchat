@@ -584,11 +584,14 @@ impl Ui {
     /// Returns `true` if the status bar is currently set for the busy animation
     pub(crate) fn is_busy(&self) -> bool { self.status_tv.busy_animation_state.is_some() }
 
-    /// Set the status bar text
+    /// Set the status bar text. Forces an immediate repaint: discrete status text
+    /// must always show, unlike the busy *animation* (whose rapid updates go
+    /// through the throttled `UpdateBusy` path). Otherwise a one-shot status update
+    /// can be silently dropped by the throttle and leave stale text on screen.
     pub(crate) fn set_status_text(&mut self, msg: &str) {
         self.status_tv.clear_str();
         write!(self.status_tv, "{}", msg).ok();
-        xous::send_message(self.self_cid, xous::Message::new_scalar(ChatOp::UpdateBusy as usize, 0, 0, 0, 0))
+        xous::send_message(self.self_cid, xous::Message::new_scalar(ChatOp::UpdateBusyForced as usize, 0, 0, 0, 0))
             .ok();
     }
 
