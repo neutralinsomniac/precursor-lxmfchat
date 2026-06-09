@@ -603,15 +603,16 @@ fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, l
 /// protocol-safe no-op, but the outbound bytes refresh the idle timers. One
 /// thread runs per connection and exits when the write fails (connection gone).
 pub fn keepalive_thread(shared: Arc<Shared>) {
-    const KEEPALIVE_SECS: u64 = 60;
-    let empty = frame(&[]);
-    // Runs for the app's lifetime (one instance). Sends a keepalive whenever a
-    // connection exists; stays quiet while the manager is reconnecting. Write
-    // errors are ignored — the read loop/manager detects the drop and reconnects.
+    const KEEPALIVE_SECS: u64 = 30;
+    // Runs for the app's lifetime (one instance). Sends a periodic empty frame
+    // whenever a connection exists. A failed write tears the connection down (see
+    // `write_to_hub`) so a silently-dead socket gets detected within KEEPALIVE_SECS
+    // and the manager reconnects — even if nothing else is trying to write.
     loop {
         std::thread::sleep(std::time::Duration::from_secs(KEEPALIVE_SECS));
-        if let Some(s) = shared.writer.lock().unwrap().as_mut() {
-            let _ = s.write_all(&empty).and_then(|_| s.flush());
+        let connected = shared.writer.lock().unwrap().is_some();
+        if connected {
+            write_to_hub(&shared, &[]);
         }
     }
 }
@@ -629,8 +630,16 @@ pub fn request_peer_key(shared: &Arc<Shared>, trng: &Trng, target: &[u8; TRUNCAT
 
 fn write_to_hub(shared: &Arc<Shared>, raw: &[u8]) {
     let framed = frame(raw);
-    if let Some(w) = shared.writer.lock().unwrap().as_mut() {
-        let _ = w.write_all(&framed).and_then(|_| w.flush());
+    let mut guard = shared.writer.lock().unwrap();
+    if let Some(w) = guard.as_mut() {
+        if w.write_all(&framed).and_then(|_| w.flush()).is_err() {
+            // A failed/timed-out write means the connection is dead OR the HDLC
+            // stream is now half-written and desynced. Don't keep limping along
+            // (that silently drops every later message): shut the socket so the
+            // read loop returns and the connection manager reconnects cleanly.
+            w.shutdown(std::net::Shutdown::Both).ok();
+            *guard = None;
+        }
     }
 }
 
