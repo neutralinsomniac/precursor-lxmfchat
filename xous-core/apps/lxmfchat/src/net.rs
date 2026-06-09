@@ -640,12 +640,12 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
     let pn = match crate::propagation_node() {
         Some(p) => p,
         None => {
-            chat::cf_set_status_text(chat_cid, "no propagation node configured");
+            chat::cf_set_status_text_forced(chat_cid, "no propagation node configured");
             return;
         }
     };
     if shared.sync.lock().unwrap().phase != SyncPhase::Idle {
-        chat::cf_set_status_text(chat_cid, "sync already in progress");
+        chat::cf_set_status_text_forced(chat_cid, "sync already in progress");
         return;
     }
     let (known, have_path) = {
@@ -656,7 +656,7 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         (Some(k), true) => k,
         _ => {
             request_peer_key(shared, trng, &pn);
-            chat::cf_set_status_text(chat_cid, "sync: finding the propagation node…");
+            chat::cf_set_status_text_forced(chat_cid, "sync: finding the propagation node…");
             return;
         }
     };
@@ -689,7 +689,7 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
             if let Some(raw) = raw {
                 write_to_hub(shared, &raw);
             }
-            chat::cf_set_status_text(chat_cid, "sync: contacting propagation node…");
+            chat::cf_set_status_text_forced(chat_cid, "sync: contacting propagation node…");
         }
     }
 }
@@ -724,7 +724,7 @@ fn sync_send_identify_and_list(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng,
     // `/get [None, None]` → list of transient ids.
     sync_send_get(shared, trng, link_id, Value::Array(vec![Value::Nil, Value::Nil]));
     shared.sync.lock().unwrap().phase = SyncPhase::ListRequested;
-    chat::cf_set_status_text(chat_cid, "sync: requesting message list…");
+    chat::cf_set_status_text_forced(chat_cid, "sync: requesting message list…");
 }
 
 /// Send an RNS request to the node's `/get` handler with `data` as the argument.
@@ -771,7 +771,7 @@ fn sync_on_outlink_data(
                 if let Some(raw) = { shared.transport.lock().unwrap().make_out_link_context(&link_id, CONTEXT_RESOURCE_REQ, &req, &iv) } {
                     write_to_hub(shared, &raw);
                 }
-                chat::cf_set_status_text(chat_cid, "sync: downloading…");
+                chat::cf_set_status_text_forced(chat_cid, "sync: downloading…");
             }
             Err(e) => {
                 log::warn!("sync resource advertisement rejected: {e}");
@@ -854,7 +854,7 @@ fn handle_sync_response(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: 
             let data = Value::Array(vec![Value::Array(ids), Value::Array(Vec::new()), Value::Int(SYNC_DELIVERY_LIMIT)]);
             sync_send_get(shared, trng, link_id, data);
             shared.sync.lock().unwrap().phase = SyncPhase::GetRequested;
-            chat::cf_set_status_text(chat_cid, &format!("sync: downloading {n} message(s)…"));
+            chat::cf_set_status_text_forced(chat_cid, &format!("sync: downloading {n} message(s)…"));
         }
         SyncPhase::GetRequested => {
             let blobs: Vec<Value> = resp.as_array().map(|a| a.to_vec()).unwrap_or_default();
@@ -906,7 +906,11 @@ fn sync_finish(shared: &Arc<Shared>, chat_cid: CID, msg: &str) {
         s.link_id = None;
         s.receiver = None;
     }
-    chat::cf_set_status_text(chat_cid, &format!("sync: {msg}"));
+    let line = format!("sync: {msg}");
+    // Persist the result as idle text (so it stays after the transient paint) AND
+    // force an immediate repaint, since the normal status redraw is throttled.
+    chat::cf_set_status_idle_text(chat_cid, &line);
+    chat::cf_set_status_text_forced(chat_cid, &line);
 }
 
 /// Parse an RNS response payload `[request_id, response]`, returning `response`.

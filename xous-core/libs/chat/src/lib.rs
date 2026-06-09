@@ -667,6 +667,16 @@ pub fn cf_set_status_text(chat_cid: xous::CID, msg: &str) {
         .expect("internal error");
 }
 
+/// Like [`cf_set_status_text`], but forces an immediate repaint. The normal status
+/// redraw is throttled (`BUSY_ANIMATION_RATE_MS`), so a single one-shot update can
+/// be silently dropped and leave stale text on screen — use this for status that
+/// must be seen even if nothing else updates the bar afterwards.
+pub fn cf_set_status_text_forced(chat_cid: xous::CID, msg: &str) {
+    cf_set_status_text(chat_cid, msg);
+    // SetStatusText (a blocking lend) has updated the text by now; force the paint.
+    xous::send_message(chat_cid, xous::Message::new_scalar(ChatOp::UpdateBusyForced as usize, 0, 0, 0, 0)).ok();
+}
+
 /// Atomically replace the text of the post matching `(author, timestamp)` in the
 /// active dialogue, returning true if a matching post was found and updated.
 /// Context-free variant for callers without a [`Chat`] handle (e.g. the net
