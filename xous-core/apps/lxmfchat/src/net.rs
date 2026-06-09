@@ -693,8 +693,9 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
     let known = match (known, have_path) {
         (Some(k), true) => k,
         _ => {
-            request_peer_key(shared, trng, &pn);
+            // Status BEFORE the hub write, so it shows even if the write stalls.
             chat::cf_set_status_text_forced(chat_cid, "sync: finding the propagation node…");
+            request_peer_key(shared, trng, &pn);
             return;
         }
     };
@@ -712,6 +713,7 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
             sync_send_identify_and_list(shared, chat_cid, trng, lid);
         }
         None => {
+            chat::cf_set_status_text_forced(chat_cid, "sync: contacting propagation node…");
             let raw = {
                 let mut tp = shared.transport.lock().unwrap();
                 if tp.pending_link_to(&pn) {
@@ -727,7 +729,6 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
             if let Some(raw) = raw {
                 write_to_hub(shared, &raw);
             }
-            chat::cf_set_status_text_forced(chat_cid, "sync: contacting propagation node…");
         }
     }
 }
@@ -754,6 +755,8 @@ fn sync_on_link_up(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng, link_id: [u
 
 /// Identify to the node and request the list of available message ids.
 fn sync_send_identify_and_list(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng, link_id: [u8; TRUNCATED_HASHLENGTH]) {
+    shared.sync.lock().unwrap().phase = SyncPhase::ListRequested;
+    chat::cf_set_status_text_forced(chat_cid, "sync: requesting message list…");
     let mut iv = [0u8; IV_LENGTH];
     crate::fill_random(trng, &mut iv);
     if let Some(idp) = { shared.transport.lock().unwrap().make_out_link_identify(&link_id, &iv) } {
@@ -761,8 +764,6 @@ fn sync_send_identify_and_list(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng,
     }
     // `/get [None, None]` → list of transient ids.
     sync_send_get(shared, trng, link_id, Value::Array(vec![Value::Nil, Value::Nil]));
-    shared.sync.lock().unwrap().phase = SyncPhase::ListRequested;
-    chat::cf_set_status_text_forced(chat_cid, "sync: requesting message list…");
 }
 
 /// Send an RNS request to the node's `/get` handler with `data` as the argument.
@@ -1036,9 +1037,6 @@ pub fn outbox_pump_thread(shared: Arc<Shared>, chat_cid: CID) {
     };
     loop {
         std::thread::sleep(std::time::Duration::from_secs(2));
-        // Auto-sync from the propagation node once, after its route is learned,
-        // and abort a sync that has stalled past its deadline.
-        maybe_auto_sync(&shared, chat_cid, &trng);
         if !shared.outbox.lock().unwrap().is_empty() {
             // Mine any pending propagation stamp first (slow, lock-free), so the
             // blob is ready when pump_outbox reaches the PN-send step. Doing it
@@ -1046,6 +1044,24 @@ pub fn outbox_pump_thread(shared: Arc<Shared>, chat_cid: CID) {
             compute_pending_pn_blob(&shared, chat_cid, &trng);
             pump_outbox(&shared, chat_cid, &pddb, &trng);
         }
+    }
+}
+
+/// Dedicated propagation-node sync driver, on its OWN thread so a slow outbox op
+/// (stalled write / PoW mining) on the pump thread can't delay a sync request, and
+/// so a slow sync can't delay message sending. Consumes the manual-sync flag and
+/// times out a stalled sync.
+pub fn sync_thread(shared: Arc<Shared>, chat_cid: CID) {
+    let trng = match XousNames::new().ok().and_then(|xns| Trng::new(&xns).ok()) {
+        Some(t) => t,
+        None => {
+            log::error!("sync thread: TRNG init failed");
+            return;
+        }
+    };
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        maybe_auto_sync(&shared, chat_cid, &trng);
     }
 }
 

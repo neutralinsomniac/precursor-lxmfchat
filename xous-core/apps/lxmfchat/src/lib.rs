@@ -240,6 +240,12 @@ impl<'a> LxmfChat<'a> {
             let pump = self.shared.clone();
             let pump_cid = self.chat_cid;
             std::thread::spawn(move || net::outbox_pump_thread(pump, pump_cid));
+            // A SEPARATE thread for propagation-node sync, so a slow outbox op
+            // (a stalled hub write, or PoW-stamp mining) on the pump thread can't
+            // stall the sync request — and vice-versa.
+            let synct = self.shared.clone();
+            let sync_cid = self.chat_cid;
+            std::thread::spawn(move || net::sync_thread(synct, sync_cid));
             return;
         }
         // Manager already running: drop any live socket so it reconnects to the
