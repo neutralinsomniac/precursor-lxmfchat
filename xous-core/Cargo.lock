@@ -3696,6 +3696,7 @@ dependencies = [
  "blitstr2",
  "chat",
  "gam",
+ "llio",
  "log",
  "lxmf",
  "modals",

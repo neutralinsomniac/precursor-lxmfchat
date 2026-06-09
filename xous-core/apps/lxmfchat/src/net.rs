@@ -218,6 +218,9 @@ pub struct Shared {
     pub last_ts: Mutex<u64>,
     /// Propagation-node message sync state machine (download stored messages).
     pub sync: Mutex<SyncState>,
+    /// Low-level I/O handle, used to buzz the vibration motor on a new inbound
+    /// message. `vibe` is a fire-and-forget scalar, safe to call from any thread.
+    pub llio: llio::Llio,
 }
 
 fn hex(b: &[u8]) -> String { reticulum_core::hex(b) }
@@ -541,6 +544,9 @@ fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, l
             ids.remove(0);
         }
     }
+
+    // A genuinely new inbound message — buzz the vibration motor as a notification.
+    shared.llio.vibe(llio::VibePattern::Short).ok();
 
     let author = shared
         .contacts
