@@ -408,6 +408,13 @@ impl Transport {
         // app's sync client / Resource receiver to dispatch.
         if packet.packet_type == PACKET_DATA && self.out_links.contains_key(&packet.destination_hash) {
             let lid = packet.destination_hash;
+            // A RESOURCE *part* is a raw ciphertext chunk of the whole-stream-
+            // encrypted resource — RNS does NOT link-decrypt parts (the assembled
+            // stream is decrypted once). Pass it through raw; every other context
+            // (RESPONSE / RESOURCE_ADV / RESOURCE_HMU / …) is link-decrypted.
+            if packet.context == CONTEXT_RESOURCE {
+                return Event::OutLinkData { link_id: lid, context: packet.context, plaintext: packet.data };
+            }
             let key = self.out_links[&lid].key;
             return match link::decrypt(&key, &packet.data) {
                 Ok(plaintext) => Event::OutLinkData { link_id: lid, context: packet.context, plaintext },
@@ -699,6 +706,30 @@ impl Transport {
     ) -> Option<Vec<u8>> {
         let key = self.out_links.get(link_id)?.key;
         link::make_identify(link_id, &key, &self.identity, iv).ok()
+    }
+
+    /// Token-decrypt a blob with an established outbound link's session key — used
+    /// to decrypt a fully-reassembled Resource stream (RNS encrypts the whole
+    /// stream, not individual parts). None if the link isn't established or the
+    /// Token fails to verify.
+    pub fn decrypt_out_link(&self, link_id: &[u8; TRUNCATED_HASHLENGTH], data: &[u8]) -> Option<Vec<u8>> {
+        let key = self.out_links.get(link_id)?.key;
+        link::decrypt(&key, data).ok()
+    }
+
+    /// Build a Resource proof (`RESOURCE_PRF`) for an outbound link: an
+    /// **unencrypted** PROOF packet carrying `resource_hash || full_hash(payload ||
+    /// hash)`, sent so the propagation node knows we received the resource (and
+    /// can delete it). None if the link isn't established.
+    pub fn make_out_link_resource_proof(
+        &self,
+        link_id: &[u8; TRUNCATED_HASHLENGTH],
+        proof_data: &[u8],
+    ) -> Option<Vec<u8>> {
+        if !self.out_links.contains_key(link_id) {
+            return None;
+        }
+        Some(Packet::header1(DEST_LINK, PACKET_PROOF, CONTEXT_RESOURCE_PRF, *link_id, proof_data.to_vec()).encode())
     }
 
     /// Build an encrypted DATA packet with an arbitrary `context` on an established

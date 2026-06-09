@@ -22,6 +22,7 @@ pub mod hdlc;
 pub mod identity;
 pub mod link;
 pub mod packet;
+pub mod resource;
 pub mod transport;
 pub mod x25519;
 
