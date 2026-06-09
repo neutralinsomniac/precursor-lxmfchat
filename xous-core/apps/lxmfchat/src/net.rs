@@ -395,7 +395,7 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
         Event::Data { destination_hash, plaintext } => {
             let mut lxmf_bytes = destination_hash.to_vec();
             lxmf_bytes.extend_from_slice(&plaintext);
-            deliver_lxmf(shared, chat_cid, pddb, trng, &lxmf_bytes);
+            deliver_lxmf(shared, chat_cid, pddb, trng, &lxmf_bytes, true);
         }
         // We accepted an inbound link request: send the proof so the initiator
         // starts transmitting the message over the link.
@@ -414,7 +414,7 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
         // stops retrying / tearing the link down).
         Event::LinkData { plaintext, proof, .. } => {
             write_to_hub(shared, &proof);
-            deliver_lxmf(shared, chat_cid, pddb, trng, &plaintext);
+            deliver_lxmf(shared, chat_cid, pddb, trng, &plaintext, true);
         }
         // A link we initiated is up. Real RNS responders only activate the link —
         // and start accepting data — once they receive an RTT packet, so send it
@@ -510,7 +510,9 @@ fn verify_and_store_ticket(
 
 /// Parse a full LXMF blob (`dest||source||sig||payload`), verify, de-duplicate,
 /// route into the sender's thread, and post it.
-fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, lxmf_bytes: &[u8]) {
+/// `notify`: buzz the vibration motor for this message (live receipt). The sync
+/// path passes false and buzzes once for the whole batch instead.
+fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, lxmf_bytes: &[u8], notify: bool) {
     if lxmf_bytes.len() < 2 * TRUNCATED_HASHLENGTH {
         return;
     }
@@ -545,8 +547,11 @@ fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, l
         }
     }
 
-    // A genuinely new inbound message — buzz the vibration motor as a notification.
-    shared.llio.vibe(llio::VibePattern::Short).ok();
+    // A genuinely new inbound message — buzz the vibration motor as a notification
+    // (live receipt only; the sync path buzzes once per batch).
+    if notify {
+        shared.llio.vibe(llio::VibePattern::Long).ok();
+    }
 
     let author = shared
         .contacts
@@ -906,6 +911,10 @@ fn handle_sync_response(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: 
                 // `/get [None, haves]` → node deletes the messages we received.
                 sync_send_get(shared, trng, link_id, Value::Array(vec![Value::Nil, Value::Array(haves)]));
             }
+            if count > 0 {
+                // One buzz for the whole synced batch (deliver_lxmf didn't per-msg).
+                shared.llio.vibe(llio::VibePattern::Long).ok();
+            }
             sync_finish(shared, chat_cid, &format!("synced {count} message(s)"));
         }
         _ => {}
@@ -928,7 +937,7 @@ fn deliver_synced_message(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng
     };
     let mut full = blob[..TRUNCATED_HASHLENGTH].to_vec();
     full.extend_from_slice(&plaintext);
-    deliver_lxmf(shared, chat_cid, pddb, trng, &full);
+    deliver_lxmf(shared, chat_cid, pddb, trng, &full, false); // synced: batch-buzz instead
 }
 
 /// End the current sync (success or failure) and reset the state machine.
