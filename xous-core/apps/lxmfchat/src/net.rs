@@ -153,6 +153,11 @@ pub struct SyncState {
     /// Bounded by [`SYNC_ROUTE_TRIES`] so an unreachable node fails visibly
     /// instead of "finding the propagation node…" forever.
     route_tries: u8,
+    /// LINKREQUESTs sent this sync. Shown in the status line (".. try N"): a
+    /// counter that stops advancing tells us the sync thread is wedged, while
+    /// one that advances with no node response means the requests are lost on
+    /// the network — exactly the distinction we can't see otherwise on device.
+    link_tries: u8,
 }
 
 impl SyncState {
@@ -166,6 +171,7 @@ impl SyncState {
             requested: false,
             next_attempt: 0,
             route_tries: 0,
+            link_tries: 0,
         }
     }
 }
@@ -673,18 +679,28 @@ pub fn request_peer_key(shared: &Arc<Shared>, trng: &Trng, target: &[u8; TRUNCAT
     log::info!("sent path request for {}", hex(target));
 }
 
-fn write_to_hub(shared: &Arc<Shared>, raw: &[u8]) {
+/// Frame and write `raw` to the hub. Returns true only if the bytes were fully
+/// written; false if there is no connection or the write failed (callers that
+/// need delivery — like the sync state machine — surface that instead of
+/// silently doing nothing).
+fn write_to_hub(shared: &Arc<Shared>, raw: &[u8]) -> bool {
     let framed = frame(raw);
     let mut guard = shared.writer.lock().unwrap();
-    if let Some(w) = guard.as_mut() {
-        if w.write_all(&framed).and_then(|_| w.flush()).is_err() {
-            // A failed/timed-out write means the connection is dead OR the HDLC
-            // stream is now half-written and desynced. Don't keep limping along
-            // (that silently drops every later message): shut the socket so the
-            // read loop returns and the connection manager reconnects cleanly.
-            w.shutdown(std::net::Shutdown::Both).ok();
-            *guard = None;
+    match guard.as_mut() {
+        Some(w) => {
+            if w.write_all(&framed).and_then(|_| w.flush()).is_err() {
+                // A failed/timed-out write means the connection is dead OR the HDLC
+                // stream is now half-written and desynced. Don't keep limping along
+                // (that silently drops every later message): shut the socket so the
+                // read loop returns and the connection manager reconnects cleanly.
+                w.shutdown(std::net::Shutdown::Both).ok();
+                *guard = None;
+                false
+            } else {
+                true
+            }
         }
+        None => false,
     }
 }
 
@@ -725,11 +741,33 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         chat::cf_set_status_text_forced(chat_cid, "sync already in progress");
         return;
     }
+    let now = now_secs();
+    // No hub connection: nothing we send can go anywhere. Wait for the manager
+    // to reconnect (same bounded retry as the no-route case below) instead of
+    // burning the request on writes that go nowhere.
+    if shared.writer.lock().unwrap().is_none() {
+        let give_up = {
+            let mut s = shared.sync.lock().unwrap();
+            s.route_tries = s.route_tries.saturating_add(1);
+            if s.route_tries <= SYNC_ROUTE_TRIES {
+                s.requested = true;
+                s.next_attempt = now + SYNC_ROUTE_RETRY_SECS;
+                false
+            } else {
+                true
+            }
+        };
+        if give_up {
+            sync_finish(shared, chat_cid, "not connected to the hub");
+        } else {
+            chat::cf_set_status_text_forced(chat_cid, "sync: waiting for hub connection…");
+        }
+        return;
+    }
     let (known, have_path) = {
         let tp = shared.transport.lock().unwrap();
         (tp.known(&pn).cloned(), tp.has_path(&pn))
     };
-    let now = now_secs();
     let known = match (known, have_path) {
         (Some(k), true) => k,
         _ => {
@@ -766,6 +804,7 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         s.link_id = None;
         s.route_tries = 0;
         s.next_attempt = 0;
+        s.link_tries = 0;
     }
     match { shared.transport.lock().unwrap().outbound_link_for(&pn, now) } {
         Some(lid) => {
@@ -773,10 +812,36 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
             sync_send_identify_and_list(shared, chat_cid, trng, lid);
         }
         None => {
-            chat::cf_set_status_text_forced(chat_cid, "sync: contacting propagation node…");
-            send_pn_link_request(shared, trng, &pn, &known.identity, now);
+            // The hop count distinguishes a HEADER_1 (hops ≤ 1, direct) from a
+            // HEADER_2 (routed) link request — and the try counter advancing
+            // proves the sync thread is alive and writing. Status BEFORE the
+            // write so it shows even if the write stalls.
+            let hops = { shared.transport.lock().unwrap().path_hops(&pn) };
+            let hops = hops.map(|h| h.to_string()).unwrap_or_else(|| "?".to_string());
+            chat::cf_set_status_text_forced(
+                chat_cid,
+                &format!("sync: contacting node (try 1, hops {hops})…"),
+            );
+            match send_pn_link_request(shared, trng, &pn, &known.identity, now) {
+                LinkReqOutcome::WriteFailed => {
+                    sync_finish(shared, chat_cid, "hub write failed — try again");
+                }
+                LinkReqOutcome::Sent | LinkReqOutcome::Pending => {
+                    shared.sync.lock().unwrap().link_tries = 1;
+                }
+            }
         }
     }
+}
+
+/// What happened when we tried to (re)send a LINKREQUEST to the propagation node.
+enum LinkReqOutcome {
+    /// A fresh request was framed and fully written to the hub.
+    Sent,
+    /// A recent request is still pending an LRPROOF — nothing sent (correct).
+    Pending,
+    /// No connection, or the hub write failed: nothing went out.
+    WriteFailed,
 }
 
 /// Send a LINKREQUEST to the propagation node unless one is already pending and
@@ -788,7 +853,7 @@ fn send_pn_link_request(
     pn: &[u8; TRUNCATED_HASHLENGTH],
     pn_identity: &reticulum_core::identity::PublicIdentity,
     now: u64,
-) {
+) -> LinkReqOutcome {
     let raw = {
         let mut tp = shared.transport.lock().unwrap();
         if tp.pending_link_to(pn, now) {
@@ -801,8 +866,15 @@ fn send_pn_link_request(
             Some(tp.make_link_request(pn, pn_identity, &ex, &ed, now).0)
         }
     };
-    if let Some(raw) = raw {
-        write_to_hub(shared, &raw);
+    match raw {
+        None => LinkReqOutcome::Pending,
+        Some(raw) => {
+            if write_to_hub(shared, &raw) {
+                LinkReqOutcome::Sent
+            } else {
+                LinkReqOutcome::WriteFailed
+            }
+        }
     }
 }
 
@@ -1184,7 +1256,26 @@ fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
     if linking {
         let known = { shared.transport.lock().unwrap().known(&pn).cloned() };
         if let Some(k) = known {
-            send_pn_link_request(shared, trng, &pn, &k.identity, now);
+            match send_pn_link_request(shared, trng, &pn, &k.identity, now) {
+                LinkReqOutcome::Sent => {
+                    // Show the retry on the status line: a counter that advances
+                    // means the sync thread is alive and writes complete — if the
+                    // node still sees nothing, the requests die on the network.
+                    let tries = {
+                        let mut s = shared.sync.lock().unwrap();
+                        s.link_tries = s.link_tries.saturating_add(1);
+                        s.link_tries
+                    };
+                    chat::cf_set_status_text_forced(
+                        chat_cid,
+                        &format!("sync: contacting node (try {tries})…"),
+                    );
+                }
+                LinkReqOutcome::WriteFailed => {
+                    sync_finish(shared, chat_cid, "hub write failed — try again");
+                }
+                LinkReqOutcome::Pending => {}
+            }
         }
         return;
     }

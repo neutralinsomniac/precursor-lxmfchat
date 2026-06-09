@@ -241,6 +241,13 @@ impl Transport {
         self.paths.contains_key(hash)
     }
 
+    /// Hop count of the learned route to `hash`, if any (diagnostics: ≤1 means
+    /// outbound packets to it stay HEADER_1; >1 means they're rewritten to
+    /// HEADER_2 via the next-hop transport node).
+    pub fn path_hops(&self, hash: &[u8; TRUNCATED_HASHLENGTH]) -> Option<u8> {
+        self.paths.get(hash).map(|p| p.hops)
+    }
+
     /// Rewrite a freshly-built HEADER_1 packet for transport when its destination
     /// is more than one hop away, exactly as `RNS/Transport.py` `outbound` does:
     /// flip the header to HEADER_2 + TRANSPORT and splice the next-hop transport
