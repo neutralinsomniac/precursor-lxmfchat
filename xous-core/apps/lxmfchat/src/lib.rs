@@ -289,6 +289,26 @@ impl<'a> LxmfChat<'a> {
             return;
         }
 
+        // Echo our own message FIRST, before the heavier sign + PDDB work below, so
+        // the bubble appears the instant Enter is pressed (responsiveness). It gets
+        // a "pending" mark; the delivery engine swaps it to ✓/⇪/×. Force the display
+        // timestamp to the most recent slot so a wrong device clock can't bury it
+        // above peers' (correctly-timestamped) messages.
+        let display_ts = {
+            let mut lt = self.shared.last_ts.lock().unwrap();
+            let ts = now().max(*lt + 1);
+            *lt = ts;
+            ts
+        };
+        self.chat
+            .post_add(chat::SELF_AUTHOR, display_ts, &net::bubble_text(text, net::MARK_PENDING), None)
+            .ok();
+        xous::send_message(
+            self.chat_cid,
+            xous::Message::new_scalar(chat::ChatOp::DialogueSave as usize, 0, 0, 0, 0),
+        )
+        .ok();
+
         // If this peer enforces a stamp cost but has trusted us with a ticket,
         // use it to stamp the message (no proof-of-work needed). Expired tickets
         // are dropped.
@@ -332,25 +352,6 @@ impl<'a> LxmfChat<'a> {
             .or_else(|| self.shared.seen.lock().unwrap().get(&peer).map(|(n, _)| n.clone()))
             .unwrap_or_else(|| hex(&peer));
         save_contact(&self.shared, &self.pddb, &peer, &name);
-
-        // Echo our own message with a "pending" mark; the delivery engine swaps it
-        // to ✓ delivered / ⇪ stored-at-node / ✗ failed. Force the display timestamp
-        // to the most recent slot so a wrong device clock can't bury it above peers'
-        // (correctly-timestamped) messages.
-        let display_ts = {
-            let mut lt = self.shared.last_ts.lock().unwrap();
-            let ts = now().max(*lt + 1);
-            *lt = ts;
-            ts
-        };
-        self.chat
-            .post_add(chat::SELF_AUTHOR, display_ts, &net::bubble_text(text, net::MARK_PENDING), None)
-            .ok();
-        xous::send_message(
-            self.chat_cid,
-            xous::Message::new_scalar(chat::ChatOp::DialogueSave as usize, 0, 0, 0, 0),
-        )
-        .ok();
 
         // Hand off to the delivery engine: direct link first, propagation fallback.
         net::enqueue_outbound(
