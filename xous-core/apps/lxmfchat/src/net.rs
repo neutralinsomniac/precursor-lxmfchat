@@ -139,11 +139,22 @@ pub struct SyncState {
     deadline: u64,
     /// One-shot guard so we auto-sync only once per app run (on first connect).
     auto_done: bool,
+    /// Set by [`request_sync`] (the menu, on the main thread) and consumed by the
+    /// pump thread, so the actual link + hub writes never run on the main thread
+    /// (a blocking hub write there would freeze the whole UI).
+    requested: bool,
 }
 
 impl SyncState {
     pub fn new() -> SyncState {
-        SyncState { phase: SyncPhase::Idle, link_id: None, receiver: None, deadline: 0, auto_done: false }
+        SyncState {
+            phase: SyncPhase::Idle,
+            link_id: None,
+            receiver: None,
+            deadline: 0,
+            auto_done: false,
+            requested: false,
+        }
     }
 }
 
@@ -258,6 +269,10 @@ pub fn connection_manager(shared: Arc<Shared>, chat_cid: CID) {
         match TcpStream::connect((host.as_str(), port)) {
             Ok(stream) => {
                 stream.set_nodelay(true).ok();
+                // Bound hub writes so a stalled socket (e.g. during a resource
+                // transfer) can't block a writer forever and wedge the threads
+                // that share it (no-op if the Xous TcpStream ignores it).
+                stream.set_write_timeout(Some(std::time::Duration::from_secs(10))).ok();
                 match stream.try_clone() {
                     Ok(reader) => {
                         *shared.writer.lock().unwrap() = Some(stream);
@@ -1020,6 +1035,16 @@ fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         sync_finish(shared, chat_cid, "timed out");
         return;
     }
+    // A manual sync request (from the menu) is executed HERE — on the pump thread
+    // — never on the main thread, so a blocking hub write can't freeze the UI.
+    let requested = {
+        let mut s = shared.sync.lock().unwrap();
+        core::mem::replace(&mut s.requested, false)
+    };
+    if requested {
+        start_sync(shared, chat_cid, trng); // handles not-ready / already-running itself
+        return;
+    }
     // Auto-sync once per app run, when idle and the node is reachable.
     let go = {
         let s = shared.sync.lock().unwrap();
@@ -1036,6 +1061,12 @@ fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         shared.sync.lock().unwrap().auto_done = true;
         start_sync(shared, chat_cid, trng);
     }
+}
+
+/// Request a propagation-node sync from the main thread (the menu): just sets a
+/// flag the pump thread picks up. Does NO hub I/O, so it can never block the UI.
+pub fn request_sync(shared: &Arc<Shared>) {
+    shared.sync.lock().unwrap().requested = true;
 }
 
 /// Compute, **lock-free**, the propagation blob for at most one outbox message

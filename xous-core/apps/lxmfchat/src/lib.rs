@@ -263,9 +263,12 @@ impl<'a> LxmfChat<'a> {
         }
     }
 
-    /// Download messages stored for us at the configured propagation node.
+    /// Download messages stored for us at the configured propagation node. Only
+    /// flags the request — the pump thread does the actual link + hub writes, so
+    /// this returns immediately and never blocks the UI on a hub write.
     pub fn sync_now(&self) {
-        net::start_sync(&self.shared, self.chat_cid, &self.trng);
+        net::request_sync(&self.shared);
+        self.chat.set_status_text("sync requested…");
     }
 
     /// Send an opportunistic LXMF message to the current peer.
