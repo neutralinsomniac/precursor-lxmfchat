@@ -64,6 +64,7 @@ fn wrapped_main() -> ! {
     chat.menu_add(menu_item("My address", MenuOp::MyAddress)).ok();
     chat.menu_add(menu_item("Set peer", MenuOp::SetPeer)).ok();
     chat.menu_add(menu_item("Set hub", MenuOp::SetHub)).ok();
+    chat.menu_add(menu_item("Sync messages", MenuOp::Sync)).ok();
     chat.menu_add(menu_item("Clear history", MenuOp::ClearHistory)).ok();
     chat.menu_add(menu_item("Close", MenuOp::Noop)).ok();
 
@@ -102,6 +103,7 @@ fn wrapped_main() -> ! {
                         Some(MenuOp::SetPeer) => app.set_peer_interactive(&modals),
                         Some(MenuOp::SetHub) => app.set_hub_interactive(&modals),
                         Some(MenuOp::ClearHistory) => app.clear_history_interactive(&modals),
+                        Some(MenuOp::Sync) => app.sync_now(),
                         Some(MenuOp::Noop) | None => {}
                     }
                 });

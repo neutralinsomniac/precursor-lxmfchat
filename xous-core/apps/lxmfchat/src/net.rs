@@ -9,9 +9,15 @@ use std::sync::{Arc, Mutex};
 
 use chat::{ChatOp, Post};
 use pddb::Pddb;
-use reticulum_core::constants::{IV_LENGTH, KEY_HALF, TRUNCATED_HASHLENGTH};
+use reticulum_core::constants::{
+    CONTEXT_REQUEST, CONTEXT_RESOURCE, CONTEXT_RESOURCE_ADV, CONTEXT_RESOURCE_REQ, CONTEXT_RESPONSE,
+    IV_LENGTH, KEY_HALF, TRUNCATED_HASHLENGTH,
+};
+use reticulum_core::crypto::{full_hash, truncated_hash};
 use reticulum_core::hdlc::{Deframer, frame};
+use reticulum_core::resource::ResourceReceiver;
 use reticulum_core::transport::{Event, Transport};
+use lxmf::msgpack::{self, Value};
 use trng::Trng;
 use xous::CID;
 use xous_ipc::Buffer;
@@ -110,6 +116,37 @@ pub struct DeliveryUpdate {
     pub status: u8,
 }
 
+/// Stage of a propagation-node message sync (mirrors LXMF's `PR_*` states).
+#[derive(Clone, Copy, PartialEq)]
+enum SyncPhase {
+    Idle,
+    /// Waiting for the link to the node to come up.
+    Linking,
+    /// Sent `/get [None,None]`; awaiting the list of available message ids.
+    ListRequested,
+    /// Sent `/get [wants,…]`; awaiting (and assembling) the message blobs.
+    GetRequested,
+}
+
+/// State of an in-progress (or idle) propagation-node sync. One at a time.
+pub struct SyncState {
+    phase: SyncPhase,
+    /// The established outbound link id to the propagation node.
+    link_id: Option<[u8; TRUNCATED_HASHLENGTH]>,
+    /// In-progress Resource download (the list or the message batch).
+    receiver: Option<ResourceReceiver>,
+    /// Wall-clock deadline; sync aborts if it stalls past this.
+    deadline: u64,
+    /// One-shot guard so we auto-sync only once per app run (on first connect).
+    auto_done: bool,
+}
+
+impl SyncState {
+    pub fn new() -> SyncState {
+        SyncState { phase: SyncPhase::Idle, link_id: None, receiver: None, deadline: 0, auto_done: false }
+    }
+}
+
 /// State shared between the app's main thread and the network RX thread.
 pub struct Shared {
     pub transport: Mutex<Transport>,
@@ -165,6 +202,8 @@ pub struct Shared {
     /// `max(now, last_ts+1)` to guarantee it sorts to the bottom of the thread
     /// instead of being buried above peers' (correctly-timestamped) messages.
     pub last_ts: Mutex<u64>,
+    /// Propagation-node message sync state machine (download stored messages).
+    pub sync: Mutex<SyncState>,
 }
 
 fn hex(b: &[u8]) -> String { reticulum_core::hex(b) }
@@ -367,6 +406,7 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
             if let Some(rtt) = rtt {
                 write_to_hub(shared, &rtt);
             }
+            sync_on_link_up(shared, chat_cid, trng, link_id, target);
             pump_outbox(shared, chat_cid, pddb, trng);
         }
         // A packet proof confirmed one of our sent messages reached its target.
@@ -374,9 +414,9 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
             mark_delivered(shared, chat_cid, pddb, &packet_hash);
         }
         // Response / resource-transfer data on a link we opened (propagation-node
-        // sync). Dispatched by the sync client (task #19); logged for now.
+        // sync): drive the sync state machine.
         Event::OutLinkData { link_id, context, plaintext } => {
-            log::info!("out-link {} data ctx=0x{:02x} ({} bytes)", hex(&link_id), context, plaintext.len());
+            sync_on_outlink_data(shared, chat_cid, pddb, trng, link_id, context, plaintext);
         }
         Event::DataUndecryptable { destination_hash, reason } => {
             // Log-only — NEVER a persisted post. A repeated undecryptable packet
@@ -579,6 +619,306 @@ fn write_to_hub(shared: &Arc<Shared>, raw: &[u8]) {
     }
 }
 
+// ---- Propagation-node message sync (download stored messages) -----------------
+//
+// Mirrors LXMF's `request_messages_from_propagation_node`: open a link to the
+// node's lxmf.propagation destination, identify, then issue RNS requests to the
+// "/get" handler: first `[None,None]` to list the transient ids waiting for us,
+// then `[wants,haves,limit]` to download them (as a Resource), feed each through
+// `deliver_lxmf`, and finally `[None,haves]` so the node deletes what we received.
+
+/// LXMF `/get` request path; its hash selects the node's message-get handler.
+const SYNC_GET_PATH: &[u8] = b"/get";
+/// Per-transfer message size limit we advertise (KB) — LXMF `DELIVERY_LIMIT`.
+const SYNC_DELIVERY_LIMIT: i64 = 1000;
+/// Abort a sync that stalls past this many seconds.
+const SYNC_DEADLINE_SECS: u64 = 120;
+
+/// Begin a propagation-node sync (from the menu or auto on first connect). Ensures
+/// the node's key + route, (re)uses or opens the link, and kicks the exchange.
+pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
+    let pn = match crate::propagation_node() {
+        Some(p) => p,
+        None => {
+            chat::cf_set_status_text(chat_cid, "no propagation node configured");
+            return;
+        }
+    };
+    if shared.sync.lock().unwrap().phase != SyncPhase::Idle {
+        chat::cf_set_status_text(chat_cid, "sync already in progress");
+        return;
+    }
+    let (known, have_path) = {
+        let tp = shared.transport.lock().unwrap();
+        (tp.known(&pn).cloned(), tp.has_path(&pn))
+    };
+    let known = match (known, have_path) {
+        (Some(k), true) => k,
+        _ => {
+            request_peer_key(shared, trng, &pn);
+            chat::cf_set_status_text(chat_cid, "sync: finding the propagation node…");
+            return;
+        }
+    };
+    let now = now_secs();
+    {
+        let mut s = shared.sync.lock().unwrap();
+        s.phase = SyncPhase::Linking;
+        s.receiver = None;
+        s.deadline = now + SYNC_DEADLINE_SECS;
+        s.link_id = None;
+    }
+    match { shared.transport.lock().unwrap().outbound_link_for(&pn) } {
+        Some(lid) => {
+            shared.sync.lock().unwrap().link_id = Some(lid);
+            sync_send_identify_and_list(shared, chat_cid, trng, lid);
+        }
+        None => {
+            let raw = {
+                let mut tp = shared.transport.lock().unwrap();
+                if tp.pending_link_to(&pn) {
+                    None
+                } else {
+                    let mut ex = [0u8; KEY_HALF];
+                    let mut ed = [0u8; KEY_HALF];
+                    crate::fill_random(trng, &mut ex);
+                    crate::fill_random(trng, &mut ed);
+                    Some(tp.make_link_request(&pn, &known.identity, &ex, &ed).0)
+                }
+            };
+            if let Some(raw) = raw {
+                write_to_hub(shared, &raw);
+            }
+            chat::cf_set_status_text(chat_cid, "sync: contacting propagation node…");
+        }
+    }
+}
+
+/// Continue a pending sync once the link to the node comes up (from the
+/// `OutboundLinkUp` event). No-op unless we're mid-sync to this node.
+fn sync_on_link_up(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng, link_id: [u8; TRUNCATED_HASHLENGTH], target: [u8; TRUNCATED_HASHLENGTH]) {
+    if crate::propagation_node() != Some(target) {
+        return;
+    }
+    let go = {
+        let mut s = shared.sync.lock().unwrap();
+        if s.phase == SyncPhase::Linking {
+            s.link_id = Some(link_id);
+            true
+        } else {
+            false
+        }
+    };
+    if go {
+        sync_send_identify_and_list(shared, chat_cid, trng, link_id);
+    }
+}
+
+/// Identify to the node and request the list of available message ids.
+fn sync_send_identify_and_list(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng, link_id: [u8; TRUNCATED_HASHLENGTH]) {
+    let mut iv = [0u8; IV_LENGTH];
+    crate::fill_random(trng, &mut iv);
+    if let Some(idp) = { shared.transport.lock().unwrap().make_out_link_identify(&link_id, &iv) } {
+        write_to_hub(shared, &idp);
+    }
+    // `/get [None, None]` → list of transient ids.
+    sync_send_get(shared, trng, link_id, Value::Array(vec![Value::Nil, Value::Nil]));
+    shared.sync.lock().unwrap().phase = SyncPhase::ListRequested;
+    chat::cf_set_status_text(chat_cid, "sync: requesting message list…");
+}
+
+/// Send an RNS request to the node's `/get` handler with `data` as the argument.
+fn sync_send_get(shared: &Arc<Shared>, trng: &Trng, link_id: [u8; TRUNCATED_HASHLENGTH], data: Value) {
+    let path_hash = truncated_hash(SYNC_GET_PATH);
+    let req = Value::Array(vec![Value::F64(now_secs() as f64), Value::Bin(path_hash.to_vec()), data]);
+    let packed = msgpack::encode(&req);
+    let mut iv = [0u8; IV_LENGTH];
+    crate::fill_random(trng, &mut iv);
+    if let Some(raw) = { shared.transport.lock().unwrap().make_out_link_context(&link_id, CONTEXT_REQUEST, &packed, &iv) } {
+        write_to_hub(shared, &raw);
+    }
+}
+
+/// Dispatch decrypted out-link data for the active sync (RESPONSE packet, or a
+/// RESOURCE advertisement / parts carrying the response).
+fn sync_on_outlink_data(
+    shared: &Arc<Shared>,
+    chat_cid: CID,
+    pddb: &Pddb,
+    trng: &Trng,
+    link_id: [u8; TRUNCATED_HASHLENGTH],
+    context: u8,
+    plaintext: Vec<u8>,
+) {
+    {
+        let s = shared.sync.lock().unwrap();
+        if s.link_id != Some(link_id) || s.phase == SyncPhase::Idle {
+            return;
+        }
+    }
+    match context {
+        CONTEXT_RESPONSE => {
+            if let Some(resp) = parse_rns_response(&plaintext) {
+                handle_sync_response(shared, chat_cid, pddb, trng, link_id, resp);
+            }
+        }
+        CONTEXT_RESOURCE_ADV => match ResourceReceiver::accept(&plaintext) {
+            Ok(rx) => {
+                let req = rx.request_data();
+                shared.sync.lock().unwrap().receiver = Some(rx);
+                let mut iv = [0u8; IV_LENGTH];
+                crate::fill_random(trng, &mut iv);
+                if let Some(raw) = { shared.transport.lock().unwrap().make_out_link_context(&link_id, CONTEXT_RESOURCE_REQ, &req, &iv) } {
+                    write_to_hub(shared, &raw);
+                }
+                chat::cf_set_status_text(chat_cid, "sync: downloading…");
+            }
+            Err(e) => {
+                log::warn!("sync resource advertisement rejected: {e}");
+                sync_finish(shared, chat_cid, "sync failed (unsupported resource)");
+            }
+        },
+        CONTEXT_RESOURCE => {
+            let complete = {
+                let mut s = shared.sync.lock().unwrap();
+                match &mut s.receiver {
+                    Some(rx) => {
+                        rx.receive_part(&plaintext);
+                        rx.is_complete()
+                    }
+                    None => false,
+                }
+            };
+            if !complete {
+                return;
+            }
+            let (stream, encrypted) = {
+                let s = shared.sync.lock().unwrap();
+                let rx = s.receiver.as_ref().unwrap();
+                (rx.concat(), rx.encrypted())
+            };
+            let plain = if encrypted {
+                match { shared.transport.lock().unwrap().decrypt_out_link(&link_id, &stream) } {
+                    Some(p) => p,
+                    None => {
+                        sync_finish(shared, chat_cid, "sync failed (decrypt)");
+                        return;
+                    }
+                }
+            } else {
+                stream
+            };
+            let finished = { shared.sync.lock().unwrap().receiver.as_ref().unwrap().finish(&plain) };
+            match finished {
+                Ok((payload, proof)) => {
+                    if let Some(raw) = { shared.transport.lock().unwrap().make_out_link_resource_proof(&link_id, &proof) } {
+                        write_to_hub(shared, &raw);
+                    }
+                    shared.sync.lock().unwrap().receiver = None;
+                    if let Some(resp) = parse_rns_response(&payload) {
+                        handle_sync_response(shared, chat_cid, pddb, trng, link_id, resp);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("sync resource invalid: {e}");
+                    sync_finish(shared, chat_cid, "sync failed (resource)");
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A `/get` response arrived (the `response` element of `[request_id, response]`).
+fn handle_sync_response(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, link_id: [u8; TRUNCATED_HASHLENGTH], resp: Value) {
+    // Error codes: 240 = no identity, 241 = no access.
+    if let Value::Int(code) = resp {
+        let why = match code {
+            240 => "node needs identification",
+            241 => "node denied access",
+            _ => "node error",
+        };
+        sync_finish(shared, chat_cid, why);
+        return;
+    }
+    let phase = shared.sync.lock().unwrap().phase;
+    match phase {
+        SyncPhase::ListRequested => {
+            let ids: Vec<Value> = resp.as_array().map(|a| a.to_vec()).unwrap_or_default();
+            if ids.is_empty() {
+                sync_finish(shared, chat_cid, "no new messages");
+                return;
+            }
+            let n = ids.len();
+            // Request all listed messages: `/get [wants, [], limit]`.
+            let data = Value::Array(vec![Value::Array(ids), Value::Array(Vec::new()), Value::Int(SYNC_DELIVERY_LIMIT)]);
+            sync_send_get(shared, trng, link_id, data);
+            shared.sync.lock().unwrap().phase = SyncPhase::GetRequested;
+            chat::cf_set_status_text(chat_cid, &format!("sync: downloading {n} message(s)…"));
+        }
+        SyncPhase::GetRequested => {
+            let blobs: Vec<Value> = resp.as_array().map(|a| a.to_vec()).unwrap_or_default();
+            let mut haves: Vec<Value> = Vec::new();
+            let mut count = 0;
+            for b in &blobs {
+                if let Some(bin) = b.as_bin() {
+                    deliver_synced_message(shared, chat_cid, pddb, trng, bin);
+                    // Confirm by transient id so the node deletes it (LXMF uses
+                    // full_hash of the returned, stamp-stripped blob).
+                    haves.push(Value::Bin(full_hash(bin).to_vec()));
+                    count += 1;
+                }
+            }
+            if !haves.is_empty() {
+                // `/get [None, haves]` → node deletes the messages we received.
+                sync_send_get(shared, trng, link_id, Value::Array(vec![Value::Nil, Value::Array(haves)]));
+            }
+            sync_finish(shared, chat_cid, &format!("synced {count} message(s)"));
+        }
+        _ => {}
+    }
+}
+
+/// Decrypt a synced message blob (`dest_hash(16) || encrypt_to_us(...)`) and route
+/// it through the normal inbound path.
+fn deliver_synced_message(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, blob: &[u8]) {
+    if blob.len() <= TRUNCATED_HASHLENGTH {
+        return;
+    }
+    let plaintext = { shared.transport.lock().unwrap().identity().decrypt(&blob[TRUNCATED_HASHLENGTH..], &[]) };
+    let plaintext = match plaintext {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("synced message decrypt failed: {e}");
+            return;
+        }
+    };
+    let mut full = blob[..TRUNCATED_HASHLENGTH].to_vec();
+    full.extend_from_slice(&plaintext);
+    deliver_lxmf(shared, chat_cid, pddb, trng, &full);
+}
+
+/// End the current sync (success or failure) and reset the state machine.
+fn sync_finish(shared: &Arc<Shared>, chat_cid: CID, msg: &str) {
+    {
+        let mut s = shared.sync.lock().unwrap();
+        s.phase = SyncPhase::Idle;
+        s.link_id = None;
+        s.receiver = None;
+    }
+    chat::cf_set_status_text(chat_cid, &format!("sync: {msg}"));
+}
+
+/// Parse an RNS response payload `[request_id, response]`, returning `response`.
+fn parse_rns_response(payload: &[u8]) -> Option<Value> {
+    let v = msgpack::decode(payload).ok()?;
+    let arr = v.as_array()?;
+    if arr.len() < 2 {
+        return None;
+    }
+    Some(arr[1].clone())
+}
+
 fn post_to_chat(shared: &Arc<Shared>, chat_cid: CID, author: &str, timestamp: u64, text: &str) {
     let post = Post {
         dialogue_id: shared.dialogue_id.clone(),
@@ -646,6 +986,9 @@ pub fn outbox_pump_thread(shared: Arc<Shared>, chat_cid: CID) {
     };
     loop {
         std::thread::sleep(std::time::Duration::from_secs(2));
+        // Auto-sync from the propagation node once, after its route is learned,
+        // and abort a sync that has stalled past its deadline.
+        maybe_auto_sync(&shared, chat_cid, &trng);
         if !shared.outbox.lock().unwrap().is_empty() {
             // Mine any pending propagation stamp first (slow, lock-free), so the
             // blob is ready when pump_outbox reaches the PN-send step. Doing it
@@ -653,6 +996,41 @@ pub fn outbox_pump_thread(shared: Arc<Shared>, chat_cid: CID) {
             compute_pending_pn_blob(&shared, chat_cid, &trng);
             pump_outbox(&shared, chat_cid, &pddb, &trng);
         }
+    }
+}
+
+/// Kick off a one-time sync once the propagation node's route is known (after the
+/// connect-time path request resolves), and time out a stalled sync. Called on the
+/// pump thread's tick so it doesn't block the net read loop.
+fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
+    let pn = match crate::propagation_node() {
+        Some(p) => p,
+        None => return,
+    };
+    // Time out a stuck sync.
+    let stalled = {
+        let s = shared.sync.lock().unwrap();
+        s.phase != SyncPhase::Idle && now_secs() > s.deadline
+    };
+    if stalled {
+        sync_finish(shared, chat_cid, "timed out");
+        return;
+    }
+    // Auto-sync once per app run, when idle and the node is reachable.
+    let go = {
+        let s = shared.sync.lock().unwrap();
+        !s.auto_done && s.phase == SyncPhase::Idle
+    };
+    if !go {
+        return;
+    }
+    let ready = {
+        let tp = shared.transport.lock().unwrap();
+        tp.known(&pn).is_some() && tp.has_path(&pn)
+    };
+    if ready {
+        shared.sync.lock().unwrap().auto_done = true;
+        start_sync(shared, chat_cid, trng);
     }
 }
 

@@ -180,6 +180,7 @@ impl<'a> LxmfChat<'a> {
             current_peer: Mutex::new(current_peer),
             recent_msg_ids: Mutex::new(Vec::new()),
             last_ts: Mutex::new(0),
+            sync: Mutex::new(net::SyncState::new()),
             hub: Mutex::new(hub.clone()),
             unread: Mutex::new(unread_map),
             pending: Mutex::new(pending_map),
@@ -260,6 +261,11 @@ impl<'a> LxmfChat<'a> {
         if self.write_framed(&raw) {
             self.chat.set_status_text("announced");
         }
+    }
+
+    /// Download messages stored for us at the configured propagation node.
+    pub fn sync_now(&self) {
+        net::start_sync(&self.shared, self.chat_cid, &self.trng);
     }
 
     /// Send an opportunistic LXMF message to the current peer.

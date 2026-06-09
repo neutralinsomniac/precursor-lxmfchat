@@ -36,6 +36,8 @@ pub enum MenuOp {
     /// Wipe the message history of the currently-open conversation (keeps the
     /// contact, its key, and any stamp ticket).
     ClearHistory,
+    /// Download messages stored for us at the propagation node (store-and-forward).
+    Sync,
     /// no-op (close menu)
     Noop,
 }
