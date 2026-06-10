@@ -126,7 +126,12 @@ impl Dialogue {
 
                 // compute the bounds for the post if visual properties are specified
                 if let Some((vp, gam)) = vp {
-                    let mut layout_bubble = default_textview(&new, false, vp);
+                    // measure with the same header the bubble will render with
+                    let header = crate::post_header(
+                        self.author(new.author_id()).map(|a| a.name.as_str()),
+                        new.timestamp(),
+                    );
+                    let mut layout_bubble = default_textview(&new, Some(&header), false, vp);
                     log::debug!("Computing bounds on {:?}", layout_bubble);
                     if gam.bounds_compute_textview(&mut layout_bubble).is_ok() {
                         new.bounding_box = layout_bubble.bounds_computed;
@@ -215,7 +220,12 @@ impl Dialogue {
         let author_id = self.posts[idx].author_id();
         let mut updated = Post::new(author_id, timestamp, new_text, None);
         if let Some((vp, gam)) = vp {
-            let mut layout_bubble = default_textview(&updated, false, vp);
+            // measure with the same header the bubble will render with
+            let header = crate::post_header(
+                self.author(author_id).map(|a| a.name.as_str()),
+                updated.timestamp(),
+            );
+            let mut layout_bubble = default_textview(&updated, Some(&header), false, vp);
             if gam.bounds_compute_textview(&mut layout_bubble).is_ok() {
                 updated.bounding_box = layout_bubble.bounds_computed;
             }
@@ -263,6 +273,12 @@ impl Dialogue {
     ///
     /// * `id` - the index of the required Author
     pub fn author(&self, id: u16) -> Option<&Author> { self.authors.get(&id) }
+
+    /// A snapshot of author names by id — for render-time bubble headers in
+    /// contexts where the dialogue itself is mutably borrowed (ui layout).
+    pub fn author_names(&self) -> HashMap<u16, String> {
+        self.authors.iter().map(|(id, a)| (*id, a.name.clone())).collect()
+    }
 
     /// Return Some<author_id> by Author name, or None.
     ///

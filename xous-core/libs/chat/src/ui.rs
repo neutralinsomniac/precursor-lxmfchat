@@ -657,6 +657,10 @@ impl Ui {
                     self.layout_topdown = false;
                     dialogue.post_last().unwrap_or(0)
                 };
+                // Snapshot author names before the posts are mutably borrowed:
+                // height measurement must use the same header the bubble will
+                // render with (see `post_header`).
+                let author_names = dialogue.author_names();
                 let mut fwd_iter;
                 let mut rev_iter;
                 let search_window: &mut dyn Iterator<Item = _> = if self.layout_topdown {
@@ -681,7 +685,11 @@ impl Ui {
                         bb.height() + self.vp.bubble_space as u32 + self.vp.bubble_margin.y as u32
                     } else {
                         // if the "natural height" has not been computed, do so now.
-                        let mut layout_bubble = default_textview(post, false, &self.vp);
+                        let header = crate::post_header(
+                            author_names.get(&post.author_id()).map(|s| s.as_str()),
+                            post.timestamp(),
+                        );
+                        let mut layout_bubble = default_textview(post, Some(&header), false, &self.vp);
                         log::debug!("compute bounds on {}", layout_bubble);
                         if self.gam.bounds_compute_textview(&mut layout_bubble).is_ok() {
                             post.bounding_box = layout_bubble.bounds_computed;

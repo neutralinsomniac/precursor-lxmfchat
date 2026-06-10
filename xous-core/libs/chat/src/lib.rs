@@ -19,8 +19,11 @@ use xous::{CID, Error, SID, msg_scalar_unpack};
 use xous_ipc::Buffer;
 
 /// Create a TextView with the default properties common to all text bubbles.
+/// `header` is the author/timestamp line shown above the post text; pass the
+/// same header when measuring and when drawing (see [`post_header`]).
 pub(crate) fn default_textview(
     post: &crate::dialogue::post::Post,
+    header: Option<&str>,
     hilite: bool,
     vp: &VisualProperties,
 ) -> TextView {
@@ -43,7 +46,13 @@ pub(crate) fn default_textview(
     bubble_tv.margin = vp.bubble_margin;
     bubble_tv.ellipsis = false;
     bubble_tv.insertion = None;
-    write!(bubble_tv.text, "{}", post.text()).expect("couldn't write history text to TextView");
+    match header {
+        Some(h) => write!(bubble_tv.text, "{}\n{}", h, post.text())
+            .expect("couldn't write history text to TextView"),
+        None => {
+            write!(bubble_tv.text, "{}", post.text()).expect("couldn't write history text to TextView")
+        }
+    }
     bubble_tv
 }
 
@@ -66,7 +75,9 @@ fn bubble(
     anchor_y: isize,
 ) -> TextView {
     // create a textview with all of our default properties
-    let mut bubble_tv = default_textview(post, hilite, vp);
+    let name = dialogue.author(post.author_id()).map(|a| a.name.as_str());
+    let header = post_header(name, post.timestamp());
+    let mut bubble_tv = default_textview(post, Some(&header), hilite, vp);
 
     // set alignment of bubble left/right
     let mut align_right = false;
@@ -662,6 +673,85 @@ pub fn server(
 }
 
 pub fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().try_into().unwrap() }
+
+/// Seconds to add to a UTC unix timestamp to display it in local time, from
+/// the same source as the status-bar clock (`llio::LocalTime`). Cached once
+/// resolved; while the timezone is still unknown (e.g. the PDDB hasn't been
+/// unlocked yet) it falls back to UTC and retries at most every 30 s.
+fn tz_offset_secs() -> i64 {
+    use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+    static CACHED: AtomicI32 = AtomicI32::new(i32::MIN); // MIN = not yet known
+    static LAST_TRY: AtomicU32 = AtomicU32::new(0);
+    let cached = CACHED.load(Ordering::Relaxed);
+    if cached != i32::MIN {
+        return cached as i64;
+    }
+    let utc = now();
+    if utc.saturating_sub(LAST_TRY.load(Ordering::Relaxed) as u64) < 30 {
+        return 0;
+    }
+    LAST_TRY.store(utc as u32, Ordering::Relaxed);
+    match llio::LocalTime::new().get_local_time_ms() {
+        Some(local_ms) => {
+            // round to the nearest 15 minutes to absorb the IPC latency (all
+            // real utc offsets are multiples of 15 minutes)
+            let raw = local_ms as i64 / 1000 - now() as i64;
+            let off = ((raw + if raw >= 0 { 450 } else { -450 }) / 900) * 900;
+            CACHED.store(off as i32, Ordering::Relaxed);
+            off
+        }
+        None => 0,
+    }
+}
+
+/// Proleptic Gregorian date (year, month, day) from days since the unix epoch
+/// (Howard Hinnant's `civil_from_days`).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Short local-time label for a bubble header: "HH:MM" for today,
+/// "MM-DD HH:MM" within the current year, "YYYY-MM-DD HH:MM" otherwise.
+fn format_when(ts: u64) -> String {
+    let off = tz_offset_secs();
+    let t = ts as i64 + off;
+    let (y, mo, d) = civil_from_days(t.div_euclid(86400));
+    let s = t.rem_euclid(86400);
+    let (hh, mm) = (s / 3600, (s % 3600) / 60);
+    let now_local = now() as i64 + off;
+    let (ny, nmo, nd) = civil_from_days(now_local.div_euclid(86400));
+    if (y, mo, d) == (ny, nmo, nd) {
+        format!("{:02}:{:02}", hh, mm)
+    } else if y == ny {
+        format!("{:02}-{:02} {:02}:{:02}", mo, d, hh, mm)
+    } else {
+        format!("{}-{:02}-{:02} {:02}:{:02}", y, mo, d, hh, mm)
+    }
+}
+
+/// The header line rendered above a bubble's text: "<author> @ <time>" for a
+/// peer's post, just the time for our own ([`SELF_AUTHOR`] adds nothing — the
+/// bubble is already right-aligned as ours). Computed at render time, never
+/// stored in the Post, so existing dialogues and the delivery-mark text swaps
+/// (which match on the stored text) are unaffected. Both the on-screen bubble
+/// and the height-measurement bubbles must use the same header, or layout
+/// heights go wrong — that's why `default_textview` takes it as an argument.
+pub(crate) fn post_header(author_name: Option<&str>, timestamp: u64) -> String {
+    let when = format_when(timestamp);
+    match author_name {
+        Some(name) if name != SELF_AUTHOR && !name.is_empty() => format!("{} @ {}", name, when),
+        _ => when,
+    }
+}
 
 /// "context-free" (cf) communication with the chat object.
 /// This is accomplished by making a copy of the connection to the chat server.
