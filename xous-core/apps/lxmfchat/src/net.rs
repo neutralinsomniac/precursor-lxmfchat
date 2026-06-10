@@ -76,6 +76,12 @@ const AUTO_SYNC_ON_CONNECT: bool = true;
 const MAX_IN_RESOURCES: usize = 4;
 /// Cap on remembered shared addresses awaiting "Import contact" (oldest dropped).
 const MAX_FOUND_ADDRS: usize = 16;
+/// Largest `packed` LXMF that fits a single link DATA packet (the RNS link
+/// MDU bounds the per-packet plaintext at 431 bytes; LXMF's 319-byte content
+/// limit is that minus its 112 bytes of overhead). Bigger messages would need
+/// an outbound Resource sender (not implemented) — they go store-and-forward
+/// via the propagation node instead.
+const LINK_PACKED_MAX: usize = 431;
 
 /// An outbound message tracked until it is delivered (✓), stored at the
 /// propagation node (⇪), or given up on (✗). Driven by [`pump_outbox`].
@@ -1310,7 +1316,7 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
                 chat_cid,
                 &format!("sync: contacting node (try 1, hops {hops})…"),
             );
-            let outcome = send_pn_link_request(shared, trng, &pn, &known.identity, now);
+            let outcome = send_link_request(shared, trng, &pn, &known.identity, now);
             match outcome {
                 LinkReqOutcome::WriteFailed => {
                     sync_finish(shared, chat_cid, "hub write failed — try again");
@@ -1333,10 +1339,11 @@ enum LinkReqOutcome {
     WriteFailed,
 }
 
-/// Send a LINKREQUEST to the propagation node unless one is already pending and
+/// Send a LINKREQUEST to `target` (a peer or the propagation node) unless one
+/// is already pending and
 /// recent (expired pending entries are pruned by `pending_link_to`, which is what
 /// lets a lost request be retried at all).
-fn send_pn_link_request(
+fn send_link_request(
     shared: &Arc<Shared>,
     trng: &Trng,
     pn: &[u8; TRUNCATED_HASHLENGTH],
@@ -1881,12 +1888,12 @@ fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
     // Mid-sync, still waiting for the link: if the LINKREQUEST was lost (its
     // pending entry expired with no proof), send a fresh one — otherwise a single
     // lost request used to mean nothing more ever went out and the sync just sat
-    // until the watchdog. `send_pn_link_request` no-ops while one is still pending.
+    // until the watchdog. `send_link_request` no-ops while one is still pending.
     let linking = { plock(&shared.sync).phase == SyncPhase::Linking };
     if linking {
         let known = { plock(&shared.transport).known(&pn).cloned() };
         if let Some(k) = known {
-            match send_pn_link_request(shared, trng, &pn, &k.identity, now) {
+            match send_link_request(shared, trng, &pn, &k.identity, now) {
                 LinkReqOutcome::Sent => {
                     // Show the retry on the status line: a counter that advances
                     // means the sync thread is alive and writes complete — if the
@@ -2052,7 +2059,7 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                 let label = peer_label(shared, &outbox[i].peer);
                 if !outbox[i].via_pn {
                     if outbox[i].attempts < MAX_ATTEMPTS {
-                        // retry opportunistically (falls through to the send below)
+                        // re-send over the link (falls through to the send below)
                     } else if !outbox[i].tried_pn && pn.is_some() {
                         // Escalate to the propagation node with its OWN fresh time
                         // budget — the direct phase's spent time doesn't count
@@ -2110,7 +2117,7 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                 let link = match link {
                     Some(l) => l,
                     None => {
-                        send_pn_link_request(shared, trng, &target, &known.identity, now);
+                        send_link_request(shared, trng, &target, &known.identity, now);
                         let label = peer_label(shared, &outbox[i].peer);
                         chat::cf_set_status_text(chat_cid, &format!("{label}: contacting propagation node…"));
                         outbox[i].next_action = now + LINK_RETRY;
@@ -2144,9 +2151,11 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                     None => outbox[i].next_action = now + 2,
                 }
             } else {
-                // ---- Primary: opportunistic delivery, acknowledged by the
-                // recipient's returned proof (this is how LXMF/NomadNet confirms
-                // delivery — the receiver proves every delivered packet). ----
+                // ---- Primary: DIRECT delivery over a link (the reference
+                // default): establish (or reuse) a link, send the message as a
+                // single link DATA packet, and await its packet proof. Links
+                // give forward-secret session keys, and the proof routes back
+                // along the link itself. ----
                 let (known, have_path) = {
                     let tp = plock(&shared.transport);
                     (tp.known(&outbox[i].peer).cloned(), tp.has_path(&outbox[i].peer))
@@ -2191,23 +2200,65 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                     i += 1;
                     continue;
                 }
-                let mut eph = [0u8; KEY_HALF];
-                let mut iv = [0u8; IV_LENGTH];
-                crate::fill_random(trng, &mut eph);
-                crate::fill_random(trng, &mut iv);
                 let peer = outbox[i].peer;
-                let (raw, full_hash) = {
-                    let mut tp = plock(&shared.transport);
-                    tp.make_opportunistic_tracked(
-                        &peer, &known.identity, known.ratchet.as_ref(), &outbox[i].packed[TRUNCATED_HASHLENGTH..], &eph, &iv,
-                    )
-                };
-                write_to_hub(shared, &raw);
-                outbox[i].in_flight = Some(full_hash);
-                outbox[i].attempts += 1;
-                outbox[i].next_action = now + DELIVERY_RETRY;
-                let label = peer_label(shared, &outbox[i].peer);
-                chat::cf_set_status_text(chat_cid, &format!("{label}: sent, awaiting confirmation…"));
+                let label = peer_label(shared, &peer);
+                // One link packet carries at most ~431 B of plaintext; bigger
+                // messages need an outbound Resource sender we don't have yet,
+                // so they go store-and-forward instead.
+                if outbox[i].packed.len() > LINK_PACKED_MAX {
+                    if !outbox[i].tried_pn && pn.is_some() {
+                        outbox[i].via_pn = true;
+                        outbox[i].deadline = now + PROP_DEADLINE;
+                        outbox[i].next_action = now;
+                        chat::cf_set_status_text(
+                            chat_cid,
+                            &format!("{label}: too large for direct — via propagation node…"),
+                        );
+                        continue;
+                    }
+                    let m = outbox.remove(i);
+                    failures.push((m.peer, m.display_ts, m.text, "too large for direct delivery"));
+                    continue;
+                }
+                let link = { plock(&shared.transport).outbound_link_for(&peer, now) };
+                match link {
+                    Some(lid) => {
+                        let mut iv = [0u8; IV_LENGTH];
+                        crate::fill_random(trng, &mut iv);
+                        // Bind first: never hold the transport guard across a hub write.
+                        let made = { plock(&shared.transport).make_link_data(&lid, &outbox[i].packed, &iv) };
+                        match made {
+                            Some((raw, packet_hash)) => {
+                                write_to_hub(shared, &raw);
+                                outbox[i].in_flight = Some(packet_hash);
+                                outbox[i].attempts += 1;
+                                outbox[i].next_action = now + DELIVERY_RETRY;
+                                chat::cf_set_status_text(
+                                    chat_cid,
+                                    &format!("{label}: sent over link, awaiting confirmation…"),
+                                );
+                            }
+                            None => {
+                                // The link vanished between the two lock takes
+                                // (expired / connection reset): retry next tick,
+                                // which re-establishes.
+                                outbox[i].next_action = now + 1;
+                            }
+                        }
+                    }
+                    None => {
+                        // No live link: establish one (a pending recent request
+                        // is left alone). The OutboundLinkUp event pumps the
+                        // outbox the moment the LRPROOF arrives, so the message
+                        // goes out without waiting for the next tick.
+                        if let LinkReqOutcome::Sent =
+                            send_link_request(shared, trng, &peer, &known.identity, now)
+                        {
+                            chat::cf_set_status_text(chat_cid, &format!("{label}: establishing link…"));
+                        }
+                        outbox[i].next_action = now + 2;
+                    }
+                }
             }
             i += 1;
         }

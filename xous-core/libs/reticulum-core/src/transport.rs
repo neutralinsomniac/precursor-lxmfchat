@@ -32,11 +32,14 @@ const MAX_RECEIPTS: usize = 64;
 /// `pending_link_to` stops reporting it so the caller sends a fresh request.
 /// Generous vs. real link establishment (a few RTTs, ≤ ~15 s on a slow hub).
 const PENDING_LINK_EXPIRY_SECS: u64 = 20;
-/// Established outbound links older than this are dropped instead of reused. We
-/// send no link keepalives, so the responder tears an idle link down after a few
-/// minutes (silently, from our perspective, if its LINKCLOSE doesn't reach us) —
-/// reusing it then means every packet vanishes until the sync watchdog fires.
-const OUT_LINK_EXPIRY_SECS: u64 = 300;
+/// Established outbound links idle longer than this are dropped instead of
+/// reused. We send no link keepalives, so the responder tears an idle link
+/// down on its own schedule — LXMF closes delivery links after 600 s of
+/// inactivity (`LXMRouter.LINK_MAX_INACTIVITY`), RNS stales them at 720 s —
+/// and reusing a dead link means every packet silently vanishes. 540 s keeps
+/// a safety margin under the earliest (LXMF) teardown, while an actively-used
+/// link stays warm indefinitely (use refreshes the activity clock).
+const OUT_LINK_INACTIVITY_SECS: u64 = 540;
 
 use crate::announce::{ParsedAnnounce, build_announce, parse_and_validate, random_hash};
 use crate::constants::*;
@@ -73,9 +76,10 @@ struct OutLink {
     key: [u8; DERIVED_KEY_LENGTH],
     /// The peer's identity, to validate the packet proofs (receipts) it returns.
     identity: PublicIdentity,
-    /// When the link was requested; stale links (past `OUT_LINK_EXPIRY_SECS`) are
-    /// dropped by `outbound_link_for` instead of reused (see the const's note).
-    created: u64,
+    /// Last time the link was used to send (refreshed by `outbound_link_for`);
+    /// links idle past `OUT_LINK_INACTIVITY_SECS` are dropped instead of
+    /// reused (see the const's note).
+    last_activity: u64,
 }
 
 /// A sent opportunistic packet awaiting its delivery proof. The recipient's LXMF
@@ -403,7 +407,7 @@ impl Transport {
                 Some(key) => {
                     let target = pend.target;
                     let created = pend.created;
-                    self.insert_out_link(lid, OutLink { target, key, identity: pend.identity, created });
+                    self.insert_out_link(lid, OutLink { target, key, identity: pend.identity, last_activity: created });
                     Event::OutboundLinkUp { link_id: lid, target }
                 }
                 None => Event::Dropped("invalid LRPROOF for initiated link"),
@@ -756,7 +760,7 @@ impl Transport {
     }
 
     /// An established, still-fresh outbound link to `target`, if one exists (for
-    /// reuse). Links past `OUT_LINK_EXPIRY_SECS` are dropped, not returned: the
+    /// reuse). Links idle past `OUT_LINK_INACTIVITY_SECS` are dropped, not returned: the
     /// responder has almost certainly torn an idle link down by then (we send no
     /// keepalives), and packets on a dead link vanish without any error.
     pub fn outbound_link_for(
@@ -767,13 +771,20 @@ impl Transport {
         let expired: Vec<[u8; TRUNCATED_HASHLENGTH]> = self
             .out_links
             .iter()
-            .filter(|(_, l)| now > l.created.saturating_add(OUT_LINK_EXPIRY_SECS))
+            .filter(|(_, l)| now > l.last_activity.saturating_add(OUT_LINK_INACTIVITY_SECS))
             .map(|(id, _)| *id)
             .collect();
         for id in expired {
             self.remove_out_link(&id);
         }
-        self.out_links.iter().find(|(_, l)| l.target == *target).map(|(id, _)| *id)
+        let id = self.out_links.iter().find(|(_, l)| l.target == *target).map(|(id, _)| *id);
+        if let Some(id) = id {
+            // About to be used: an actively-used link stays warm indefinitely.
+            if let Some(l) = self.out_links.get_mut(&id) {
+                l.last_activity = now;
+            }
+        }
+        id
     }
 
     /// True if a link to `target` is pending establishment and its request is
@@ -1225,10 +1236,17 @@ mod tests {
     fn stale_out_link_is_dropped_not_reused() {
         let now = 1000;
         let (mut initiator, responder_dh, lid) = established_out_link(now);
+        // Each use refreshes the activity clock, so an active link stays warm…
         assert_eq!(initiator.outbound_link_for(&responder_dh, now + 60), Some(lid));
-        // Past the expiry the responder has long torn the idle link down: don't
-        // hand it out for reuse, drop it so a fresh link gets established.
-        assert_eq!(initiator.outbound_link_for(&responder_dh, now + OUT_LINK_EXPIRY_SECS + 1), None);
+        // …even well past creation + the inactivity window.
+        let later = now + OUT_LINK_INACTIVITY_SECS + 30;
+        assert_eq!(initiator.outbound_link_for(&responder_dh, later), Some(lid));
+        // But once IDLE past the window, the responder has long torn the link
+        // down (LXMF closes at 600 s inactivity): don't hand it out, drop it.
+        assert_eq!(
+            initiator.outbound_link_for(&responder_dh, later + OUT_LINK_INACTIVITY_SECS + 1),
+            None
+        );
         assert!(initiator.out_links.is_empty(), "stale out-link must be pruned");
     }
 
