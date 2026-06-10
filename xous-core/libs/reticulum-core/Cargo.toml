@@ -22,8 +22,10 @@ zeroize = { version = "1.8.1", default-features = false }
 rand_core = { version = "0.6.4", default-features = false }
 # Pure-Rust bzip2 DECODER (no C). RNS auto-compresses Resource payloads with
 # bz2 when it shrinks them — the norm for large text messages — so the
-# Resource receiver must decompress.
-bzip2-rs = "0.1.2"
+# Resource receiver must decompress. Vendored + patched: the upstream crate
+# preallocates its BWT array at the header's declared block size (3.6 MB for
+# the "BZh9" Python always emits) — an OOM abort on the Precursor.
+bzip2-rs = { path = "../bzip2-rs" }
 
 [dependencies.curve25519-dalek]
 version = "=4.1.2" # patched to the betrusted fork in the workspace root Cargo.toml

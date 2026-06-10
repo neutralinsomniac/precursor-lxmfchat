@@ -1,0 +1,23 @@
+# Vendored copy of bzip2-rs 0.1.2 (https://github.com/paolobarbolini/bzip2-rs,
+# MIT/Apache-2.0), patched for the Precursor's small heap: the decoder used to
+# preallocate its BWT working array at the stream's *declared* block size —
+# 900,000 u32s (3.6 MB) for the "BZh9" header Python's bz2 always writes —
+# which aborts the app on device even for a tiny message. The patch allocates
+# lazily and clamps the supported block-content size (see src/header/mod.rs).
+[package]
+name = "bzip2-rs"
+version = "0.1.2"
+authors = ["Paolo Barbolini <paolo@paolo565.org>", "precursor-reticulum (memory patches)"]
+edition = "2018"
+description = "Pure Rust bzip2 decompressor (vendored, memory-bounded for Xous)"
+license = "MIT/Apache-2.0"
+
+[dependencies]
+crc32fast = "1.2.1"
+tinyvec = "1.1"
+
+[features]
+default = []
+rustc_1_37 = []
+rustc_1_40 = ["rustc_1_37", "tinyvec/rustc_1_40"]
+rustc_1_51 = []
