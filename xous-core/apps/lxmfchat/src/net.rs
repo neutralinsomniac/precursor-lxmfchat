@@ -302,7 +302,7 @@ fn peer_label(shared: &Arc<Shared>, peer: &[u8; TRUNCATED_HASHLENGTH]) -> String
         .unwrap()
         .get(peer)
         .cloned()
-        .or_else(|| shared.seen.lock().unwrap().get(peer).map(|(n, _)| n.clone()))
+        .or_else(|| plock(&shared.seen).get(peer).map(|(n, _)| n.clone()))
         .unwrap_or_else(|| hex(&peer[..4]))
 }
 
@@ -326,7 +326,7 @@ pub fn connection_manager(shared: Arc<Shared>, chat_cid: CID) {
     };
     let mut backoff = 2u64;
     loop {
-        let hub = shared.hub.lock().unwrap().clone();
+        let hub = plock(&shared.hub).clone();
         let parsed = hub
             .rsplit_once(':')
             .and_then(|(h, p)| p.parse::<u16>().ok().map(|n| (h.to_string(), n)));
@@ -350,8 +350,8 @@ pub fn connection_manager(shared: Arc<Shared>, chat_cid: CID) {
                 let clones = stream.try_clone().and_then(|r| stream.try_clone().map(|c| (r, c)));
                 match clones {
                     Ok((reader, ctl)) => {
-                        *shared.writer.lock().unwrap() = Some(stream);
-                        *shared.ctl.lock().unwrap() = Some(ctl);
+                        *plock(&shared.writer) = Some(stream);
+                        *plock(&shared.ctl) = Some(ctl);
                         shared.connected.store(true, core::sync::atomic::Ordering::SeqCst);
                         backoff = 2;
                         chat::cf_set_status_text(chat_cid, &format!("connected to {hub}"));
@@ -362,7 +362,7 @@ pub fn connection_manager(shared: Arc<Shared>, chat_cid: CID) {
                         request_propagation_path(&shared, &trng);
                         read_until_closed(&shared, chat_cid, &pddb, &trng, reader);
                         shared.connected.store(false, core::sync::atomic::Ordering::SeqCst);
-                        shared.ctl.lock().unwrap().take();
+                        plock(&shared.ctl).take();
                         // Clear the writer with a BOUNDED wait: a write stuck on
                         // the dying socket may hold the mutex until the watchdog
                         // breaks it — never let the manager (the only thing that
@@ -383,8 +383,8 @@ pub fn connection_manager(shared: Arc<Shared>, chat_cid: CID) {
                         // session: every link / pending request / receipt is dead
                         // after a reconnect. Drop them so nothing reuses a link
                         // the hub can no longer route responses back on.
-                        shared.transport.lock().unwrap().connection_reset();
-                        let sync_active = { shared.sync.lock().unwrap().phase != SyncPhase::Idle };
+                        plock(&shared.transport).connection_reset();
+                        let sync_active = { plock(&shared.sync).phase != SyncPhase::Idle };
                         if sync_active {
                             sync_finish(&shared, chat_cid, "connection lost — try again");
                         }
@@ -436,7 +436,7 @@ fn send_announce(shared: &Arc<Shared>, trng: &Trng) {
     let mut r5 = [0u8; 5];
     crate::fill_random(trng, &mut r5);
     let raw = {
-        let tp = shared.transport.lock().unwrap();
+        let tp = plock(&shared.transport);
         tp.make_announce_with("lxmf", &["delivery"], b"precursor", &r5, now_secs())
     };
     write_to_hub(shared, &raw);
@@ -466,7 +466,7 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
     shared.frame_stage.store(1, Ordering::SeqCst);
     let t0 = now_secs();
     let event = {
-        let mut tp = shared.transport.lock().unwrap();
+        let mut tp = plock(&shared.transport);
         shared.frame_stage.store(2, Ordering::SeqCst);
         tp.handle_frame(frame_bytes, &mut gen_ephemeral)
     };
@@ -490,11 +490,11 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
             // Announces populate the live directory only; they are NOT saved as
             // contacts until you actually message them (or they message you).
             let name = crate::lxmf_display_name(&info.app_data).unwrap_or_else(|| hex(&destination_hash));
-            shared.seen.lock().unwrap().insert(destination_hash, (name.clone(), now_secs()));
+            plock(&shared.seen).insert(destination_hash, (name.clone(), now_secs()));
             // If this is already a saved contact (e.g. someone who messaged us
             // before we had their key — common on an access_point interface),
             // upgrade their record now that we have the key + a display name.
-            let is_contact = shared.contacts.lock().unwrap().contains_key(&destination_hash);
+            let is_contact = plock(&shared.contacts).contains_key(&destination_hash);
             arm(312); // directory updated; about to persist the contact (PDDB)
             if is_contact {
                 crate::save_contact(shared, pddb, &destination_hash, &name);
@@ -502,7 +502,7 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
             arm(313); // contact persisted; about to verify any cached ticket
             // Now that we have this peer's key, recover a ticket from any earlier
             // message we couldn't verify at the time (access-point interface).
-            let cached = shared.ticket_pending.lock().unwrap().remove(&destination_hash);
+            let cached = plock(&shared.ticket_pending).remove(&destination_hash);
             if let Some(bytes) = cached {
                 verify_and_store_ticket(shared, chat_cid, pddb, &destination_hash, &info.identity, &bytes);
             }
@@ -545,7 +545,7 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
             log::info!("outbound link {} up to {}", hex(&link_id), hex(&target));
             let mut iv = [0u8; IV_LENGTH];
             crate::fill_random(trng, &mut iv);
-            let rtt = { shared.transport.lock().unwrap().make_link_rtt(&link_id, &iv) };
+            let rtt = { plock(&shared.transport).make_link_rtt(&link_id, &iv) };
             if let Some(rtt) = rtt {
                 write_to_hub(shared, &rtt);
             }
@@ -570,7 +570,7 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
             arm(38);
             log::info!("outbound link {} closed by responder", hex(&link_id));
             let sync_was_on_it = {
-                let s = shared.sync.lock().unwrap();
+                let s = plock(&shared.sync);
                 s.phase != SyncPhase::Idle && s.link_id == Some(link_id)
             };
             if sync_was_on_it {
@@ -622,11 +622,11 @@ fn store_ticket(
     if t.expires <= now_secs() {
         return;
     }
-    let keep = shared.tickets.lock().unwrap().get(src_hash).map_or(true, |(exp, _)| t.expires >= *exp);
+    let keep = plock(&shared.tickets).get(src_hash).map_or(true, |(exp, _)| t.expires >= *exp);
     if !keep {
         return;
     }
-    shared.tickets.lock().unwrap().insert(*src_hash, (t.expires, t.ticket));
+    plock(&shared.tickets).insert(*src_hash, (t.expires, t.ticket));
     crate::persist_ticket(pddb, src_hash, t.expires, &t.ticket);
     let label = peer_label(shared, src_hash);
     chat::cf_set_status_text(chat_cid, &format!("received a ticket from {label} — you can now reply"));
@@ -664,7 +664,7 @@ fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, l
     let mut src_hash = [0u8; TRUNCATED_HASHLENGTH];
     src_hash.copy_from_slice(&lxmf_bytes[TRUNCATED_HASHLENGTH..2 * TRUNCATED_HASHLENGTH]);
 
-    let src_id = { shared.transport.lock().unwrap().known(&src_hash).map(|k| k.identity.clone()) };
+    let src_id = { plock(&shared.transport).known(&src_hash).map(|k| k.identity.clone()) };
     // If we don't have the sender's public key (common on an access_point
     // interface, where we never see announces), ask the network for it now, so a
     // reply is possible by the time the user reads this message.
@@ -682,7 +682,7 @@ fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, l
 
     // Drop duplicates (link senders retransmit until they get a receipt).
     {
-        let mut ids = shared.recent_msg_ids.lock().unwrap();
+        let mut ids = plock(&shared.recent_msg_ids);
         if ids.contains(&m.message_id) {
             return;
         }
@@ -704,7 +704,7 @@ fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, l
         .unwrap()
         .get(&src_hash)
         .cloned()
-        .or_else(|| shared.seen.lock().unwrap().get(&src_hash).map(|(n, _)| n.clone()))
+        .or_else(|| plock(&shared.seen).get(&src_hash).map(|(n, _)| n.clone()))
         .unwrap_or_else(|| hex(&src_hash));
     let mut text = m.content_string();
     if !m.signature_validated {
@@ -724,16 +724,16 @@ fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, l
             store_ticket(shared, chat_cid, pddb, &src_hash, &t);
         }
     } else if lxmf::message::extract_ticket(&m.fields).is_some() {
-        shared.ticket_pending.lock().unwrap().insert(src_hash, lxmf_bytes.to_vec());
+        plock(&shared.ticket_pending).insert(src_hash, lxmf_bytes.to_vec());
         log::info!("cached unverified ticket message from {} pending key", hex(&src_hash));
     }
 
     let ts = m.timestamp as u64;
-    let active = *shared.current_peer.lock().unwrap();
+    let active = *plock(&shared.current_peer);
     if active == Some(src_hash) {
         // The conversation we're currently viewing: show it immediately.
         {
-            let mut lt = shared.last_ts.lock().unwrap();
+            let mut lt = plock(&shared.last_ts);
             *lt = (*lt).max(ts);
         }
         chat::cf_set_status_idle_text(chat_cid, &format!("\u{25c9} {author}"));
@@ -743,13 +743,13 @@ fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, l
         // message and bump that contact's unread badge; it'll be flushed into the
         // thread when the user opens it (see `activate_peer`).
         {
-            let mut p = shared.pending.lock().unwrap();
+            let mut p = plock(&shared.pending);
             let list = p.entry(src_hash).or_default();
             list.push((author.clone(), ts, text));
             // Persist so held messages + the unread badge survive an app restart.
             crate::persist_pending(pddb, &src_hash, list);
         }
-        *shared.unread.lock().unwrap().entry(src_hash).or_default() += 1;
+        *plock(&shared.unread).entry(src_hash).or_default() += 1;
         chat::cf_set_status_text(chat_cid, &format!("\u{2709} new message from {author}"));
     }
 }
@@ -786,7 +786,7 @@ pub fn keepalive_thread(shared: Arc<Shared>, chat_cid: CID) {
             chat::cf_set_status_text(chat_cid, "hub write stalled — resetting connection…");
             shared.write_started.store(0, Ordering::SeqCst);
             shared.connected.store(false, Ordering::SeqCst);
-            if let Some(c) = shared.ctl.lock().unwrap().take() {
+            if let Some(c) = plock(&shared.ctl).take() {
                 c.shutdown(std::net::Shutdown::Both).ok();
             }
             continue;
@@ -803,9 +803,34 @@ pub fn keepalive_thread(shared: Arc<Shared>, chat_cid: CID) {
 pub fn request_peer_key(shared: &Arc<Shared>, trng: &Trng, target: &[u8; TRUNCATED_HASHLENGTH]) {
     let mut tag = [0u8; TRUNCATED_HASHLENGTH];
     crate::fill_random(trng, &mut tag);
-    let raw = { shared.transport.lock().unwrap().make_path_request(target, &tag) };
+    let raw = { plock(&shared.transport).make_path_request(target, &tag) };
     write_to_hub(shared, &raw);
     log::info!("sent path request for {}", hex(target));
+}
+
+/// Acquire a mutex by polling `try_lock` instead of `lock()`.
+///
+/// On the Precursor, a thread that PARKS on a contended `Mutex::lock()` was
+/// observed (liveness brackets, Jun-10) to sleep forever even after the mutex
+/// was free — the sync thread sat 3+ minutes blocked acquiring a transport
+/// lock that no other thread held, microseconds after acquiring the same lock
+/// twice itself. Parking goes through the ticktimer server and the wakeup
+/// evidently can be lost (suspected interaction with suspend/idle; upstream
+/// report pending). `try_lock` is a pure atomic and never parks; `sleep`
+/// demonstrably always wakes. So: poll. 5 ms granularity is invisible at our
+/// message rates and converts a forever-hang into bounded latency.
+pub(crate) fn plock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    loop {
+        match m.try_lock() {
+            Ok(g) => return g,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(5))
+            }
+            Err(std::sync::TryLockError::Poisoned(e)) => {
+                panic!("poisoned mutex: {e}")
+            }
+        }
+    }
 }
 
 /// A hub write counts as stuck after this long; the keepalive thread's watchdog
@@ -857,7 +882,7 @@ pub(crate) fn write_to_hub(shared: &Arc<Shared>, raw: &[u8]) -> bool {
                 w.shutdown(std::net::Shutdown::Both).ok();
                 *guard = None;
                 shared.connected.store(false, Ordering::SeqCst);
-                shared.ctl.lock().unwrap().take();
+                plock(&shared.ctl).take();
                 false
             } else {
                 true
@@ -901,7 +926,7 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
             return;
         }
     };
-    if shared.sync.lock().unwrap().phase != SyncPhase::Idle {
+    if plock(&shared.sync).phase != SyncPhase::Idle {
         chat::cf_set_status_text_forced(chat_cid, "sync already in progress");
         return;
     }
@@ -913,7 +938,7 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
     // mutex — this check must never block behind a stuck write.
     if !shared.connected.load(core::sync::atomic::Ordering::SeqCst) {
         let give_up = {
-            let mut s = shared.sync.lock().unwrap();
+            let mut s = plock(&shared.sync);
             s.route_tries = s.route_tries.saturating_add(1);
             if s.route_tries <= SYNC_ROUTE_TRIES {
                 s.requested = true;
@@ -932,7 +957,7 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
     }
     stage(shared, 13);
     let (known, have_path) = {
-        let tp = shared.transport.lock().unwrap();
+        let tp = plock(&shared.transport);
         (tp.known(&pn).cloned(), tp.has_path(&pn))
     };
     stage(shared, 14);
@@ -944,7 +969,7 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
             // consuming the flag here with no retry left the status stuck at
             // "finding…" forever. Bounded so an unreachable node fails visibly.
             let give_up = {
-                let mut s = shared.sync.lock().unwrap();
+                let mut s = plock(&shared.sync);
                 s.route_tries = s.route_tries.saturating_add(1);
                 if s.route_tries <= SYNC_ROUTE_TRIES {
                     s.requested = true;
@@ -965,7 +990,7 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         }
     };
     {
-        let mut s = shared.sync.lock().unwrap();
+        let mut s = plock(&shared.sync);
         s.phase = SyncPhase::Linking;
         s.receiver = None;
         s.deadline = now + SYNC_DEADLINE_SECS;
@@ -975,9 +1000,9 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         s.link_tries = 0;
     }
     stage(shared, 15);
-    match { shared.transport.lock().unwrap().outbound_link_for(&pn, now) } {
+    match { plock(&shared.transport).outbound_link_for(&pn, now) } {
         Some(lid) => {
-            shared.sync.lock().unwrap().link_id = Some(lid);
+            plock(&shared.sync).link_id = Some(lid);
             sync_send_identify_and_list(shared, chat_cid, trng, lid);
         }
         None => {
@@ -986,7 +1011,7 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
             // HEADER_2 (routed) link request — and the try counter advancing
             // proves the sync thread is alive and writing. Status BEFORE the
             // write so it shows even if the write stalls.
-            let hops = { shared.transport.lock().unwrap().path_hops(&pn) };
+            let hops = { plock(&shared.transport).path_hops(&pn) };
             let hops = hops.map(|h| h.to_string()).unwrap_or_else(|| "?".to_string());
             stage(shared, 151); // transport (path_hops) done; about to do the status IPC
             chat::cf_set_status_text_forced(
@@ -1001,7 +1026,7 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
                     sync_finish(shared, chat_cid, "hub write failed — try again");
                 }
                 LinkReqOutcome::Sent | LinkReqOutcome::Pending => {
-                    shared.sync.lock().unwrap().link_tries = 1;
+                    plock(&shared.sync).link_tries = 1;
                 }
             }
         }
@@ -1032,7 +1057,7 @@ fn send_pn_link_request(
     // thread; the pump only calls this while the outbox is non-empty).
     stage(shared, 161); // about to take the transport lock
     let raw = {
-        let mut tp = shared.transport.lock().unwrap();
+        let mut tp = plock(&shared.transport);
         if tp.pending_link_to(pn, now) {
             None
         } else {
@@ -1066,7 +1091,7 @@ fn sync_on_link_up(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng, link_id: [u
         return;
     }
     let go = {
-        let mut s = shared.sync.lock().unwrap();
+        let mut s = plock(&shared.sync);
         if s.phase == SyncPhase::Linking {
             s.link_id = Some(link_id);
             true
@@ -1081,11 +1106,11 @@ fn sync_on_link_up(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng, link_id: [u
 
 /// Identify to the node and request the list of available message ids.
 fn sync_send_identify_and_list(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng, link_id: [u8; TRUNCATED_HASHLENGTH]) {
-    shared.sync.lock().unwrap().phase = SyncPhase::ListRequested;
+    plock(&shared.sync).phase = SyncPhase::ListRequested;
     chat::cf_set_status_text_forced(chat_cid, "sync: requesting message list…");
     let mut iv = [0u8; IV_LENGTH];
     crate::fill_random(trng, &mut iv);
-    if let Some(idp) = { shared.transport.lock().unwrap().make_out_link_identify(&link_id, &iv) } {
+    if let Some(idp) = { plock(&shared.transport).make_out_link_identify(&link_id, &iv) } {
         write_to_hub(shared, &idp);
     }
     // `/get [None, None]` → list of transient ids.
@@ -1099,7 +1124,7 @@ fn sync_send_get(shared: &Arc<Shared>, trng: &Trng, link_id: [u8; TRUNCATED_HASH
     let packed = msgpack::encode(&req);
     let mut iv = [0u8; IV_LENGTH];
     crate::fill_random(trng, &mut iv);
-    if let Some(raw) = { shared.transport.lock().unwrap().make_out_link_context(&link_id, CONTEXT_REQUEST, &packed, &iv) } {
+    if let Some(raw) = { plock(&shared.transport).make_out_link_context(&link_id, CONTEXT_REQUEST, &packed, &iv) } {
         write_to_hub(shared, &raw);
     }
 }
@@ -1116,7 +1141,7 @@ fn sync_on_outlink_data(
     plaintext: Vec<u8>,
 ) {
     {
-        let s = shared.sync.lock().unwrap();
+        let s = plock(&shared.sync);
         if s.link_id != Some(link_id) || s.phase == SyncPhase::Idle {
             return;
         }
@@ -1130,10 +1155,10 @@ fn sync_on_outlink_data(
         CONTEXT_RESOURCE_ADV => match ResourceReceiver::accept(&plaintext) {
             Ok(rx) => {
                 let req = rx.request_data();
-                shared.sync.lock().unwrap().receiver = Some(rx);
+                plock(&shared.sync).receiver = Some(rx);
                 let mut iv = [0u8; IV_LENGTH];
                 crate::fill_random(trng, &mut iv);
-                if let Some(raw) = { shared.transport.lock().unwrap().make_out_link_context(&link_id, CONTEXT_RESOURCE_REQ, &req, &iv) } {
+                if let Some(raw) = { plock(&shared.transport).make_out_link_context(&link_id, CONTEXT_RESOURCE_REQ, &req, &iv) } {
                     write_to_hub(shared, &raw);
                 }
                 chat::cf_set_status_text_forced(chat_cid, "sync: downloading…");
@@ -1145,7 +1170,7 @@ fn sync_on_outlink_data(
         },
         CONTEXT_RESOURCE => {
             let complete = {
-                let mut s = shared.sync.lock().unwrap();
+                let mut s = plock(&shared.sync);
                 match &mut s.receiver {
                     Some(rx) => {
                         rx.receive_part(&plaintext);
@@ -1161,14 +1186,14 @@ fn sync_on_outlink_data(
             // thread's watchdog may sync_finish a stalled sync at any moment), so
             // never unwrap it — bail out instead of panicking the read thread.
             let (stream, encrypted) = {
-                let s = shared.sync.lock().unwrap();
+                let s = plock(&shared.sync);
                 match s.receiver.as_ref() {
                     Some(rx) => (rx.concat(), rx.encrypted()),
                     None => return,
                 }
             };
             let plain = if encrypted {
-                match { shared.transport.lock().unwrap().decrypt_out_link(&link_id, &stream) } {
+                match { plock(&shared.transport).decrypt_out_link(&link_id, &stream) } {
                     Some(p) => p,
                     None => {
                         sync_finish(shared, chat_cid, "sync failed (decrypt)");
@@ -1179,7 +1204,7 @@ fn sync_on_outlink_data(
                 stream
             };
             let finished = {
-                let s = shared.sync.lock().unwrap();
+                let s = plock(&shared.sync);
                 match s.receiver.as_ref() {
                     Some(rx) => rx.finish(&plain),
                     None => return,
@@ -1187,10 +1212,10 @@ fn sync_on_outlink_data(
             };
             match finished {
                 Ok((payload, proof)) => {
-                    if let Some(raw) = { shared.transport.lock().unwrap().make_out_link_resource_proof(&link_id, &proof) } {
+                    if let Some(raw) = { plock(&shared.transport).make_out_link_resource_proof(&link_id, &proof) } {
                         write_to_hub(shared, &raw);
                     }
-                    shared.sync.lock().unwrap().receiver = None;
+                    plock(&shared.sync).receiver = None;
                     if let Some(resp) = parse_rns_response(&payload) {
                         handle_sync_response(shared, chat_cid, pddb, trng, link_id, resp);
                     }
@@ -1217,7 +1242,7 @@ fn handle_sync_response(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: 
         sync_finish(shared, chat_cid, why);
         return;
     }
-    let phase = shared.sync.lock().unwrap().phase;
+    let phase = plock(&shared.sync).phase;
     match phase {
         SyncPhase::ListRequested => {
             let ids: Vec<Value> = resp.as_array().map(|a| a.to_vec()).unwrap_or_default();
@@ -1229,7 +1254,7 @@ fn handle_sync_response(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: 
             // Request all listed messages: `/get [wants, [], limit]`.
             let data = Value::Array(vec![Value::Array(ids), Value::Array(Vec::new()), Value::Int(SYNC_DELIVERY_LIMIT)]);
             sync_send_get(shared, trng, link_id, data);
-            shared.sync.lock().unwrap().phase = SyncPhase::GetRequested;
+            plock(&shared.sync).phase = SyncPhase::GetRequested;
             chat::cf_set_status_text_forced(chat_cid, &format!("sync: downloading {n} message(s)…"));
         }
         SyncPhase::GetRequested => {
@@ -1265,7 +1290,7 @@ fn deliver_synced_message(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng
     if blob.len() <= TRUNCATED_HASHLENGTH {
         return;
     }
-    let plaintext = { shared.transport.lock().unwrap().identity().decrypt(&blob[TRUNCATED_HASHLENGTH..], &[]) };
+    let plaintext = { plock(&shared.transport).identity().decrypt(&blob[TRUNCATED_HASHLENGTH..], &[]) };
     let plaintext = match plaintext {
         Ok(p) => p,
         Err(e) => {
@@ -1285,7 +1310,7 @@ fn deliver_synced_message(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng
 /// hang the next sync. Establishment is cheap relative to a 2-minute hang.
 fn sync_finish(shared: &Arc<Shared>, chat_cid: CID, msg: &str) {
     let link = {
-        let mut s = shared.sync.lock().unwrap();
+        let mut s = plock(&shared.sync);
         s.phase = SyncPhase::Idle;
         s.receiver = None;
         s.requested = false;
@@ -1293,7 +1318,7 @@ fn sync_finish(shared: &Arc<Shared>, chat_cid: CID, msg: &str) {
         s.link_id.take()
     };
     if let Some(lid) = link {
-        shared.transport.lock().unwrap().drop_out_link(&lid);
+        plock(&shared.transport).drop_out_link(&lid);
     }
     let line = format!("sync: {msg}");
     // Persist the result as idle text (so it stays after the transient paint) AND
@@ -1347,7 +1372,7 @@ pub fn enqueue_outbound(
     text: String,
     packed: Vec<u8>,
 ) {
-    shared.outbox.lock().unwrap().push(OutboundMsg {
+    plock(&shared.outbox).push(OutboundMsg {
         peer,
         display_ts,
         text,
@@ -1384,7 +1409,7 @@ pub fn outbox_pump_thread(shared: Arc<Shared>, chat_cid: CID) {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(2));
         shared.beat_pump.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-        if !shared.outbox.lock().unwrap().is_empty() {
+        if !plock(&shared.outbox).is_empty() {
             // Mine any pending propagation stamp first (slow, lock-free), so the
             // blob is ready when pump_outbox reaches the PN-send step. Doing it
             // here keeps the multi-second PoW off the net read loop.
@@ -1447,7 +1472,7 @@ fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
             // Still consume a manual request so the user gets an answer instead
             // of "sync requested…" sitting there forever.
             let requested = {
-                let mut s = shared.sync.lock().unwrap();
+                let mut s = plock(&shared.sync);
                 core::mem::replace(&mut s.requested, false)
             };
             if requested {
@@ -1460,7 +1485,7 @@ fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
     stage(shared, 1);
     // Time out a stuck sync.
     let stalled = {
-        let s = shared.sync.lock().unwrap();
+        let s = plock(&shared.sync);
         s.phase != SyncPhase::Idle && now > s.deadline
     };
     if stalled {
@@ -1472,9 +1497,9 @@ fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
     // pending entry expired with no proof), send a fresh one — otherwise a single
     // lost request used to mean nothing more ever went out and the sync just sat
     // until the watchdog. `send_pn_link_request` no-ops while one is still pending.
-    let linking = { shared.sync.lock().unwrap().phase == SyncPhase::Linking };
+    let linking = { plock(&shared.sync).phase == SyncPhase::Linking };
     if linking {
-        let known = { shared.transport.lock().unwrap().known(&pn).cloned() };
+        let known = { plock(&shared.transport).known(&pn).cloned() };
         if let Some(k) = known {
             match send_pn_link_request(shared, trng, &pn, &k.identity, now) {
                 LinkReqOutcome::Sent => {
@@ -1482,7 +1507,7 @@ fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
                     // means the sync thread is alive and writes complete — if the
                     // node still sees nothing, the requests die on the network.
                     let tries = {
-                        let mut s = shared.sync.lock().unwrap();
+                        let mut s = plock(&shared.sync);
                         s.link_tries = s.link_tries.saturating_add(1);
                         s.link_tries
                     };
@@ -1504,7 +1529,7 @@ fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
     // `next_attempt` is the backoff while the node's route is being resolved.
     stage(shared, 3);
     let requested = {
-        let mut s = shared.sync.lock().unwrap();
+        let mut s = plock(&shared.sync);
         if s.requested && now >= s.next_attempt {
             s.requested = false;
             true
@@ -1522,15 +1547,15 @@ fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
     // becomes reachable.
     if AUTO_SYNC_ON_CONNECT {
         let go = {
-            let s = shared.sync.lock().unwrap();
+            let s = plock(&shared.sync);
             !s.auto_done && s.phase == SyncPhase::Idle
         };
         let ready = go && {
-            let tp = shared.transport.lock().unwrap();
+            let tp = plock(&shared.transport);
             tp.known(&pn).is_some() && tp.has_path(&pn)
         };
         if ready {
-            shared.sync.lock().unwrap().auto_done = true;
+            plock(&shared.sync).auto_done = true;
             start_sync(shared, chat_cid, trng);
         }
     }
@@ -1539,7 +1564,7 @@ fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
 /// Request a propagation-node sync from the main thread (the menu): just sets a
 /// flag the pump thread picks up. Does NO hub I/O, so it can never block the UI.
 pub fn request_sync(shared: &Arc<Shared>) {
-    shared.sync.lock().unwrap().requested = true;
+    plock(&shared.sync).requested = true;
 }
 
 /// Compute, **lock-free**, the propagation blob for at most one outbox message
@@ -1553,7 +1578,7 @@ pub fn request_sync(shared: &Arc<Shared>) {
 fn compute_pending_pn_blob(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) -> bool {
     // One message that's on the PN path and still needs a stamp.
     let job = {
-        let outbox = shared.outbox.lock().unwrap();
+        let outbox = plock(&shared.outbox);
         outbox
             .iter()
             .find(|m| m.via_pn && m.pn_blob.is_none())
@@ -1565,7 +1590,7 @@ fn compute_pending_pn_blob(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) -> 
     };
     // We encrypt the stored copy *to the recipient*, so we need their key. If we
     // don't have it yet, pump_outbox is already requesting it — try again later.
-    let known = { shared.transport.lock().unwrap().known(&peer).cloned() };
+    let known = { plock(&shared.transport).known(&peer).cloned() };
     let known = match known {
         Some(k) => k,
         None => return false,
@@ -1592,7 +1617,7 @@ fn compute_pending_pn_blob(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) -> 
     );
 
     // Store it back by re-finding the entry; it may have been removed/delivered.
-    let mut outbox = shared.outbox.lock().unwrap();
+    let mut outbox = plock(&shared.outbox);
     if let Some(m) = outbox.iter_mut().find(|m| m.peer == peer && m.display_ts == display_ts) {
         m.pn_blob = Some(blob);
     }
@@ -1611,7 +1636,7 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
     let mut failures: Vec<([u8; TRUNCATED_HASHLENGTH], u64, String, &'static str)> = Vec::new();
 
     {
-        let mut outbox = shared.outbox.lock().unwrap();
+        let mut outbox = plock(&shared.outbox);
         let mut i = 0;
         while i < outbox.len() {
             // 0. The current phase's independent time budget is up.
@@ -1671,7 +1696,7 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                 // over a link to it (the node returns a proof → ⇪). ----
                 let target = pn.unwrap();
                 let (known, have_path) = {
-                    let tp = shared.transport.lock().unwrap();
+                    let tp = plock(&shared.transport);
                     (tp.known(&target).cloned(), tp.has_path(&target))
                 };
                 let known = match known {
@@ -1692,7 +1717,7 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                     i += 1;
                     continue;
                 }
-                let link = { shared.transport.lock().unwrap().outbound_link_for(&target, now) };
+                let link = { plock(&shared.transport).outbound_link_for(&target, now) };
                 let link = match link {
                     Some(l) => l,
                     None => {
@@ -1717,7 +1742,7 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                 };
                 let mut div = [0u8; IV_LENGTH];
                 crate::fill_random(trng, &mut div);
-                let sent = { shared.transport.lock().unwrap().make_link_data(&link, &blob, &div) };
+                let sent = { plock(&shared.transport).make_link_data(&link, &blob, &div) };
                 match sent {
                     Some((raw, packet_hash)) => {
                         write_to_hub(shared, &raw);
@@ -1734,7 +1759,7 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                 // recipient's returned proof (this is how LXMF/NomadNet confirms
                 // delivery — the receiver proves every delivered packet). ----
                 let (known, have_path) = {
-                    let tp = shared.transport.lock().unwrap();
+                    let tp = plock(&shared.transport);
                     (tp.known(&outbox[i].peer).cloned(), tp.has_path(&outbox[i].peer))
                 };
                 let known = match known {
@@ -1777,7 +1802,7 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                 crate::fill_random(trng, &mut iv);
                 let peer = outbox[i].peer;
                 let (raw, full_hash) = {
-                    let mut tp = shared.transport.lock().unwrap();
+                    let mut tp = plock(&shared.transport);
                     tp.make_opportunistic_tracked(
                         &peer, &known.identity, known.ratchet.as_ref(), &outbox[i].packed[TRUNCATED_HASHLENGTH..], &eph, &iv,
                     )
@@ -1804,7 +1829,7 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
 /// delivered (✓) or stored-at-node (⇪), depending on how it was sent.
 fn mark_delivered(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, packet_hash: &[u8; 32]) {
     let done = {
-        let mut outbox = shared.outbox.lock().unwrap();
+        let mut outbox = plock(&shared.outbox);
         outbox.iter().position(|m| m.in_flight == Some(*packet_hash)).map(|pos| {
             let m = outbox.remove(pos);
             let status = if m.via_pn { STATUS_QUEUED } else { STATUS_DELIVERED };
@@ -1843,7 +1868,7 @@ fn update_mark(
         return;
     }
     // Not the active thread: defer + persist (mirrors the inbound pending queue).
-    let mut map = shared.delivery_updates.lock().unwrap();
+    let mut map = plock(&shared.delivery_updates);
     let list = map.entry(*peer).or_default();
     list.push(DeliveryUpdate { display_ts, text: text.to_string(), status });
     crate::persist_delivery_updates(pddb, peer, list);
@@ -1852,7 +1877,7 @@ fn update_mark(
 /// Apply any held delivery-mark updates for `peer` to the now-active dialogue
 /// (called from `activate_peer` after the dialogue is switched). Clears them.
 pub fn apply_delivery_updates(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, peer: &[u8; TRUNCATED_HASHLENGTH]) {
-    let updates = shared.delivery_updates.lock().unwrap().remove(peer);
+    let updates = plock(&shared.delivery_updates).remove(peer);
     if let Some(updates) = updates {
         for u in &updates {
             chat::cf_post_update(chat_cid, chat::SELF_AUTHOR, u.display_ts, &bubble_text(&u.text, status_mark(u.status)));

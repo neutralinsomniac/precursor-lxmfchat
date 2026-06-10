@@ -24,6 +24,7 @@ use xous::CID;
 use xous_names::XousNames;
 
 pub use net::Shared;
+use net::plock;
 
 const PDDB_DICT: &str = "lxmf.state";
 const CONTACTS_DICT: &str = "lxmf.contacts";
@@ -219,9 +220,9 @@ impl<'a> LxmfChat<'a> {
         // is why verify is software now. This line keeps both costs visible.
         let st = {
             let t0 = std::time::Instant::now();
-            let sig = shared.transport.lock().unwrap().identity().sign(b"selftest timing");
+            let sig = plock(&shared.transport).identity().sign(b"selftest timing");
             let sign_ms = t0.elapsed().as_millis();
-            let pubid = shared.transport.lock().unwrap().identity().public().clone();
+            let pubid = plock(&shared.transport).identity().public().clone();
             let t1 = std::time::Instant::now();
             let ok = pubid.validate(&sig, b"selftest timing");
             let verify_ms = t1.elapsed().as_millis();
@@ -253,7 +254,7 @@ impl<'a> LxmfChat<'a> {
     /// later calls it points the manager at the current hub and forces a fresh
     /// (re)connect so a "Set hub" / explicit "Connect" takes effect immediately.
     pub fn connect(&mut self) {
-        *self.shared.hub.lock().unwrap() = self.hub.clone();
+        *plock(&self.shared.hub) = self.hub.clone();
         if !self.manager_started {
             self.manager_started = true;
             let shared = self.shared.clone();
@@ -282,7 +283,7 @@ impl<'a> LxmfChat<'a> {
         // will pick up the new hub on its next attempt. Shutdown goes through the
         // control clone — the writer mutex may be held by an in-flight (possibly
         // stuck) write, and the main thread must never block on it.
-        if let Some(ctl) = self.shared.ctl.lock().unwrap().take() {
+        if let Some(ctl) = plock(&self.shared.ctl).take() {
             ctl.shutdown(std::net::Shutdown::Both).ok();
         }
         self.chat.set_status_text(&format!("reconnecting to {}…", self.hub));
@@ -293,7 +294,7 @@ impl<'a> LxmfChat<'a> {
         let mut r5 = [0u8; 5];
         fill_random(&self.trng, &mut r5);
         let raw = {
-            let tp = self.shared.transport.lock().unwrap();
+            let tp = plock(&self.shared.transport);
             tp.make_announce_with("lxmf", &["delivery"], b"precursor", &r5, now())
         };
         if self.write_framed(&raw) {
@@ -347,7 +348,7 @@ impl<'a> LxmfChat<'a> {
 
     /// Send an opportunistic LXMF message to the current peer.
     pub fn post(&mut self, text: &str) {
-        let peer = match *self.shared.current_peer.lock().unwrap() {
+        let peer = match *plock(&self.shared.current_peer) {
             Some(p) => p,
             None => {
                 self.chat.set_status_text("pick someone first (menu → Contacts)");
@@ -357,7 +358,7 @@ impl<'a> LxmfChat<'a> {
         // Direct delivery needs the peer's key. If we don't have it (e.g. we never
         // saw its announce on an access_point interface), ask for it and bail —
         // the reply arrives as an announce; the user retries in a moment.
-        if self.shared.transport.lock().unwrap().known(&peer).is_none() {
+        if plock(&self.shared.transport).known(&peer).is_none() {
             net::request_peer_key(&self.shared, &self.trng, &peer);
             self.chat.set_status_text("requesting peer's key… try again in a moment");
             return;
@@ -369,7 +370,7 @@ impl<'a> LxmfChat<'a> {
         // timestamp to the most recent slot so a wrong device clock can't bury it
         // above peers' (correctly-timestamped) messages.
         let display_ts = {
-            let mut lt = self.shared.last_ts.lock().unwrap();
+            let mut lt = plock(&self.shared.last_ts);
             let ts = now().max(*lt + 1);
             *lt = ts;
             ts
@@ -387,7 +388,7 @@ impl<'a> LxmfChat<'a> {
         // use it to stamp the message (no proof-of-work needed). Expired tickets
         // are dropped.
         let ticket = {
-            let mut t = self.shared.tickets.lock().unwrap();
+            let mut t = plock(&self.shared.tickets);
             match t.get(&peer) {
                 Some((expiry, _)) if *expiry <= now() => {
                     t.remove(&peer);
@@ -401,7 +402,7 @@ impl<'a> LxmfChat<'a> {
         // Pack + sign the full LXMF message once. It's delivered as direct link
         // DATA (and re-wrapped for the propagation node if direct delivery fails).
         let packed = {
-            let tp = self.shared.transport.lock().unwrap();
+            let tp = plock(&self.shared.transport);
             lxmf::message::pack(
                 tp.identity(),
                 &peer,
@@ -423,7 +424,7 @@ impl<'a> LxmfChat<'a> {
             .unwrap()
             .get(&peer)
             .cloned()
-            .or_else(|| self.shared.seen.lock().unwrap().get(&peer).map(|(n, _)| n.clone()))
+            .or_else(|| plock(&self.shared.seen).get(&peer).map(|(n, _)| n.clone()))
             .unwrap_or_else(|| hex(&peer));
         save_contact(&self.shared, &self.pddb, &peer, &name);
 
@@ -470,21 +471,21 @@ impl<'a> LxmfChat<'a> {
     /// Make `addr` the active conversation: set it as the send target, persist
     /// it as the "last peer", and switch the chat UI to that peer's own thread.
     fn activate_peer(&self, addr: &[u8; TRUNCATED_HASHLENGTH]) {
-        *self.shared.current_peer.lock().unwrap() = Some(*addr);
+        *plock(&self.shared.current_peer) = Some(*addr);
         write_string(&self.pddb, KEY_PEER, &hex(addr));
         self.chat.dialogue_set(DIALOGUE_DICT, Some(&hex(addr))).ok();
         // Flush messages that arrived for this peer while we were viewing someone
         // else, into the now-active thread, and clear its unread badge.
-        let queued = self.shared.pending.lock().unwrap().remove(addr).unwrap_or_default();
+        let queued = plock(&self.shared.pending).remove(addr).unwrap_or_default();
         let had_queued = !queued.is_empty();
         for (author, ts, text) in queued {
             {
-                let mut lt = self.shared.last_ts.lock().unwrap();
+                let mut lt = plock(&self.shared.last_ts);
                 *lt = (*lt).max(ts);
             }
             self.chat.post_add(&author, ts, &text, None).ok();
         }
-        self.shared.unread.lock().unwrap().remove(addr);
+        plock(&self.shared.unread).remove(addr);
         if had_queued {
             delete_pending(&self.pddb, addr);
             xous::send_message(
@@ -512,7 +513,7 @@ impl<'a> LxmfChat<'a> {
             .unwrap()
             .get(addr)
             .cloned()
-            .or_else(|| self.shared.seen.lock().unwrap().get(addr).map(|(n, _)| n.clone()))
+            .or_else(|| plock(&self.shared.seen).get(addr).map(|(n, _)| n.clone()))
             .unwrap_or_else(|| format!("{}…", &hex(addr)[..8]))
     }
 
@@ -521,7 +522,7 @@ impl<'a> LxmfChat<'a> {
     pub fn show_announces_interactive(&mut self, modals: &modals::Modals) {
         // Collect, then show the most-recently-seen first, capped to a sane length.
         let mut all: Vec<([u8; TRUNCATED_HASHLENGTH], String, u64)> = {
-            self.shared.seen.lock().unwrap().iter().map(|(k, (n, t))| (*k, n.clone(), *t)).collect()
+            plock(&self.shared.seen).iter().map(|(k, (n, t))| (*k, n.clone(), *t)).collect()
         };
         all.sort_by(|a, b| b.2.cmp(&a.2));
         all.truncate(ANNOUNCE_LIST_MAX);
@@ -538,9 +539,9 @@ impl<'a> LxmfChat<'a> {
     /// Pick from your saved contacts (people you've messaged or who've messaged
     /// you). Persisted across reboots; opens that peer's thread.
     pub fn message_contact_interactive(&mut self, modals: &modals::Modals) {
-        let unread = self.shared.unread.lock().unwrap().clone();
+        let unread = plock(&self.shared.unread).clone();
         let mut entries: Vec<_> =
-            { self.shared.contacts.lock().unwrap().iter().map(|(k, v)| (*k, v.clone())).collect() };
+            { plock(&self.shared.contacts).iter().map(|(k, v)| (*k, v.clone())).collect() };
         // Contacts with unread messages float to the top of the list.
         entries.sort_by(|a, b| {
             let (ua, ub) = (unread.get(&a.0).copied().unwrap_or(0), unread.get(&b.0).copied().unwrap_or(0));
@@ -567,7 +568,7 @@ impl<'a> LxmfChat<'a> {
     /// the posts (and any queued/undelivered state for this thread) are removed.
     pub fn clear_history_interactive(&mut self, modals: &modals::Modals) {
         // The active thread is the current peer's, or the welcome thread if none.
-        let peer = *self.shared.current_peer.lock().unwrap();
+        let peer = *plock(&self.shared.current_peer);
         let (key, label) = match peer {
             Some(addr) => (hex(&addr), self.peer_name(&addr)),
             None => (DIALOGUE_WELCOME.to_string(), "this thread".to_string()),
@@ -595,10 +596,10 @@ impl<'a> LxmfChat<'a> {
         //    it: held inbound messages, unread badge, deferred delivery marks, and
         //    any in-flight outbound entries. (Contact + ticket are left intact.)
         if let Some(addr) = peer {
-            self.shared.pending.lock().unwrap().remove(&addr);
-            self.shared.unread.lock().unwrap().remove(&addr);
-            self.shared.delivery_updates.lock().unwrap().remove(&addr);
-            self.shared.outbox.lock().unwrap().retain(|m| m.peer != addr);
+            plock(&self.shared.pending).remove(&addr);
+            plock(&self.shared.unread).remove(&addr);
+            plock(&self.shared.delivery_updates).remove(&addr);
+            plock(&self.shared.outbox).retain(|m| m.peer != addr);
             delete_pending(&self.pddb, &addr);
             delete_delivery_updates(&self.pddb, &addr);
         }
@@ -1054,9 +1055,9 @@ pub(crate) fn save_contact(
     dest_hash: &[u8; TRUNCATED_HASHLENGTH],
     name: &str,
 ) {
-    shared.contacts.lock().unwrap().insert(*dest_hash, name.to_string());
+    plock(&shared.contacts).insert(*dest_hash, name.to_string());
     let key_material = {
-        let tp = shared.transport.lock().unwrap();
+        let tp = plock(&shared.transport);
         tp.known(dest_hash).map(|k| (k.identity.public_key(), k.ratchet))
     };
     match key_material {
