@@ -160,6 +160,21 @@ fn main() {
                             Err(e) => println!("link LXMF parse failed: {:?}", e),
                         }
                     }
+                    Event::LinkIdentified { link_id, identity } => {
+                        println!(
+                            ">>> BACKCHANNEL: peer identified on link {} (identity hash {})",
+                            reticulum_core::hex(&link_id),
+                            reticulum_core::hex(&identity.hash)
+                        );
+                    }
+                    Event::LinkKeepalive { link_id, reply } => {
+                        writer.write_all(&frame(&reply)).ok();
+                        writer.flush().ok();
+                        println!("echoed keepalive on {}", reticulum_core::hex(&link_id));
+                    }
+                    Event::InLinkClosed { link_id } => {
+                        println!("inbound link {} closed by initiator", reticulum_core::hex(&link_id));
+                    }
                     Event::DataUndecryptable { reason, .. } => {
                         println!("UNDECRYPTABLE: {}", reason);
                     }

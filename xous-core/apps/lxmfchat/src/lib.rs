@@ -196,6 +196,7 @@ impl<'a> LxmfChat<'a> {
             in_resources: Mutex::new(BTreeMap::new()),
             stamp_costs: Mutex::new(BTreeMap::new()),
             found_addrs: Mutex::new(load_found_addrs(&pddb)),
+            backchannels: Mutex::new(BTreeMap::new()),
             llio: llio::Llio::new(&xns),
             hub: Mutex::new(hub.clone()),
             unread: Mutex::new(unread_map),

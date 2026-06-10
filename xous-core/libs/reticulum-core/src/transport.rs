@@ -56,6 +56,11 @@ use crate::packet::Packet;
 struct LinkState {
     key: [u8; DERIVED_KEY_LENGTH],
     proof: Vec<u8>,
+    /// The peer's identity, once it identifies itself on the link
+    /// (`LINKIDENTIFY`). Unlocks the LXMF **backchannel**: we may send our own
+    /// data on this inbound link and validate the packet proofs the peer
+    /// returns for it.
+    peer_identity: Option<PublicIdentity>,
 }
 
 /// A link we initiated and are waiting to establish (LINKREQUEST sent, LRPROOF
@@ -139,6 +144,16 @@ pub enum Event {
     /// whole reassembled stream is decrypted once); the other contexts
     /// (`RESOURCE_ADV` / `RESOURCE_HMU`) are link-decrypted.
     InLinkData { link_id: [u8; TRUNCATED_HASHLENGTH], context: u8, plaintext: Vec<u8> },
+    /// The initiator of an inbound link identified itself (validated
+    /// `LINKIDENTIFY`). In LXMF this opens a backchannel: replies to this
+    /// peer may ride this link (see [`Transport::make_in_link_data`]).
+    LinkIdentified { link_id: [u8; TRUNCATED_HASHLENGTH], identity: PublicIdentity },
+    /// The initiator sent a link keepalive; `reply` is the echo to transmit
+    /// (keeping the link — and any backchannel on it — alive at their end).
+    LinkKeepalive { link_id: [u8; TRUNCATED_HASHLENGTH], reply: Vec<u8> },
+    /// The initiator closed an inbound link (LINKCLOSE); it has been
+    /// forgotten — drop anything (e.g. a backchannel route) that used it.
+    InLinkClosed { link_id: [u8; TRUNCATED_HASHLENGTH] },
     /// A link we initiated is now established (the responder's LRPROOF validated).
     /// `target` is the destination we opened it to, so queued sends can be flushed.
     OutboundLinkUp { link_id: [u8; TRUNCATED_HASHLENGTH], target: [u8; TRUNCATED_HASHLENGTH] },
@@ -434,13 +449,18 @@ impl Transport {
             }
         }
 
-        // 0b. Packet proof (receipt) confirming a link DATA packet we sent.
-        if packet.packet_type == PACKET_PROOF
-            && packet.context == CONTEXT_NONE
-            && self.out_links.contains_key(&packet.destination_hash)
-        {
+        // 0b. Packet proof (receipt) confirming a link DATA packet we sent —
+        // on a link we initiated, or on an inbound link whose initiator has
+        // identified itself (a backchannel reply; their identity validates
+        // the proof).
+        if packet.packet_type == PACKET_PROOF && packet.context == CONTEXT_NONE {
             let lid = packet.destination_hash;
-            let identity = self.out_links[&lid].identity.clone();
+            let known_identity = if let Some(l) = self.out_links.get(&lid) {
+                Some(l.identity.clone())
+            } else {
+                self.links.get(&lid).and_then(|st| st.peer_identity.clone())
+            };
+            if let Some(identity) = known_identity {
             // Explicit proof carries the packet hash; implicit is signature-only, so
             // test it against each outstanding receipt on this link.
             let candidates: Vec<[u8; 32]> = if packet.data.len() >= 32 + SIG_LENGTH {
@@ -461,6 +481,7 @@ impl Transport {
                 packet_type: packet.packet_type,
                 context: packet.context,
             };
+            }
         }
 
         // 0b-2. Decrypted DATA on an established outbound link — a response or a
@@ -487,6 +508,14 @@ impl Transport {
                     self.remove_out_link(&lid);
                     Event::OutLinkClosed { link_id: lid }
                 }
+                // Plain DATA on a link we initiated = the peer replying over
+                // OUR link (the backchannel, after we identified on it).
+                // Surface it like any inbound message, with the packet proof
+                // to send back — without the proof their ✓ never happens.
+                Ok(plaintext) if packet.context == CONTEXT_NONE => {
+                    let proof = link::prove_packet(&self.identity, &lid, &packet);
+                    Event::LinkData { link_id: lid, plaintext, proof }
+                }
                 Ok(plaintext) => Event::OutLinkData { link_id: lid, context: packet.context, plaintext },
                 Err(reason) => Event::DataUndecryptable { destination_hash: lid, reason },
             };
@@ -512,6 +541,73 @@ impl Transport {
                         let proof = link::prove_packet(&self.identity, &packet.destination_hash, &packet);
                         Event::LinkData { link_id: packet.destination_hash, plaintext, proof }
                     }
+                    Err(reason) => {
+                        Event::DataUndecryptable { destination_hash: packet.destination_hash, reason }
+                    }
+                };
+            }
+            // The initiator identifying itself (LINKIDENTIFY): validates and
+            // opens the backchannel — we may now reply over this link and
+            // check the proofs they return.
+            if packet.packet_type == PACKET_DATA && packet.context == CONTEXT_LINKIDENTIFY {
+                return match link::decrypt(&key, &packet.data) {
+                    Ok(pt) => match link::validate_identify(&packet.destination_hash, &pt) {
+                        Some(identity) => {
+                            if let Some(st) = self.links.get_mut(&packet.destination_hash) {
+                                st.peer_identity = Some(identity.clone());
+                            }
+                            Event::LinkIdentified { link_id: packet.destination_hash, identity }
+                        }
+                        None => Event::Dropped("invalid link identify"),
+                    },
+                    Err(reason) => {
+                        Event::DataUndecryptable { destination_hash: packet.destination_hash, reason }
+                    }
+                };
+            }
+            // Initiator keepalive (0xFF): echo 0xFE, like an RNS responder —
+            // otherwise the initiator stales the link out (and the
+            // backchannel with it) even though we're still here.
+            if packet.packet_type == PACKET_DATA && packet.context == CONTEXT_KEEPALIVE {
+                return match link::decrypt(&key, &packet.data) {
+                    Ok(pt) if pt.as_slice() == [0xFF] => {
+                        let eph = gen_ephemeral();
+                        let mut iv = [0u8; IV_LENGTH];
+                        iv.copy_from_slice(&eph[..IV_LENGTH]);
+                        match link::make_link_context_packet(
+                            &packet.destination_hash,
+                            &key,
+                            CONTEXT_KEEPALIVE,
+                            &[0xFE],
+                            &iv,
+                        ) {
+                            Ok(reply) => {
+                                Event::LinkKeepalive { link_id: packet.destination_hash, reply }
+                            }
+                            Err(_) => Event::Dropped("keepalive echo failed"),
+                        }
+                    }
+                    Ok(_) => Event::AddressedUnhandled {
+                        destination_hash: packet.destination_hash,
+                        packet_type: packet.packet_type,
+                        context: packet.context,
+                    },
+                    Err(reason) => {
+                        Event::DataUndecryptable { destination_hash: packet.destination_hash, reason }
+                    }
+                };
+            }
+            // The initiator tore the link down: forget it so a backchannel
+            // can't keep pointing at a dead link.
+            if packet.packet_type == PACKET_DATA && packet.context == CONTEXT_LINKCLOSE {
+                return match link::decrypt(&key, &packet.data) {
+                    Ok(pt) if pt.as_slice() == &packet.destination_hash[..] => {
+                        let lid = packet.destination_hash;
+                        self.links.remove(&lid);
+                        self.links_order.retain(|k| *k != lid);
+                        Event::InLinkClosed { link_id: lid }
+                    }
+                    Ok(_) => Event::Dropped("malformed link close"),
                     Err(reason) => {
                         Event::DataUndecryptable { destination_hash: packet.destination_hash, reason }
                     }
@@ -587,7 +683,7 @@ impl Transport {
                             Some(est) => {
                                 self.insert_link(
                                     est.link_id,
-                                    LinkState { key: est.derived_key, proof: est.proof_packet.clone() },
+                                    LinkState { key: est.derived_key, proof: est.proof_packet.clone(), peer_identity: None },
                                 );
                                 Event::LinkEstablished { link_id: est.link_id, proof: est.proof_packet }
                             }
@@ -1013,6 +1109,28 @@ impl Transport {
         link::make_link_context_packet(link_id, &key, context, plaintext, iv).ok()
     }
 
+    /// Send our own DATA on an INBOUND link — the LXMF **backchannel**: a
+    /// reply to a peer who opened this link to us and identified itself.
+    /// Registers a receipt; the peer (the link initiator) proves the packet,
+    /// validated against the identity from its LINKIDENTIFY, surfacing
+    /// [`Event::Delivered`]. None if the link is unknown or unidentified
+    /// (without the peer's identity the proof could not be checked).
+    pub fn make_in_link_data(
+        &mut self,
+        link_id: &[u8; TRUNCATED_HASHLENGTH],
+        plaintext: &[u8],
+        iv: &[u8; IV_LENGTH],
+    ) -> Option<(Vec<u8>, [u8; 32])> {
+        let st = self.links.get(link_id)?;
+        st.peer_identity.as_ref()?;
+        let key = st.key;
+        let ciphertext = link::encrypt_data(&key, plaintext, iv).ok()?;
+        let packet = Packet::header1(DEST_LINK, PACKET_DATA, CONTEXT_NONE, *link_id, ciphertext);
+        let packet_hash = packet.packet_hash();
+        self.insert_receipt(packet_hash, *link_id);
+        Some((packet.encode(), packet_hash))
+    }
+
     /// Token-decrypt a blob with an established INBOUND link's session key — used
     /// to decrypt a fully-reassembled Resource stream (RNS encrypts the whole
     /// stream, not individual parts). None if the link isn't established or the
@@ -1355,6 +1473,85 @@ mod tests {
         }
         // Retired: a replayed proof no longer matches.
         assert!(!matches!(initiator.handle_frame(&prf, &mut eph), Event::Delivered { .. }));
+    }
+
+    #[test]
+    fn backchannel_reply_rides_the_inbound_link() {
+        // NomadNet-style flow: the initiator opens a link, identifies itself,
+        // and the responder replies over that SAME link (no reverse
+        // handshake), with the initiator proving the reply packet.
+        let initiator_id = id(0xA0);
+        let responder_id = id(0xB0);
+        let responder_dh = single_destination_hash("lxmf", &["delivery"], &responder_id.hash());
+        let mut initiator = Transport::new(initiator_id);
+        let mut responder = Transport::new(responder_id);
+        responder.register_destination(responder_dh);
+        let mut eph = || [0x55u8; KEY_HALF];
+        let peer_pub = PrivateIdentity::from_bytes(&[0xB0; KEY_HALF], &[0xB1; KEY_HALF]).public().clone();
+        let (req, lid) = initiator.make_link_request(&responder_dh, &peer_pub, &[1; KEY_HALF], &[2; KEY_HALF], 1000);
+        let proof = match responder.handle_frame(&req, &mut eph) {
+            Event::LinkEstablished { proof, .. } => proof,
+            _ => panic!("responder should accept the link"),
+        };
+        assert!(matches!(initiator.handle_frame(&proof, &mut eph), Event::OutboundLinkUp { .. }));
+
+        // Before identification, the backchannel is closed: no identity to
+        // validate the peer's proofs against.
+        assert!(responder.make_in_link_data(&lid, b"early", &[9u8; IV_LENGTH]).is_none());
+
+        // The initiator identifies itself on the link.
+        let identify = initiator.make_out_link_identify(&lid, &[3u8; IV_LENGTH]).expect("identify");
+        let initiator_pub = PrivateIdentity::from_bytes(&[0xA0; KEY_HALF], &[0xA1; KEY_HALF]).public().clone();
+        match responder.handle_frame(&identify, &mut eph) {
+            Event::LinkIdentified { link_id, identity } => {
+                assert_eq!(link_id, lid);
+                assert_eq!(identity.public_key(), initiator_pub.public_key());
+            }
+            other => panic!("expected identified, got {:?}", core::mem::discriminant(&other)),
+        }
+
+        // The responder replies over the inbound link…
+        let (reply, reply_hash) =
+            responder.make_in_link_data(&lid, b"backchannel reply", &[4u8; IV_LENGTH]).expect("send");
+        // …which the initiator receives as plain link data, with a proof out.
+        let reply_proof = match initiator.handle_frame(&reply, &mut eph) {
+            Event::LinkData { link_id, plaintext, proof } => {
+                assert_eq!(link_id, lid);
+                assert_eq!(plaintext, b"backchannel reply");
+                proof
+            }
+            other => panic!("expected link data, got {:?}", core::mem::discriminant(&other)),
+        };
+        // The proof retires the responder's receipt (its ✓).
+        match responder.handle_frame(&reply_proof, &mut eph) {
+            Event::Delivered { packet_hash } => assert_eq!(packet_hash, reply_hash),
+            other => panic!("expected delivered, got {:?}", core::mem::discriminant(&other)),
+        }
+
+        // Keepalive: initiator's 0xFF gets a 0xFE echo to send back.
+        let key = responder.links[&lid].key;
+        let ka = link::make_link_context_packet(&lid, &key, CONTEXT_KEEPALIVE, &[0xFF], &[5u8; IV_LENGTH])
+            .unwrap();
+        let echo = match responder.handle_frame(&ka, &mut eph) {
+            Event::LinkKeepalive { link_id, reply } => {
+                assert_eq!(link_id, lid);
+                reply
+            }
+            other => panic!("expected keepalive, got {:?}", core::mem::discriminant(&other)),
+        };
+        match initiator.handle_frame(&echo, &mut eph) {
+            Event::OutLinkData { context, plaintext, .. } => {
+                assert_eq!(context, CONTEXT_KEEPALIVE);
+                assert_eq!(plaintext, [0xFE]);
+            }
+            other => panic!("expected echo, got {:?}", core::mem::discriminant(&other)),
+        }
+
+        // LINKCLOSE tears the inbound link (and so the backchannel) down.
+        let close =
+            link::make_link_context_packet(&lid, &key, CONTEXT_LINKCLOSE, &lid, &[6u8; IV_LENGTH]).unwrap();
+        assert!(matches!(responder.handle_frame(&close, &mut eph), Event::InLinkClosed { .. }));
+        assert!(responder.make_in_link_data(&lid, b"late", &[7u8; IV_LENGTH]).is_none());
     }
 
     /// A full link setup between two in-process transports, returning the

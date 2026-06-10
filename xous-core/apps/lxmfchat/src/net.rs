@@ -82,6 +82,10 @@ const MAX_FOUND_ADDRS: usize = 16;
 /// an outbound Resource sender (not implemented) — they go store-and-forward
 /// via the propagation node instead.
 const LINK_PACKED_MAX: usize = 431;
+/// A backchannel idle past this is not used for replies (the initiator
+/// keepalives every 360 s and LXMF closes idle links at 600 s; our keepalive
+/// echoes refresh the clock, so an alive link stays usable indefinitely).
+const BACKCHANNEL_MAX_IDLE: u64 = 540;
 /// Proof wait for a message sent as a Resource (multiple request/part round
 /// trips before the receiver can prove it) — longer than the single-packet
 /// DELIVERY_RETRY. On timeout the send is retried as a fresh resource.
@@ -256,6 +260,12 @@ pub struct Shared {
     /// (author, timestamp, text) until the user opens that thread, then flushed
     /// into it. In-memory only (not yet persisted across an app restart).
     pub pending: Mutex<BTreeMap<[u8; TRUNCATED_HASHLENGTH], Vec<(String, u64, String)>>>,
+    /// Open backchannels: peers who established a link TO us and identified
+    /// themselves on it (LINKIDENTIFY) — replies to them can ride that link
+    /// with no reverse handshake (the LXMF backchannel). dest hash →
+    /// (inbound link id, last-activity secs). Entries idle past
+    /// [`BACKCHANNEL_MAX_IDLE`] are dropped at use; cleared on reconnect.
+    pub backchannels: Mutex<BTreeMap<[u8; TRUNCATED_HASHLENGTH], ([u8; TRUNCATED_HASHLENGTH], u64)>>,
     /// LXMF addresses spotted in inbound message text (32-hex tokens), newest
     /// last — so a contact can be shared by simply messaging us their address
     /// ("here's Bob: <hex>") and imported from the menu, with no announce and
@@ -445,6 +455,7 @@ pub fn connection_manager(shared: Arc<Shared>, chat_cid: CID) {
                         // the hub can no longer route responses back on.
                         plock(&shared.transport).connection_reset();
                         plock(&shared.in_resources).clear();
+                        plock(&shared.backchannels).clear();
                         let sync_active = { plock(&shared.sync).phase != SyncPhase::Idle };
                         if sync_active {
                             sync_finish(&shared, chat_cid, "connection lost — try again");
@@ -622,8 +633,17 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
         // Direct delivery over a link: the plaintext is already the full LXMF
         // blob. Send the packet proof back so the sender confirms delivery (and
         // stops retrying / tearing the link down).
-        Event::LinkData { plaintext, proof, .. } => {
+        Event::LinkData { link_id, plaintext, proof } => {
             write_to_hub(shared, &proof);
+            {
+                // traffic on the link = the backchannel (if any) is alive
+                let mut b = plock(&shared.backchannels);
+                for (_, (lid, seen)) in b.iter_mut() {
+                    if *lid == link_id {
+                        *seen = now_secs();
+                    }
+                }
+            }
             deliver_lxmf(shared, chat_cid, pddb, trng, &plaintext, true);
         }
         // A direct message too large for one link packet arrives as an RNS
@@ -631,6 +651,51 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
         // parts → we prove receipt (the sender's delivery ack) and deliver.
         Event::InLinkData { link_id, context, plaintext } => {
             inbound_resource(shared, chat_cid, pddb, trng, link_id, context, plaintext);
+        }
+        // The peer identified itself on its link to us: open a backchannel —
+        // replies to them now ride this link, no reverse handshake. Also a
+        // free key-learning moment (like an announce without app_data), which
+        // makes the peer replyable even if we never see them announce.
+        Event::LinkIdentified { link_id, identity } => {
+            let dest = reticulum_core::destination::single_destination_hash(
+                "lxmf",
+                &["delivery"],
+                &identity.hash,
+            );
+            log::info!("backchannel open: {} via link {}", hex(&dest), hex(&link_id));
+            {
+                let mut tp = plock(&shared.transport);
+                if tp.known(&dest).is_none() {
+                    tp.remember(
+                        dest,
+                        reticulum_core::transport::KnownDest {
+                            identity,
+                            name_hash: crate::lxmf_delivery_name_hash(),
+                            ratchet: None,
+                            app_data: Vec::new(),
+                        },
+                    );
+                }
+            }
+            plock(&shared.backchannels).insert(dest, (link_id, now_secs()));
+            // A queued reply may have been waiting for exactly this.
+            pump_outbox(shared, chat_cid, pddb, trng);
+        }
+        // Echo the initiator's keepalive so it doesn't stale the link out —
+        // and note the link (hence backchannel) is alive.
+        Event::LinkKeepalive { link_id, reply } => {
+            write_to_hub(shared, &reply);
+            let mut b = plock(&shared.backchannels);
+            for (_, (lid, seen)) in b.iter_mut() {
+                if *lid == link_id {
+                    *seen = now_secs();
+                }
+            }
+        }
+        // The initiator closed its link: any backchannel over it is dead.
+        Event::InLinkClosed { link_id } => {
+            plock(&shared.backchannels).retain(|_, (lid, _)| *lid != link_id);
+            plock(&shared.in_resources).remove(&link_id);
         }
         // A link we initiated is up. Real RNS responders only activate the link —
         // and start accepting data — once they receive an RTT packet, so send it
@@ -642,6 +707,17 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
             let rtt = { plock(&shared.transport).make_link_rtt(&link_id, &iv) };
             if let Some(rtt) = rtt {
                 write_to_hub(shared, &rtt);
+            }
+            // Identify ourselves on links to PEERS (the PN flow identifies
+            // during sync) so their replies can ride this link back — the
+            // provider half of the LXMF backchannel.
+            if crate::propagation_node() != Some(target) {
+                let mut iiv = [0u8; IV_LENGTH];
+                crate::fill_random(trng, &mut iiv);
+                let idp = { plock(&shared.transport).make_out_link_identify(&link_id, &iiv) };
+                if let Some(idp) = idp {
+                    write_to_hub(shared, &idp);
+                }
             }
             sync_on_link_up(shared, chat_cid, trng, link_id, target);
             pump_outbox(shared, chat_cid, pddb, trng);
@@ -2310,6 +2386,49 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                         }
                     }
                     None => {
+                        // A peer who messaged us and identified leaves a
+                        // backchannel: reply over THEIR link, no handshake.
+                        // (Single-packet messages only — Resource-over-
+                        // backchannel isn't wired; large replies take the
+                        // 3-5 s of establishing our own link.)
+                        if outbox[i].packed.len() <= LINK_PACKED_MAX {
+                            let bc = {
+                                let mut b = plock(&shared.backchannels);
+                                match b.get(&peer) {
+                                    Some((lid, seen))
+                                        if now.saturating_sub(*seen) <= BACKCHANNEL_MAX_IDLE =>
+                                    {
+                                        Some(*lid)
+                                    }
+                                    Some(_) => {
+                                        b.remove(&peer); // stale: don't reuse
+                                        None
+                                    }
+                                    None => None,
+                                }
+                            };
+                            if let Some(lid) = bc {
+                                let mut iv = [0u8; IV_LENGTH];
+                                crate::fill_random(trng, &mut iv);
+                                let made = {
+                                    plock(&shared.transport).make_in_link_data(&lid, &outbox[i].packed, &iv)
+                                };
+                                if let Some((raw, packet_hash)) = made {
+                                    write_to_hub(shared, &raw);
+                                    outbox[i].in_flight = Some(packet_hash);
+                                    outbox[i].attempts += 1;
+                                    outbox[i].next_action = now + DELIVERY_RETRY;
+                                    chat::cf_set_status_text(
+                                        chat_cid,
+                                        &format!("{label}: replied over their link…"),
+                                    );
+                                    i += 1;
+                                    continue;
+                                }
+                                // link vanished under us: drop and establish our own
+                                plock(&shared.backchannels).remove(&peer);
+                            }
+                        }
                         // No live link: establish one (a pending recent request
                         // is left alone). The OutboundLinkUp event pumps the
                         // outbox the moment the LRPROOF arrives, so the message

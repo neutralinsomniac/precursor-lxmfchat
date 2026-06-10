@@ -284,6 +284,24 @@ pub fn make_link_context_packet(
 /// `pub(64) || Ed25519_sign(signed_data)`, sent as an encrypted DATA packet with
 /// context `LINKIDENTIFY`. `pub` is `enc_pub(32) || sig_pub(32)` (RNS
 /// `Identity.get_public_key`).
+/// Validate a received `LINKIDENTIFY` plaintext (`pub(64) || sign(link_id ||
+/// pub)`) and return the identified peer. This is how a link initiator tells
+/// the responder who it is — which in LXMF opens a **backchannel**: the
+/// responder may reply over this same link instead of establishing its own.
+pub fn validate_identify(
+    link_id: &[u8; TRUNCATED_HASHLENGTH],
+    plaintext: &[u8],
+) -> Option<PublicIdentity> {
+    if plaintext.len() != KEYSIZE + SIG_LENGTH {
+        return None;
+    }
+    let identity = PublicIdentity::from_public_key(&plaintext[..KEYSIZE]).ok()?;
+    let mut signed = Vec::with_capacity(TRUNCATED_HASHLENGTH + KEYSIZE);
+    signed.extend_from_slice(link_id);
+    signed.extend_from_slice(&plaintext[..KEYSIZE]);
+    if identity.validate(&plaintext[KEYSIZE..], &signed) { Some(identity) } else { None }
+}
+
 pub fn make_identify(
     link_id: &[u8; TRUNCATED_HASHLENGTH],
     derived_key: &[u8; DERIVED_KEY_LENGTH],
