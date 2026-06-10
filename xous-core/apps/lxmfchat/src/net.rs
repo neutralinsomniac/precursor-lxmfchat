@@ -200,6 +200,16 @@ pub struct Shared {
     /// socket if this stays nonzero too long, which errors the blocked write out
     /// and lets the connection manager reconnect.
     pub write_started: core::sync::atomic::AtomicU32,
+    /// LIVENESS DIAGNOSTICS, displayed by the MAIN thread in `sync_now`'s status
+    /// line (`[sN pN rN gN cN]`). Lock-free on purpose: the main thread must be
+    /// able to render them no matter which mutex is wedged. Heartbeats tick once
+    /// per loop iteration of their thread; `sync_stage` records the last numbered
+    /// step the sync path reached (see [`stage`] constants), so a wedged sync
+    /// pinpoints the exact statement it blocked on.
+    pub beat_sync: core::sync::atomic::AtomicU32,
+    pub beat_pump: core::sync::atomic::AtomicU32,
+    pub beat_read: core::sync::atomic::AtomicU32,
+    pub sync_stage: core::sync::atomic::AtomicU32,
     /// The hub to (re)connect to, as `host:port`. Read by the connection manager
     /// each cycle so a "Set hub" takes effect on the next (re)connect.
     pub hub: Mutex<String>,
@@ -384,6 +394,7 @@ fn read_until_closed(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Tr
                 break;
             }
             Ok(n) => {
+                shared.beat_read.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
                 for frame in deframer.push(&buf[..n]) {
                     handle_frame(shared, chat_cid, pddb, trng, &frame);
                 }
@@ -823,6 +834,7 @@ const SYNC_ROUTE_TRIES: u8 = 20;
 /// Begin a propagation-node sync (from the menu or auto on first connect). Ensures
 /// the node's key + route, (re)uses or opens the link, and kicks the exchange.
 pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
+    stage(shared, 11);
     let pn = match crate::propagation_node() {
         Some(p) => p,
         None => {
@@ -834,6 +846,7 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         chat::cf_set_status_text_forced(chat_cid, "sync already in progress");
         return;
     }
+    stage(shared, 12);
     let now = now_secs();
     // No hub connection: nothing we send can go anywhere. Wait for the manager
     // to reconnect (same bounded retry as the no-route case below) instead of
@@ -858,10 +871,12 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         }
         return;
     }
+    stage(shared, 13);
     let (known, have_path) = {
         let tp = shared.transport.lock().unwrap();
         (tp.known(&pn).cloned(), tp.has_path(&pn))
     };
+    stage(shared, 14);
     let known = match (known, have_path) {
         (Some(k), true) => k,
         _ => {
@@ -900,12 +915,14 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         s.next_attempt = 0;
         s.link_tries = 0;
     }
+    stage(shared, 15);
     match { shared.transport.lock().unwrap().outbound_link_for(&pn, now) } {
         Some(lid) => {
             shared.sync.lock().unwrap().link_id = Some(lid);
             sync_send_identify_and_list(shared, chat_cid, trng, lid);
         }
         None => {
+            stage(shared, 16);
             // The hop count distinguishes a HEADER_1 (hops ≤ 1, direct) from a
             // HEADER_2 (routed) link request — and the try counter advancing
             // proves the sync thread is alive and writing. Status BEFORE the
@@ -916,7 +933,9 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
                 chat_cid,
                 &format!("sync: contacting node (try 1, hops {hops})…"),
             );
-            match send_pn_link_request(shared, trng, &pn, &known.identity, now) {
+            let outcome = send_pn_link_request(shared, trng, &pn, &known.identity, now);
+            stage(shared, 17);
+            match outcome {
                 LinkReqOutcome::WriteFailed => {
                     sync_finish(shared, chat_cid, "hub write failed — try again");
                 }
@@ -1296,6 +1315,7 @@ pub fn outbox_pump_thread(shared: Arc<Shared>, chat_cid: CID) {
     };
     loop {
         std::thread::sleep(std::time::Duration::from_secs(2));
+        shared.beat_pump.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         if !shared.outbox.lock().unwrap().is_empty() {
             // Mine any pending propagation stamp first (slow, lock-free), so the
             // blob is ready when pump_outbox reaches the PN-send step. Doing it
@@ -1324,8 +1344,27 @@ pub fn sync_thread(shared: Arc<Shared>, chat_cid: CID) {
     };
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
+        shared.beat_sync.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         maybe_auto_sync(&shared, chat_cid, &trng);
     }
+}
+
+// Sync-path progress markers for the `[gN]` diagnostic (see Shared.sync_stage).
+// Each is stored just BEFORE the statement it names, so a frozen value points at
+// the exact blocking statement:
+//  1 maybe_auto_sync entered (about to take the sync lock for the watchdog)
+//  2 watchdog done (about to take the sync lock for the linking check)
+//  3 linking check done (about to take the sync lock to consume the request)
+// 10 request consumed (about to call start_sync)
+// 11 start_sync entered (about to take the sync lock for the phase check)
+// 12 phase check done (about to read the connected flag)
+// 13 connected (about to take the TRANSPORT lock for known/path)
+// 14 known/path read (about to take the sync lock to init Linking state)
+// 15 Linking state set (about to take the TRANSPORT lock for outbound_link_for)
+// 16 no reusable link (about to build + write the LINKREQUEST)
+// 17 LINKREQUEST write returned
+fn stage(shared: &Arc<Shared>, s: u32) {
+    shared.sync_stage.store(s, core::sync::atomic::Ordering::SeqCst);
 }
 
 /// Kick off a one-time sync once the propagation node's route is known (after the
@@ -1348,6 +1387,7 @@ fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         }
     };
     let now = now_secs();
+    stage(shared, 1);
     // Time out a stuck sync.
     let stalled = {
         let s = shared.sync.lock().unwrap();
@@ -1357,6 +1397,7 @@ fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         sync_finish(shared, chat_cid, "timed out");
         return;
     }
+    stage(shared, 2);
     // Mid-sync, still waiting for the link: if the LINKREQUEST was lost (its
     // pending entry expired with no proof), send a fresh one — otherwise a single
     // lost request used to mean nothing more ever went out and the sync just sat
@@ -1391,6 +1432,7 @@ fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
     // A manual sync request (from the menu) is executed HERE — on the sync thread
     // — never on the main thread, so a blocking hub write can't freeze the UI.
     // `next_attempt` is the backoff while the node's route is being resolved.
+    stage(shared, 3);
     let requested = {
         let mut s = shared.sync.lock().unwrap();
         if s.requested && now >= s.next_attempt {
@@ -1401,6 +1443,7 @@ fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         }
     };
     if requested {
+        stage(shared, 10);
         start_sync(shared, chat_cid, trng); // handles not-ready / already-running itself
         return;
     }

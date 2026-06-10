@@ -176,6 +176,10 @@ impl<'a> LxmfChat<'a> {
             connected: core::sync::atomic::AtomicBool::new(false),
             ctl: Mutex::new(None),
             write_started: core::sync::atomic::AtomicU32::new(0),
+            beat_sync: core::sync::atomic::AtomicU32::new(0),
+            beat_pump: core::sync::atomic::AtomicU32::new(0),
+            beat_read: core::sync::atomic::AtomicU32::new(0),
+            sync_stage: core::sync::atomic::AtomicU32::new(0),
             our_dh,
             dialogue_id: DIALOGUE_WELCOME.to_string(),
             seen: Mutex::new(BTreeMap::new()),
@@ -282,7 +286,19 @@ impl<'a> LxmfChat<'a> {
     /// this returns immediately and never blocks the UI on a hub write.
     pub fn sync_now(&self) {
         net::request_sync(&self.shared);
-        self.chat.set_status_text("sync requested…");
+        // Liveness snapshot, rendered by the MAIN thread from lock-free atomics
+        // (so it displays no matter which mutex/thread is wedged): s/p/r =
+        // sync/pump/read thread heartbeats, g = last sync-path stage reached
+        // (see net.rs stage table), c = connected. Press Sync twice ~15 s apart:
+        // s should advance by ~15 and g should move — whichever number FREEZES
+        // identifies the wedged thread / exact blocking statement.
+        use core::sync::atomic::Ordering;
+        let s = self.shared.beat_sync.load(Ordering::SeqCst);
+        let p = self.shared.beat_pump.load(Ordering::SeqCst);
+        let r = self.shared.beat_read.load(Ordering::SeqCst);
+        let g = self.shared.sync_stage.load(Ordering::SeqCst);
+        let c = self.shared.connected.load(Ordering::SeqCst) as u32;
+        self.chat.set_status_text(&format!("sync requested… [s{s} p{p} r{r} g{g} c{c}]"));
     }
 
     /// Send an opportunistic LXMF message to the current peer.
