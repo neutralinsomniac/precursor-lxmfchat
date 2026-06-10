@@ -786,7 +786,8 @@ pub fn keepalive_thread(shared: Arc<Shared>, chat_cid: CID) {
             chat::cf_set_status_text(chat_cid, "hub write stalled — resetting connection…");
             shared.write_started.store(0, Ordering::SeqCst);
             shared.connected.store(false, Ordering::SeqCst);
-            if let Some(c) = plock(&shared.ctl).take() {
+            let c = plock(&shared.ctl).take();
+            if let Some(c) = c {
                 c.shutdown(std::net::Shutdown::Both).ok();
             }
             continue;
@@ -1000,7 +1001,15 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         s.link_tries = 0;
     }
     stage(shared, 15);
-    match { plock(&shared.transport).outbound_link_for(&pn, now) } {
+    // BIND the lookup result before matching. A lock inside a `match` scrutinee
+    // — even wrapped in braces — keeps its guard alive through EVERY ARM (Rust
+    // temporary-scope rules), so the old `match { lock().outbound_link_for() }`
+    // SELF-DEADLOCKED as soon as either arm touched the transport mutex again.
+    // That was the root cause of "sync hangs forever on the first attempt of
+    // every boot" (and it wedged sends + inbound frames behind the held mutex);
+    // it never reproduced off-device because only the device runs start_sync.
+    let existing_link = { plock(&shared.transport).outbound_link_for(&pn, now) };
+    match existing_link {
         Some(lid) => {
             plock(&shared.sync).link_id = Some(lid);
             sync_send_identify_and_list(shared, chat_cid, trng, lid);
@@ -1110,7 +1119,11 @@ fn sync_send_identify_and_list(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng,
     chat::cf_set_status_text_forced(chat_cid, "sync: requesting message list…");
     let mut iv = [0u8; IV_LENGTH];
     crate::fill_random(trng, &mut iv);
-    if let Some(idp) = { plock(&shared.transport).make_out_link_identify(&link_id, &iv) } {
+    // Bind before testing: in edition 2021 an `if let` scrutinee's lock guard
+    // lives through the body, which would hold the transport mutex across the
+    // hub write below.
+    let idp = { plock(&shared.transport).make_out_link_identify(&link_id, &iv) };
+    if let Some(idp) = idp {
         write_to_hub(shared, &idp);
     }
     // `/get [None, None]` → list of transient ids.
@@ -1124,7 +1137,9 @@ fn sync_send_get(shared: &Arc<Shared>, trng: &Trng, link_id: [u8; TRUNCATED_HASH
     let packed = msgpack::encode(&req);
     let mut iv = [0u8; IV_LENGTH];
     crate::fill_random(trng, &mut iv);
-    if let Some(raw) = { plock(&shared.transport).make_out_link_context(&link_id, CONTEXT_REQUEST, &packed, &iv) } {
+    // Bind before testing (scrutinee guards outlive the body in edition 2021).
+    let raw = { plock(&shared.transport).make_out_link_context(&link_id, CONTEXT_REQUEST, &packed, &iv) };
+    if let Some(raw) = raw {
         write_to_hub(shared, &raw);
     }
 }
@@ -1158,7 +1173,10 @@ fn sync_on_outlink_data(
                 plock(&shared.sync).receiver = Some(rx);
                 let mut iv = [0u8; IV_LENGTH];
                 crate::fill_random(trng, &mut iv);
-                if let Some(raw) = { plock(&shared.transport).make_out_link_context(&link_id, CONTEXT_RESOURCE_REQ, &req, &iv) } {
+                // Bind first: don't hold the transport guard across the write.
+                let raw =
+                    { plock(&shared.transport).make_out_link_context(&link_id, CONTEXT_RESOURCE_REQ, &req, &iv) };
+                if let Some(raw) = raw {
                     write_to_hub(shared, &raw);
                 }
                 chat::cf_set_status_text_forced(chat_cid, "sync: downloading…");
@@ -1193,7 +1211,11 @@ fn sync_on_outlink_data(
                 }
             };
             let plain = if encrypted {
-                match { plock(&shared.transport).decrypt_out_link(&link_id, &stream) } {
+                // Bind first: the None arm calls sync_finish, which locks the
+                // transport mutex to drop the link — a self-deadlock if the
+                // scrutinee's guard were still held (match-arm temporary scope).
+                let decrypted = { plock(&shared.transport).decrypt_out_link(&link_id, &stream) };
+                match decrypted {
                     Some(p) => p,
                     None => {
                         sync_finish(shared, chat_cid, "sync failed (decrypt)");
@@ -1212,7 +1234,9 @@ fn sync_on_outlink_data(
             };
             match finished {
                 Ok((payload, proof)) => {
-                    if let Some(raw) = { plock(&shared.transport).make_out_link_resource_proof(&link_id, &proof) } {
+                    // Bind first: don't hold the transport guard across the write.
+                    let raw = { plock(&shared.transport).make_out_link_resource_proof(&link_id, &proof) };
+                    if let Some(raw) = raw {
                         write_to_hub(shared, &raw);
                     }
                     plock(&shared.sync).receiver = None;

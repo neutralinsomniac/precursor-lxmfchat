@@ -283,7 +283,8 @@ impl<'a> LxmfChat<'a> {
         // will pick up the new hub on its next attempt. Shutdown goes through the
         // control clone — the writer mutex may be held by an in-flight (possibly
         // stuck) write, and the main thread must never block on it.
-        if let Some(ctl) = plock(&self.shared.ctl).take() {
+        let ctl = plock(&self.shared.ctl).take();
+        if let Some(ctl) = ctl {
             ctl.shutdown(std::net::Shutdown::Both).ok();
         }
         self.chat.set_status_text(&format!("reconnecting to {}…", self.hub));
