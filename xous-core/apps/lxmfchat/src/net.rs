@@ -744,7 +744,15 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
                     return;
                 }
             }
-            sync_on_outlink_data(shared, chat_cid, pddb, trng, link_id, context, plaintext);
+            // Sync traffic goes to the sync state machine; anything else on a
+            // link WE opened is the peer using the backchannel — including a
+            // LARGE reply arriving as a Resource on our own link.
+            let is_sync_link = { plock(&shared.sync).link_id == Some(link_id) };
+            if is_sync_link {
+                sync_on_outlink_data(shared, chat_cid, pddb, trng, link_id, context, plaintext);
+            } else {
+                outlink_resource(shared, chat_cid, pddb, trng, link_id, context, plaintext);
+            }
         }
         // The responder closed a link we initiated (transport already forgot it).
         // If a sync was mid-flight on it, abort now and let the user retry over a
@@ -948,6 +956,17 @@ fn inbound_resource(
                 send_in_link_request(shared, trng, &link_id, &req);
             }
         }
+        // The initiator downloading a Resource WE are sending over the
+        // backchannel asks for parts: serve them.
+        CONTEXT_RESOURCE_REQ => {
+            let mut iv = [0u8; IV_LENGTH];
+            crate::fill_random(trng, &mut iv);
+            // Bind first: never hold the transport guard across hub writes.
+            let packets = { plock(&shared.transport).serve_link_resource(&link_id, &plaintext, &iv) };
+            for p in packets {
+                write_to_hub(shared, &p);
+            }
+        }
         _ => log::debug!("inbound link {} resource ctx=0x{context:02x} ignored", hex(&link_id)),
     }
 }
@@ -975,6 +994,112 @@ fn make_resource_on_link(
     let (adv, hash) = made?;
     write_to_hub(shared, &adv);
     Some(hash)
+}
+
+/// Drive a Resource arriving on a link WE opened, outside a sync — a peer's
+/// LARGE backchannel reply. Mirror of [`inbound_resource`] with the out-link
+/// crypto ops; shares the receiver map (link ids are unique across tables).
+fn outlink_resource(
+    shared: &Arc<Shared>,
+    chat_cid: CID,
+    pddb: &Pddb,
+    trng: &Trng,
+    link_id: [u8; TRUNCATED_HASHLENGTH],
+    context: u8,
+    plaintext: Vec<u8>,
+) {
+    match context {
+        CONTEXT_RESOURCE_ADV => match ResourceReceiver::accept(&plaintext) {
+            Ok(mut rx) => {
+                let req = rx.next_request();
+                {
+                    let mut map = plock(&shared.in_resources);
+                    while map.len() >= MAX_IN_RESOURCES && !map.contains_key(&link_id) {
+                        map.pop_first();
+                    }
+                    map.insert(link_id, rx);
+                }
+                if let Some(req) = req {
+                    send_out_link_request(shared, trng, &link_id, &req);
+                }
+                chat::cf_set_status_text(chat_cid, "incoming message — receiving…");
+            }
+            Err(e) => {
+                log::warn!("backchannel resource on link {} rejected: {e}", hex(&link_id));
+            }
+        },
+        CONTEXT_RESOURCE => {
+            let (complete, next_req) = {
+                let mut map = plock(&shared.in_resources);
+                match map.get_mut(&link_id) {
+                    Some(rx) => {
+                        let window_done = rx.receive_part(&plaintext);
+                        if rx.is_complete() {
+                            (true, None)
+                        } else if window_done {
+                            (false, rx.next_request())
+                        } else {
+                            (false, None)
+                        }
+                    }
+                    None => (false, None),
+                }
+            };
+            if let Some(req) = next_req {
+                send_out_link_request(shared, trng, &link_id, &req);
+            }
+            if !complete {
+                return;
+            }
+            let rx = match plock(&shared.in_resources).remove(&link_id) {
+                Some(rx) => rx,
+                None => return,
+            };
+            let stream = rx.concat();
+            let plain = if rx.encrypted() {
+                // Bind first (match-scrutinee guards outlive the arms).
+                let decrypted = { plock(&shared.transport).decrypt_out_link(&link_id, &stream) };
+                match decrypted {
+                    Some(p) => p,
+                    None => {
+                        log::warn!("backchannel resource on link {}: stream decrypt failed", hex(&link_id));
+                        return;
+                    }
+                }
+            } else {
+                stream
+            };
+            match rx.finish(&plain) {
+                Ok((payload, proof)) => {
+                    let raw = { plock(&shared.transport).make_out_link_resource_proof(&link_id, &proof) };
+                    if let Some(raw) = raw {
+                        write_to_hub(shared, &raw);
+                    }
+                    deliver_lxmf(shared, chat_cid, pddb, trng, &payload, true);
+                }
+                Err(e) => log::warn!("backchannel resource on link {} invalid: {e}", hex(&link_id)),
+            }
+        }
+        CONTEXT_RESOURCE_HMU => {
+            let next_req = {
+                let mut map = plock(&shared.in_resources);
+                match map.get_mut(&link_id) {
+                    Some(rx) => match rx.receive_hashmap_update(&plaintext) {
+                        Ok(()) => rx.next_request(),
+                        Err(e) => {
+                            log::warn!("backchannel resource on link {}: bad hashmap update: {e}", hex(&link_id));
+                            None
+                        }
+                    },
+                    None => None,
+                }
+            };
+            if let Some(req) = next_req {
+                send_out_link_request(shared, trng, &link_id, &req);
+            }
+        }
+        _ => log::debug!("out-link {} non-sync ctx=0x{context:02x} ignored", hex(&link_id)),
+    }
 }
 
 /// Send a `RESOURCE_REQ` on an inbound link. Bind-then-write: never hold the
@@ -2387,11 +2512,10 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                     }
                     None => {
                         // A peer who messaged us and identified leaves a
-                        // backchannel: reply over THEIR link, no handshake.
-                        // (Single-packet messages only — Resource-over-
-                        // backchannel isn't wired; large replies take the
-                        // 3-5 s of establishing our own link.)
-                        if outbox[i].packed.len() <= LINK_PACKED_MAX {
+                        // backchannel: reply over THEIR link, no handshake —
+                        // as a single link packet, or as a Resource when too
+                        // big for one.
+                        {
                             let bc = {
                                 let mut b = plock(&shared.backchannels);
                                 match b.get(&peer) {
@@ -2408,25 +2532,46 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                                 }
                             };
                             if let Some(lid) = bc {
-                                let mut iv = [0u8; IV_LENGTH];
-                                crate::fill_random(trng, &mut iv);
-                                let made = {
-                                    plock(&shared.transport).make_in_link_data(&lid, &outbox[i].packed, &iv)
-                                };
-                                if let Some((raw, packet_hash)) = made {
-                                    write_to_hub(shared, &raw);
-                                    outbox[i].in_flight = Some(packet_hash);
-                                    outbox[i].attempts += 1;
-                                    outbox[i].next_action = now + DELIVERY_RETRY;
-                                    chat::cf_set_status_text(
-                                        chat_cid,
-                                        &format!("{label}: replied over their link…"),
-                                    );
-                                    i += 1;
-                                    continue;
+                                if outbox[i].packed.len() > LINK_PACKED_MAX {
+                                    // Large reply: a Resource on their link.
+                                    match make_resource_on_link(shared, trng, &lid, &outbox[i].packed) {
+                                        Some(res_hash) => {
+                                            outbox[i].in_flight = Some(res_hash);
+                                            outbox[i].attempts += 1;
+                                            outbox[i].next_action = now + RESOURCE_RETRY;
+                                            chat::cf_set_status_text(
+                                                chat_cid,
+                                                &format!("{label}: transferring over their link…"),
+                                            );
+                                            i += 1;
+                                            continue;
+                                        }
+                                        None => {
+                                            plock(&shared.backchannels).remove(&peer);
+                                        }
+                                    }
+                                } else {
+                                    let mut iv = [0u8; IV_LENGTH];
+                                    crate::fill_random(trng, &mut iv);
+                                    let made = {
+                                        plock(&shared.transport)
+                                            .make_in_link_data(&lid, &outbox[i].packed, &iv)
+                                    };
+                                    if let Some((raw, packet_hash)) = made {
+                                        write_to_hub(shared, &raw);
+                                        outbox[i].in_flight = Some(packet_hash);
+                                        outbox[i].attempts += 1;
+                                        outbox[i].next_action = now + DELIVERY_RETRY;
+                                        chat::cf_set_status_text(
+                                            chat_cid,
+                                            &format!("{label}: replied over their link…"),
+                                        );
+                                        i += 1;
+                                        continue;
+                                    }
+                                    // link vanished under us: drop, establish our own
+                                    plock(&shared.backchannels).remove(&peer);
                                 }
-                                // link vanished under us: drop and establish our own
-                                plock(&shared.backchannels).remove(&peer);
                             }
                         }
                         // No live link: establish one (a pending recent request

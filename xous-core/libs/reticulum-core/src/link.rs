@@ -35,6 +35,11 @@ pub struct EstablishedLink {
     pub derived_key: [u8; DERIVED_KEY_LENGTH],
     /// The PROOF packet to transmit back to the initiator (already encoded).
     pub proof_packet: Vec<u8>,
+    /// The initiator's per-link **ephemeral** Ed25519 verifying key (bytes
+    /// 32..64 of the LINKREQUEST). This — not its identity key — signs the
+    /// packet proofs it returns for data we send on this link (RNS
+    /// `Link.__init__`: initiators use `sig_prv = Ed25519PrivateKey.generate()`).
+    pub peer_sig_pub: [u8; KEY_HALF],
 }
 
 /// Compute the link id for an inbound LINKREQUEST without accepting it. Used to
@@ -87,6 +92,8 @@ pub fn accept_request(
     }
     let mut peer_pub = [0u8; KEY_HALF];
     peer_pub.copy_from_slice(&request.data[..KEY_HALF]);
+    let mut peer_sig_pub = [0u8; KEY_HALF];
+    peer_sig_pub.copy_from_slice(&request.data[KEY_HALF..ECPUBSIZE]);
 
     let lid = link_id(request);
 
@@ -116,7 +123,7 @@ pub fn accept_request(
     proof_data.extend_from_slice(&sig);
 
     let proof = Packet::header1(DEST_LINK, PACKET_PROOF, CONTEXT_LRPROOF, lid, proof_data);
-    Some(EstablishedLink { link_id: lid, derived_key, proof_packet: proof.encode() })
+    Some(EstablishedLink { link_id: lid, derived_key, proof_packet: proof.encode(), peer_sig_pub })
 }
 
 /// Decrypt a link DATA packet's payload with the session key.
@@ -233,6 +240,19 @@ pub fn validate_proof(
     packet_hash: &[u8; 32],
     proof_data: &[u8],
 ) -> bool {
+    validate_proof_sig(&peer_identity.sig_pub, packet_hash, proof_data)
+}
+
+/// Validate a packet PROOF against a raw Ed25519 verifying key. Which key signs
+/// a link packet proof depends on the prover's side of the link (RNS
+/// `Link.__init__` / `Packet.py:validate_link_proof` → `link.peer_sig_pub`):
+/// a **responder** proves with its identity key, but an **initiator** proves
+/// with the per-link ephemeral key from its LINKREQUEST.
+pub fn validate_proof_sig(
+    sig_pub: &[u8; KEY_HALF],
+    packet_hash: &[u8; 32],
+    proof_data: &[u8],
+) -> bool {
     let signature = if proof_data.len() == 32 + SIG_LENGTH {
         if proof_data[..32] != packet_hash[..] {
             return false;
@@ -243,7 +263,9 @@ pub fn validate_proof(
     } else {
         return false;
     };
-    peer_identity.validate(signature, packet_hash)
+    let mut sig = [0u8; SIG_LENGTH];
+    sig.copy_from_slice(signature);
+    crate::ed25519::verify(sig_pub, packet_hash, &sig)
 }
 
 /// Build a packet PROOF (receipt) for a received link DATA packet, so the sender
@@ -257,6 +279,26 @@ pub fn prove_packet(
 ) -> Vec<u8> {
     let packet_hash = data_packet.packet_hash(); // full 32-byte SHA-256
     let signature = identity.sign(&packet_hash);
+    let mut proof_data = Vec::with_capacity(packet_hash.len() + signature.len());
+    proof_data.extend_from_slice(&packet_hash);
+    proof_data.extend_from_slice(&signature);
+    Packet::header1(DEST_LINK, PACKET_PROOF, CONTEXT_NONE, *link_id, proof_data).encode()
+}
+
+/// [`prove_packet`] for a link we **initiated**: the proof must be signed with
+/// the per-link ephemeral Ed25519 key whose public half went into our
+/// LINKREQUEST — that's the key the responder validates against (RNS
+/// `Link.__init__`: `sig_prv = Ed25519PrivateKey.generate()` for initiators;
+/// `validate_link_proof` → `link.peer_sig_pub`). Signing with our identity key
+/// here would make the peer silently reject the receipt.
+pub fn prove_packet_ephemeral(
+    eph_ed25519_seed: &[u8; KEY_HALF],
+    link_id: &[u8; TRUNCATED_HASHLENGTH],
+    data_packet: &Packet,
+) -> Vec<u8> {
+    let sig_pub = SigningKey::from_bytes(eph_ed25519_seed).verifying_key().to_bytes();
+    let packet_hash = data_packet.packet_hash();
+    let signature = crate::ed25519::sign(eph_ed25519_seed, &sig_pub, &packet_hash);
     let mut proof_data = Vec::with_capacity(packet_hash.len() + signature.len());
     proof_data.extend_from_slice(&packet_hash);
     proof_data.extend_from_slice(&signature);

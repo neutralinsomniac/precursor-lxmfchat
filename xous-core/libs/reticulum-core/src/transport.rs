@@ -56,10 +56,14 @@ use crate::packet::Packet;
 struct LinkState {
     key: [u8; DERIVED_KEY_LENGTH],
     proof: Vec<u8>,
+    /// The initiator's per-link ephemeral Ed25519 verifying key (from its
+    /// LINKREQUEST). This is what validates the packet proofs it returns for
+    /// backchannel data we send on this link — RNS initiators sign link packet
+    /// proofs with the link ephemeral, NOT their identity key.
+    peer_sig_pub: [u8; KEY_HALF],
     /// The peer's identity, once it identifies itself on the link
     /// (`LINKIDENTIFY`). Unlocks the LXMF **backchannel**: we may send our own
-    /// data on this inbound link and validate the packet proofs the peer
-    /// returns for it.
+    /// data on this inbound link.
     peer_identity: Option<PublicIdentity>,
 }
 
@@ -69,6 +73,10 @@ struct LinkState {
 struct PendingOut {
     target: [u8; TRUNCATED_HASHLENGTH],
     eph_secret: [u8; KEY_HALF],
+    /// Our per-link ephemeral Ed25519 seed (its public half went into the
+    /// LINKREQUEST). As initiator we must sign packet proofs with THIS key —
+    /// the responder validates them against the request's ephemeral pub.
+    sig_seed: [u8; KEY_HALF],
     identity: PublicIdentity,
     /// When the LINKREQUEST was sent; expired entries (no LRPROOF within
     /// `PENDING_LINK_EXPIRY_SECS`) are pruned so a lost request can be retried.
@@ -79,7 +87,13 @@ struct PendingOut {
 struct OutLink {
     target: [u8; TRUNCATED_HASHLENGTH],
     key: [u8; DERIVED_KEY_LENGTH],
-    /// The peer's identity, to validate the packet proofs (receipts) it returns.
+    /// Our per-link ephemeral Ed25519 seed, carried over from [`PendingOut`]:
+    /// signs the packet proofs we return for backchannel data the peer sends
+    /// on this link (the responder validates against our LINKREQUEST's
+    /// ephemeral pub, not our identity).
+    sig_seed: [u8; KEY_HALF],
+    /// The peer's identity, to validate the packet proofs (receipts) it
+    /// returns (a responder proves with its identity key).
     identity: PublicIdentity,
     /// Last time the link was used to send (refreshed by `outbound_link_for`);
     /// links idle past `OUT_LINK_INACTIVITY_SECS` are dropped instead of
@@ -428,7 +442,16 @@ impl Transport {
                 Some(key) => {
                     let target = pend.target;
                     let created = pend.created;
-                    self.insert_out_link(lid, OutLink { target, key, identity: pend.identity, last_activity: created });
+                    self.insert_out_link(
+                        lid,
+                        OutLink {
+                            target,
+                            key,
+                            sig_seed: pend.sig_seed,
+                            identity: pend.identity,
+                            last_activity: created,
+                        },
+                    );
                     Event::OutboundLinkUp { link_id: lid, target }
                 }
                 None => Event::Dropped("invalid LRPROOF for initiated link"),
@@ -450,17 +473,18 @@ impl Transport {
         }
 
         // 0b. Packet proof (receipt) confirming a link DATA packet we sent —
-        // on a link we initiated, or on an inbound link whose initiator has
-        // identified itself (a backchannel reply; their identity validates
-        // the proof).
+        // on a link we initiated, or on an inbound link (a backchannel reply).
+        // Which key validates depends on the prover's side: a responder proves
+        // with its IDENTITY key, an initiator with the per-link EPHEMERAL
+        // Ed25519 from its LINKREQUEST (RNS Link.__init__ sig_prv).
         if packet.packet_type == PACKET_PROOF && packet.context == CONTEXT_NONE {
             let lid = packet.destination_hash;
-            let known_identity = if let Some(l) = self.out_links.get(&lid) {
-                Some(l.identity.clone())
+            let known_sig_pub = if let Some(l) = self.out_links.get(&lid) {
+                Some(l.identity.sig_pub)
             } else {
-                self.links.get(&lid).and_then(|st| st.peer_identity.clone())
+                self.links.get(&lid).map(|st| st.peer_sig_pub)
             };
-            if let Some(identity) = known_identity {
+            if let Some(sig_pub) = known_sig_pub {
             // Explicit proof carries the packet hash; implicit is signature-only, so
             // test it against each outstanding receipt on this link.
             let candidates: Vec<[u8; 32]> = if packet.data.len() >= 32 + SIG_LENGTH {
@@ -471,7 +495,9 @@ impl Transport {
                 self.receipts.iter().filter(|(_, l)| **l == lid).map(|(h, _)| *h).collect()
             };
             for ph in candidates {
-                if self.receipts.get(&ph) == Some(&lid) && link::validate_proof(&identity, &ph, &packet.data) {
+                if self.receipts.get(&ph) == Some(&lid)
+                    && link::validate_proof_sig(&sig_pub, &ph, &packet.data)
+                {
                     self.receipts.remove(&ph);
                     return Event::Delivered { packet_hash: ph };
                 }
@@ -511,9 +537,13 @@ impl Transport {
                 // Plain DATA on a link we initiated = the peer replying over
                 // OUR link (the backchannel, after we identified on it).
                 // Surface it like any inbound message, with the packet proof
-                // to send back — without the proof their ✓ never happens.
+                // to send back — without the proof their ✓ never happens. As
+                // the link INITIATOR we must prove with the link-ephemeral
+                // Ed25519, not our identity (the responder validates against
+                // our LINKREQUEST's ephemeral pub).
                 Ok(plaintext) if packet.context == CONTEXT_NONE => {
-                    let proof = link::prove_packet(&self.identity, &lid, &packet);
+                    let sig_seed = self.out_links[&lid].sig_seed;
+                    let proof = link::prove_packet_ephemeral(&sig_seed, &lid, &packet);
                     Event::LinkData { link_id: lid, plaintext, proof }
                 }
                 Ok(plaintext) => Event::OutLinkData { link_id: lid, context: packet.context, plaintext },
@@ -620,7 +650,7 @@ impl Transport {
             if packet.packet_type == PACKET_DATA
                 && matches!(
                     packet.context,
-                    CONTEXT_RESOURCE_ADV | CONTEXT_RESOURCE | CONTEXT_RESOURCE_HMU
+                    CONTEXT_RESOURCE_ADV | CONTEXT_RESOURCE | CONTEXT_RESOURCE_HMU | CONTEXT_RESOURCE_REQ
                 )
             {
                 if packet.context == CONTEXT_RESOURCE {
@@ -683,7 +713,12 @@ impl Transport {
                             Some(est) => {
                                 self.insert_link(
                                     est.link_id,
-                                    LinkState { key: est.derived_key, proof: est.proof_packet.clone(), peer_identity: None },
+                                    LinkState {
+                                        key: est.derived_key,
+                                        proof: est.proof_packet.clone(),
+                                        peer_sig_pub: est.peer_sig_pub,
+                                        peer_identity: None,
+                                    },
                                 );
                                 Event::LinkEstablished { link_id: est.link_id, proof: est.proof_packet }
                             }
@@ -868,6 +903,7 @@ impl Transport {
             PendingOut {
                 target: *target,
                 eph_secret: *eph_x25519,
+                sig_seed: *eph_ed25519,
                 identity: peer_identity.clone(),
                 created: now,
             },
@@ -901,6 +937,16 @@ impl Transport {
             }
         }
         id
+    }
+
+    /// Session key for `link_id`, whichever side established it — Resource
+    /// transfers run identically on links we initiated and links peers opened
+    /// to us (the backchannel).
+    fn any_link_key(&self, link_id: &[u8; TRUNCATED_HASHLENGTH]) -> Option<[u8; DERIVED_KEY_LENGTH]> {
+        self.out_links
+            .get(link_id)
+            .map(|l| l.key)
+            .or_else(|| self.links.get(link_id).map(|s| s.key))
     }
 
     /// True if a link to `target` is pending establishment and its request is
@@ -1049,7 +1095,7 @@ impl Transport {
         iv: &[u8; IV_LENGTH],
         adv_iv: &[u8; IV_LENGTH],
     ) -> Option<(Vec<u8>, [u8; 32])> {
-        let key = self.out_links.get(link_id)?.key;
+        let key = self.any_link_key(link_id)?;
         let tx = crate::resource::ResourceSender::new(data, &key, r, prefix, iv);
         let hash = tx.resource_hash();
         let adv = link::make_link_context_packet(
@@ -1075,8 +1121,8 @@ impl Transport {
         req_plaintext: &[u8],
         hmu_iv: &[u8; IV_LENGTH],
     ) -> Vec<Vec<u8>> {
-        let (tx, key) = match (self.out_resources.get(link_id), self.out_links.get(link_id)) {
-            (Some(tx), Some(l)) => (tx, l.key),
+        let (tx, key) = match (self.out_resources.get(link_id), self.any_link_key(link_id)) {
+            (Some(tx), Some(key)) => (tx, key),
             _ => return Vec::new(),
         };
         let (parts, hmu) = tx.handle_request(req_plaintext);
@@ -1111,10 +1157,10 @@ impl Transport {
 
     /// Send our own DATA on an INBOUND link — the LXMF **backchannel**: a
     /// reply to a peer who opened this link to us and identified itself.
-    /// Registers a receipt; the peer (the link initiator) proves the packet,
-    /// validated against the identity from its LINKIDENTIFY, surfacing
-    /// [`Event::Delivered`]. None if the link is unknown or unidentified
-    /// (without the peer's identity the proof could not be checked).
+    /// Registers a receipt; the peer (the link initiator) proves the packet
+    /// with its per-link ephemeral Ed25519 (validated against the LINKREQUEST's
+    /// `peer_sig_pub`), surfacing [`Event::Delivered`]. None if the link is
+    /// unknown or unidentified (only identified links are backchannels).
     pub fn make_in_link_data(
         &mut self,
         link_id: &[u8; TRUNCATED_HASHLENGTH],
@@ -1552,6 +1598,120 @@ mod tests {
             link::make_link_context_packet(&lid, &key, CONTEXT_LINKCLOSE, &lid, &[6u8; IV_LENGTH]).unwrap();
         assert!(matches!(responder.handle_frame(&close, &mut eph), Event::InLinkClosed { .. }));
         assert!(responder.make_in_link_data(&lid, b"late", &[7u8; IV_LENGTH]).is_none());
+    }
+
+    #[test]
+    fn backchannel_proof_must_use_the_link_ephemeral_key() {
+        // RNS link initiators sign packet proofs with the per-link ephemeral
+        // Ed25519 from their LINKREQUEST, not their identity key (Link.__init__:
+        // `sig_prv = Ed25519PrivateKey.generate()`). Validating backchannel
+        // receipts against the LINKIDENTIFY identity rejected every real proof
+        // — the message arrived but the sender escalated to the PN anyway.
+        let initiator_id = id(0xA0);
+        let responder_id = id(0xB0);
+        let responder_dh = single_destination_hash("lxmf", &["delivery"], &responder_id.hash());
+        let mut initiator = Transport::new(id(0xA0));
+        let mut responder = Transport::new(responder_id);
+        responder.register_destination(responder_dh);
+        let mut eph = || [0x66u8; KEY_HALF];
+        let peer_pub = PrivateIdentity::from_bytes(&[0xB0; KEY_HALF], &[0xB1; KEY_HALF]).public().clone();
+        let eph_ed25519 = [2u8; KEY_HALF];
+        let (req, lid) =
+            initiator.make_link_request(&responder_dh, &peer_pub, &[1; KEY_HALF], &eph_ed25519, 1000);
+        let proof = match responder.handle_frame(&req, &mut eph) {
+            Event::LinkEstablished { proof, .. } => proof,
+            _ => panic!("responder should accept the link"),
+        };
+        assert!(matches!(initiator.handle_frame(&proof, &mut eph), Event::OutboundLinkUp { .. }));
+        let identify = initiator.make_out_link_identify(&lid, &[3u8; IV_LENGTH]).expect("identify");
+        assert!(matches!(responder.handle_frame(&identify, &mut eph), Event::LinkIdentified { .. }));
+
+        let (reply, reply_hash) =
+            responder.make_in_link_data(&lid, b"needs the right key", &[4u8; IV_LENGTH]).expect("send");
+        let reply_packet = Packet::decode(&reply).expect("decode");
+
+        // A proof signed with the initiator's IDENTITY key (the old, wrong
+        // behavior) must be rejected…
+        let forged = link::prove_packet(&initiator_id, &lid, &reply_packet);
+        assert!(
+            !matches!(responder.handle_frame(&forged, &mut eph), Event::Delivered { .. }),
+            "identity-signed proof must not retire a backchannel receipt"
+        );
+
+        // …while the link-ephemeral-signed proof retires the receipt.
+        let real = link::prove_packet_ephemeral(&eph_ed25519, &lid, &reply_packet);
+        match responder.handle_frame(&real, &mut eph) {
+            Event::Delivered { packet_hash } => assert_eq!(packet_hash, reply_hash),
+            other => panic!("expected delivered, got {:?}", core::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn backchannel_resource_transfer() {
+        use crate::resource::ResourceReceiver;
+        // A LARGE reply over the backchannel: the responder sends a Resource
+        // on the link the initiator opened; the initiator downloads it with
+        // the out-link machinery and its RESOURCE_PRF retires the send.
+        let initiator_id = id(0xC0);
+        let responder_id = id(0xD0);
+        let responder_dh = single_destination_hash("lxmf", &["delivery"], &responder_id.hash());
+        let mut initiator = Transport::new(initiator_id);
+        let mut responder = Transport::new(responder_id);
+        responder.register_destination(responder_dh);
+        let mut eph = || [0x44u8; KEY_HALF];
+        let peer_pub = PrivateIdentity::from_bytes(&[0xD0; KEY_HALF], &[0xD1; KEY_HALF]).public().clone();
+        let (req, lid) = initiator.make_link_request(&responder_dh, &peer_pub, &[1; KEY_HALF], &[2; KEY_HALF], 1000);
+        let proof = match responder.handle_frame(&req, &mut eph) {
+            Event::LinkEstablished { proof, .. } => proof,
+            _ => panic!("responder should accept the link"),
+        };
+        assert!(matches!(initiator.handle_frame(&proof, &mut eph), Event::OutboundLinkUp { .. }));
+
+        // Responder starts a resource on the INBOUND link.
+        let data: Vec<u8> = (0..4000u32).map(|i| (i * 17) as u8).collect();
+        let (adv, res_hash) = responder
+            .make_link_resource(&lid, &data, [1, 2, 3, 4], [5, 6, 7, 8], &[0x20; IV_LENGTH], &[0x21; IV_LENGTH])
+            .expect("resource on inbound link");
+
+        // The initiator sees the ADV on its out-link and pumps the download;
+        // its requests reach the responder as InLinkData(RESOURCE_REQ).
+        let mut rx = match initiator.handle_frame(&adv, &mut eph) {
+            Event::OutLinkData { context: CONTEXT_RESOURCE_ADV, plaintext, .. } => {
+                ResourceReceiver::accept(&plaintext).expect("accept")
+            }
+            other => panic!("expected ADV, got {:?}", core::mem::discriminant(&other)),
+        };
+        let mut guard = 0;
+        while !rx.is_complete() {
+            let req = rx.next_request().expect("next step");
+            let req_pkt =
+                initiator.make_out_link_context(&lid, CONTEXT_RESOURCE_REQ, &req, &[0x22; IV_LENGTH]).unwrap();
+            let req_plain = match responder.handle_frame(&req_pkt, &mut eph) {
+                Event::InLinkData { context: CONTEXT_RESOURCE_REQ, plaintext, .. } => plaintext,
+                other => panic!("expected REQ, got {:?}", core::mem::discriminant(&other)),
+            };
+            for raw in responder.serve_link_resource(&lid, &req_plain, &[0x23; IV_LENGTH]) {
+                match initiator.handle_frame(&raw, &mut eph) {
+                    Event::OutLinkData { context: CONTEXT_RESOURCE, plaintext, .. } => {
+                        rx.receive_part(&plaintext);
+                    }
+                    Event::OutLinkData { context: CONTEXT_RESOURCE_HMU, plaintext, .. } => {
+                        rx.receive_hashmap_update(&plaintext).expect("hmu");
+                    }
+                    other => panic!("unexpected frame {:?}", core::mem::discriminant(&other)),
+                }
+            }
+            guard += 1;
+            assert!(guard < 100, "did not converge");
+        }
+        let stream = initiator.decrypt_out_link(&lid, &rx.concat()).expect("stream decrypt");
+        let (payload, proof_data) = rx.finish(&stream).expect("finish");
+        assert_eq!(payload, data);
+        let prf = initiator.make_out_link_resource_proof(&lid, &proof_data).expect("proof packet");
+        match responder.handle_frame(&prf, &mut eph) {
+            Event::Delivered { packet_hash } => assert_eq!(packet_hash, res_hash),
+            other => panic!("expected delivered, got {:?}", core::mem::discriminant(&other)),
+        }
     }
 
     /// A full link setup between two in-process transports, returning the

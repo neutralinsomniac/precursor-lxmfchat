@@ -112,6 +112,9 @@ fn main() {
     };
     let text = if is_send { args[4].clone() } else { String::new() };
     let mut sent = false;
+    // listen mode: a backchannel reply waiting for the peer's LINKIDENTIFY
+    // (LXMF identifies lazily — often after the first data packet).
+    let mut pending_bc: Option<([u8; 16], [u8; 16])> = None; // (link_id, peer dest)
 
     // On an access-point hub, announces aren't relayed to us, so path-request the
     // target to learn its key (the hub answers with the target's announce). Mirrors
@@ -159,6 +162,18 @@ fn main() {
                             ),
                             Err(e) => println!("link LXMF parse failed: {:?}", e),
                         }
+                        // In listen mode, exercise the backchannel: reply over the
+                        // SAME inbound link and await the initiator's packet proof
+                        // (it signs with its link-ephemeral Ed25519, not its
+                        // identity — Event::Delivered validates that).
+                        if mode == "listen" && plaintext.len() >= 32 {
+                            let mut peer = [0u8; 16];
+                            peer.copy_from_slice(&plaintext[16..32]);
+                            if !send_backchannel_reply(&mut writer, &mut tp, &link_id, &peer, &our_dh) {
+                                println!("backchannel reply queued: awaiting LINKIDENTIFY");
+                                pending_bc = Some((link_id, peer));
+                            }
+                        }
                     }
                     Event::LinkIdentified { link_id, identity } => {
                         println!(
@@ -166,6 +181,13 @@ fn main() {
                             reticulum_core::hex(&link_id),
                             reticulum_core::hex(&identity.hash)
                         );
+                        if let Some((lid, peer)) = pending_bc {
+                            if lid == link_id
+                                && send_backchannel_reply(&mut writer, &mut tp, &lid, &peer, &our_dh)
+                            {
+                                pending_bc = None;
+                            }
+                        }
                     }
                     Event::LinkKeepalive { link_id, reply } => {
                         writer.write_all(&frame(&reply)).ok();
@@ -232,6 +254,16 @@ fn main() {
                             sync_phase = 1;
                             println!("sync: requested message list");
                         } else {
+                            // Identify on the link so the peer's LXMRouter registers
+                            // a backchannel — large replies then arrive here as
+                            // Resources on this same link.
+                            let mut iiv = [0u8; 16];
+                            rand_core::RngCore::fill_bytes(&mut OsRng, &mut iiv);
+                            if let Some(idp) = tp.make_out_link_identify(&link_id, &iiv) {
+                                writer.write_all(&frame(&idp)).ok();
+                                writer.flush().ok();
+                                println!("identified on link (backchannel armed)");
+                            }
                             let msg = message::pack(
                                 tp.identity(), &lt, &our_dh, now() as f64, b"", text.as_bytes(), &Fields::new(), None,
                             );
@@ -311,10 +343,16 @@ fn main() {
                                 continue;
                             }
                         }
-                        sync_handle_outlink(&mut writer, &tp, &mut sync_phase, &mut sync_rx, &link_id, context, plaintext);
+                        if mode == "sync" {
+                            sync_handle_outlink(&mut writer, &tp, &mut sync_phase, &mut sync_rx, &link_id, context, plaintext);
+                        } else {
+                            // A Resource arriving on a link WE opened: the peer's
+                            // LXMRouter is replying over the backchannel.
+                            link_resource(&mut writer, &tp, &mut in_rxs, &link_id, context, plaintext, false);
+                        }
                     }
                     Event::InLinkData { link_id, context, plaintext } => {
-                        inbound_resource(&mut writer, &tp, &mut in_rxs, &link_id, context, plaintext);
+                        link_resource(&mut writer, &tp, &mut in_rxs, &link_id, context, plaintext, true);
                     }
                     Event::OutLinkClosed { link_id } => {
                         println!("outbound link {} closed by responder", reticulum_core::hex(&link_id));
@@ -448,23 +486,26 @@ fn sync_handle_outlink(
     }
 }
 
-/// Receive a Resource on an INBOUND link — a peer sending us a direct message
-/// too large for a single link packet. Accept the advertisement, request the
-/// parts, reassemble + decrypt + verify, prove receipt (the sender's delivery
+/// Receive a Resource on a link — a peer sending us a direct message too
+/// large for a single link packet. `inbound` selects which key table the
+/// link lives in: links peers opened to us vs links we opened (a backchannel
+/// reply rides the latter). Accept the advertisement, request the parts,
+/// reassemble + decrypt + verify, prove receipt (the sender's delivery
 /// confirmation), and parse the recovered LXMF message.
-fn inbound_resource(
+fn link_resource(
     writer: &mut TcpStream,
     tp: &Transport,
     rxs: &mut std::collections::HashMap<[u8; 16], ResourceReceiver>,
     link_id: &[u8; 16],
     context: u8,
     plaintext: Vec<u8>,
+    inbound: bool,
 ) {
     match context {
         CONTEXT_RESOURCE_ADV => match ResourceReceiver::accept(&plaintext) {
             Ok(mut r) => {
                 if let Some(req) = r.next_request() {
-                    send_resource_req(writer, tp, link_id, &req, true);
+                    send_resource_req(writer, tp, link_id, &req, inbound);
                 }
                 rxs.insert(*link_id, r);
                 println!("inbound resource on link {} — requesting parts…", reticulum_core::hex(link_id));
@@ -476,7 +517,7 @@ fn inbound_resource(
                 match r.receive_hashmap_update(&plaintext) {
                     Ok(()) => {
                         if let Some(req) = r.next_request() {
-                            send_resource_req(writer, tp, link_id, &req, true);
+                            send_resource_req(writer, tp, link_id, &req, inbound);
                         }
                     }
                     Err(e) => println!("inbound resource: bad hashmap update: {e}"),
@@ -498,27 +539,37 @@ fn inbound_resource(
                 None => (false, None),
             };
             if let Some(req) = next_req {
-                send_resource_req(writer, tp, link_id, &req, true);
+                send_resource_req(writer, tp, link_id, &req, inbound);
             }
             if !complete {
                 return;
             }
             let r = rxs.remove(link_id).unwrap();
             let stream = r.concat();
-            let plain = if r.encrypted() {
-                match tp.decrypt_in_link(link_id, &stream) {
-                    Some(p) => p,
-                    None => {
-                        println!("inbound resource: stream decrypt failed");
-                        return;
-                    }
+            let decrypted = if r.encrypted() {
+                if inbound {
+                    tp.decrypt_in_link(link_id, &stream)
+                } else {
+                    tp.decrypt_out_link(link_id, &stream)
                 }
             } else {
-                stream
+                Some(stream)
+            };
+            let plain = match decrypted {
+                Some(p) => p,
+                None => {
+                    println!("inbound resource: stream decrypt failed");
+                    return;
+                }
             };
             match r.finish(&plain) {
                 Ok((payload, proof)) => {
-                    if let Some(p) = tp.make_in_link_resource_proof(link_id, &proof) {
+                    let p = if inbound {
+                        tp.make_in_link_resource_proof(link_id, &proof)
+                    } else {
+                        tp.make_out_link_resource_proof(link_id, &proof)
+                    };
+                    if let Some(p) = p {
                         writer.write_all(&frame(&p)).ok();
                         writer.flush().ok();
                     }
@@ -639,6 +690,42 @@ fn sync_deliver(tp: &Transport, blob: &[u8]) {
             }
         }
         Err(e) => println!("sync: synced message decrypt failed: {e}"),
+    }
+}
+
+/// Reply over an inbound link (the LXMF backchannel). False if the link isn't
+/// identified yet — the caller retries on `LinkIdentified`.
+fn send_backchannel_reply(
+    writer: &mut TcpStream,
+    tp: &mut Transport,
+    link_id: &[u8; 16],
+    peer: &[u8; 16],
+    our_dh: &[u8; 16],
+) -> bool {
+    let reply = message::pack(
+        tp.identity(),
+        peer,
+        our_dh,
+        now() as f64,
+        b"",
+        b"backchannel reply from host-client",
+        &Fields::new(),
+        None,
+    );
+    let mut iv = [0u8; 16];
+    rand_core::RngCore::fill_bytes(&mut OsRng, &mut iv);
+    match tp.make_in_link_data(link_id, &reply.packed, &iv) {
+        Some((raw, ph)) => {
+            writer.write_all(&frame(&raw)).ok();
+            writer.flush().ok();
+            println!(
+                "sent BACKCHANNEL reply on {} — awaiting proof {}",
+                reticulum_core::hex(link_id),
+                reticulum_core::hex(&ph)
+            );
+            true
+        }
+        None => false,
     }
 }
 
