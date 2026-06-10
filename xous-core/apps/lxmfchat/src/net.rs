@@ -68,8 +68,9 @@ const DELIVERY_RETRY: u64 = 10; // re-send opportunistically if no proof yet (LX
 const MAX_ATTEMPTS: u8 = 5; // opportunistic delivery tries before escalating (LXMF: 5)
 const MAX_ROUTE_TRIES: u8 = 3; // path requests (× KEY_RETRY) before escalating to the PN
 /// Whether to sync from the propagation node automatically on first connect.
-/// Disabled for now — sync is triggered manually via the "Sync messages" menu.
-const AUTO_SYNC_ON_CONNECT: bool = false;
+/// Runs once per app run, as soon as the node's route resolves; the "Sync
+/// messages" menu remains for manual re-syncs.
+const AUTO_SYNC_ON_CONNECT: bool = true;
 
 /// An outbound message tracked until it is delivered (✓), stored at the
 /// propagation node (⇪), or given up on (✗). Driven by [`pump_outbox`].
@@ -1464,9 +1465,7 @@ fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         start_sync(shared, chat_cid, trng); // handles not-ready / already-running itself
         return;
     }
-    // Auto-sync on connect is disabled for now (sync is manual via the menu).
-    // Flip AUTO_SYNC_ON_CONNECT to re-enable: sync once per app run when the node
-    // becomes reachable.
+    // Auto-sync once per app run, as soon as the node becomes reachable.
     if AUTO_SYNC_ON_CONNECT {
         let go = {
             let s = plock(&shared.sync);
