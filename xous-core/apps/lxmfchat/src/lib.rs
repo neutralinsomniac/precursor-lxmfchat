@@ -184,6 +184,7 @@ impl<'a> LxmfChat<'a> {
             recent_msg_ids: Mutex::new(Vec::new()),
             last_ts: Mutex::new(0),
             sync: Mutex::new(net::SyncState::new()),
+            in_resources: Mutex::new(BTreeMap::new()),
             llio: llio::Llio::new(&xns),
             hub: Mutex::new(hub.clone()),
             unread: Mutex::new(unread_map),

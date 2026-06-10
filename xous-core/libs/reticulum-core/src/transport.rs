@@ -125,6 +125,12 @@ pub enum Event {
     /// direct delivery this is the full `dest||source||sig||payload`. `proof` is
     /// a packet receipt to transmit back so the sender confirms delivery.
     LinkData { link_id: [u8; TRUNCATED_HASHLENGTH], plaintext: Vec<u8>, proof: Vec<u8> },
+    /// Resource-transfer DATA received on an inbound link a peer opened to us —
+    /// how a direct message too large for a single link packet arrives
+    /// (advertisement, then parts). `RESOURCE` parts are passed through raw (the
+    /// whole reassembled stream is decrypted once); the other contexts
+    /// (`RESOURCE_ADV` / `RESOURCE_HMU`) are link-decrypted.
+    InLinkData { link_id: [u8; TRUNCATED_HASHLENGTH], context: u8, plaintext: Vec<u8> },
     /// A link we initiated is now established (the responder's LRPROOF validated).
     /// `target` is the destination we opened it to, so queued sends can be flushed.
     OutboundLinkUp { link_id: [u8; TRUNCATED_HASHLENGTH], target: [u8; TRUNCATED_HASHLENGTH] },
@@ -478,6 +484,34 @@ impl Transport {
                         let proof = link::prove_packet(&self.identity, &packet.destination_hash, &packet);
                         Event::LinkData { link_id: packet.destination_hash, plaintext, proof }
                     }
+                    Err(reason) => {
+                        Event::DataUndecryptable { destination_hash: packet.destination_hash, reason }
+                    }
+                };
+            }
+            // A Resource transfer on the link — how RNS sends a direct message
+            // too large for one packet. The advertisement (and any hashmap
+            // update) is link-encrypted; the parts are raw chunks of the
+            // whole-stream ciphertext (decrypted once, after reassembly).
+            if packet.packet_type == PACKET_DATA
+                && matches!(
+                    packet.context,
+                    CONTEXT_RESOURCE_ADV | CONTEXT_RESOURCE | CONTEXT_RESOURCE_HMU
+                )
+            {
+                if packet.context == CONTEXT_RESOURCE {
+                    return Event::InLinkData {
+                        link_id: packet.destination_hash,
+                        context: packet.context,
+                        plaintext: packet.data,
+                    };
+                }
+                return match link::decrypt(&key, &packet.data) {
+                    Ok(plaintext) => Event::InLinkData {
+                        link_id: packet.destination_hash,
+                        context: packet.context,
+                        plaintext,
+                    },
                     Err(reason) => {
                         Event::DataUndecryptable { destination_hash: packet.destination_hash, reason }
                     }
@@ -848,6 +882,45 @@ impl Transport {
         let key = self.out_links.get(link_id)?.key;
         link::make_link_context_packet(link_id, &key, context, plaintext, iv).ok()
     }
+
+    /// Build an encrypted DATA packet with an arbitrary `context` on an
+    /// established INBOUND link (one a peer opened to us) — for requesting the
+    /// parts (`RESOURCE_REQ`) of a Resource the peer is sending us as a large
+    /// direct message. `iv` is fresh random. None if the link isn't established.
+    pub fn make_in_link_context(
+        &self,
+        link_id: &[u8; TRUNCATED_HASHLENGTH],
+        context: u8,
+        plaintext: &[u8],
+        iv: &[u8; IV_LENGTH],
+    ) -> Option<Vec<u8>> {
+        let key = self.links.get(link_id)?.key;
+        link::make_link_context_packet(link_id, &key, context, plaintext, iv).ok()
+    }
+
+    /// Token-decrypt a blob with an established INBOUND link's session key — used
+    /// to decrypt a fully-reassembled Resource stream (RNS encrypts the whole
+    /// stream, not individual parts). None if the link isn't established or the
+    /// Token fails to verify.
+    pub fn decrypt_in_link(&self, link_id: &[u8; TRUNCATED_HASHLENGTH], data: &[u8]) -> Option<Vec<u8>> {
+        let key = self.links.get(link_id)?.key;
+        link::decrypt(&key, data).ok()
+    }
+
+    /// Build a Resource proof (`RESOURCE_PRF`) for an inbound link: an
+    /// **unencrypted** PROOF packet carrying `resource_hash || full_hash(payload
+    /// || hash)`. For a direct message sent as a Resource this proof IS the
+    /// sender's delivery confirmation. None if the link isn't established.
+    pub fn make_in_link_resource_proof(
+        &self,
+        link_id: &[u8; TRUNCATED_HASHLENGTH],
+        proof_data: &[u8],
+    ) -> Option<Vec<u8>> {
+        if !self.links.contains_key(link_id) {
+            return None;
+        }
+        Some(Packet::header1(DEST_LINK, PACKET_PROOF, CONTEXT_RESOURCE_PRF, *link_id, proof_data.to_vec()).encode())
+    }
 }
 
 #[cfg(test)]
@@ -971,6 +1044,109 @@ mod tests {
             other => panic!("expected out-link closed, got {:?}", core::mem::discriminant(&other)),
         }
         assert_eq!(initiator.outbound_link_for(&responder_dh, 1002), None);
+    }
+
+    #[test]
+    fn inbound_resource_delivers_a_large_direct_message() {
+        use crate::crypto::{Token, full_hash};
+        use crate::resource::ResourceReceiver;
+
+        // Establish a link between an initiator (the sender) and us (responder).
+        let initiator_id = id(0x60);
+        let responder_id = id(0x70);
+        let responder_dh = single_destination_hash("lxmf", &["delivery"], &responder_id.hash());
+        let mut initiator = Transport::new(initiator_id);
+        let mut responder = Transport::new(responder_id);
+        responder.register_destination(responder_dh);
+        let mut eph = || [0xEFu8; KEY_HALF];
+        let peer_pub = PrivateIdentity::from_bytes(&[0x70; KEY_HALF], &[0x71; KEY_HALF]).public().clone();
+        let (req, lid) = initiator.make_link_request(&responder_dh, &peer_pub, &[1; KEY_HALF], &[2; KEY_HALF], 1000);
+        let proof = match responder.handle_frame(&req, &mut eph) {
+            Event::LinkEstablished { proof, .. } => proof,
+            _ => panic!("responder should accept the link"),
+        };
+        match initiator.handle_frame(&proof, &mut eph) {
+            Event::OutboundLinkUp { .. } => {}
+            _ => panic!("expected outbound link up"),
+        }
+        let key = responder.links[&lid].key; // both sides hold the same session key
+
+        // The sender builds the resource exactly as RNS does: link-encrypt
+        // random_prefix(4)||payload, split the ciphertext into parts, and
+        // advertise hash + part map-hashes.
+        let payload: Vec<u8> = (0..2000u32).map(|i| (i * 13) as u8).collect(); // ≫ one packet
+        let r = [0x0Au8, 0x0B, 0x0C, 0x0D];
+        let mut stream_plain = vec![0xF0, 0xF1, 0xF2, 0xF3];
+        stream_plain.extend_from_slice(&payload);
+        let ciphertext = Token::new(&key).unwrap().encrypt_with_iv(&stream_plain, &[0x21; IV_LENGTH]);
+        let mut hsalt = payload.clone();
+        hsalt.extend_from_slice(&r);
+        let res_hash = full_hash(&hsalt);
+        let mut parts: Vec<Vec<u8>> = Vec::new();
+        let mut hashmap = Vec::new();
+        for chunk in ciphertext.chunks(431) {
+            parts.push(chunk.to_vec());
+            let mut salted = chunk.to_vec();
+            salted.extend_from_slice(&r);
+            hashmap.extend_from_slice(&full_hash(&salted)[..4]);
+        }
+        let mut adv = vec![0x86]; // fixmap{h,r,m,n,l,f}, the fields the receiver reads
+        for (k, v) in [(b'h', &res_hash[..]), (b'r', &r[..]), (b'm', &hashmap[..])] {
+            adv.extend_from_slice(&[0xa1, k, 0xc4, v.len() as u8]);
+            adv.extend_from_slice(v);
+        }
+        adv.extend_from_slice(&[0xa1, b'n', parts.len() as u8]);
+        adv.extend_from_slice(&[0xa1, b'l', 1]);
+        adv.extend_from_slice(&[0xa1, b'f', 0x01]); // encrypted, not compressed
+
+        // Advertisement (link-encrypted) → surfaced decrypted as InLinkData.
+        let adv_pkt =
+            link::make_link_context_packet(&lid, &key, CONTEXT_RESOURCE_ADV, &adv, &[6u8; IV_LENGTH]).unwrap();
+        let mut rx = match responder.handle_frame(&adv_pkt, &mut eph) {
+            Event::InLinkData { link_id, context, plaintext } => {
+                assert_eq!(link_id, lid);
+                assert_eq!(context, CONTEXT_RESOURCE_ADV);
+                ResourceReceiver::accept(&plaintext).expect("accept advertisement")
+            }
+            other => panic!("expected in-link data, got {:?}", core::mem::discriminant(&other)),
+        };
+
+        // Our part request goes back encrypted on the same link; the sender
+        // must be able to decrypt it and see every map-hash requested.
+        let req_pkt = responder
+            .make_in_link_context(&lid, CONTEXT_RESOURCE_REQ, &rx.request_data(), &[7u8; IV_LENGTH])
+            .expect("request packet");
+        let decoded = Packet::decode(&req_pkt).expect("decode request");
+        assert_eq!(decoded.context, CONTEXT_RESOURCE_REQ);
+        assert_eq!(decoded.destination_hash, lid);
+        let req_plain = link::decrypt(&key, &decoded.data).expect("sender decrypts request");
+        assert_eq!(req_plain.len(), 1 + 32 + parts.len() * 4);
+
+        // Parts arrive raw (whole-stream ciphertext chunks), out of order.
+        for part in parts.iter().rev() {
+            let raw = Packet::header1(DEST_LINK, PACKET_DATA, CONTEXT_RESOURCE, lid, part.clone()).encode();
+            match responder.handle_frame(&raw, &mut eph) {
+                Event::InLinkData { context, plaintext, .. } => {
+                    assert_eq!(context, CONTEXT_RESOURCE);
+                    rx.receive_part(&plaintext);
+                }
+                other => panic!("expected in-link part, got {:?}", core::mem::discriminant(&other)),
+            }
+        }
+        assert!(rx.is_complete());
+
+        // Reassemble, link-decrypt the whole stream, verify, and prove.
+        let stream = responder.decrypt_in_link(&lid, &rx.concat()).expect("stream decrypt");
+        let (got, proof_data) = rx.finish(&stream).expect("finish");
+        assert_eq!(got, payload, "recovered message must match");
+        let prf = responder.make_in_link_resource_proof(&lid, &proof_data).expect("proof packet");
+        let decoded = Packet::decode(&prf).expect("decode proof");
+        assert_eq!(decoded.context, CONTEXT_RESOURCE_PRF);
+        let mut expected = res_hash.to_vec();
+        let mut psalt = payload.clone();
+        psalt.extend_from_slice(&res_hash);
+        expected.extend_from_slice(&full_hash(&psalt));
+        assert_eq!(decoded.data, expected, "proof must be hash || full_hash(payload||hash)");
     }
 
     /// A full link setup between two in-process transports, returning the

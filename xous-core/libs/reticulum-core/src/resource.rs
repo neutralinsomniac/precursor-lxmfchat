@@ -13,14 +13,23 @@
 //!    returns a `RESOURCE_PRF` proof.
 //!
 //! Scope: **single-segment** resources (≤ `HASHMAP_MAX_LEN` ≈ 74 parts, ≈ 31 KB
-//! of transfer) — which comfortably covers a normal LXMF sync batch. The whole
-//! hashmap then fits in the advertisement, so no `RESOURCE_HMU` round-trips are
-//! needed and every part is in the sender's serve window, letting us request them
-//! all at once. Multi-segment and bz2-compressed resources are detected and
-//! rejected (LXMF message blobs are encrypted → incompressible → sent
-//! uncompressed, so `compressed` is not expected here).
+//! of transfer) — which comfortably covers a normal LXMF sync batch or direct
+//! message. The whole hashmap then fits in the advertisement, so no
+//! `RESOURCE_HMU` round-trips are needed and every part is in the sender's serve
+//! window, letting us request them all at once. Multi-segment resources are
+//! detected and rejected. bz2-compressed resources ARE handled: RNS
+//! auto-compresses when it shrinks the payload — the norm for large *text*
+//! direct messages (propagation-sync blobs are encrypted → incompressible →
+//! sent uncompressed). The resource hash and proof are computed over the
+//! **decompressed** payload (`RNS/Resource.py` `assemble`).
 
 use crate::crypto::full_hash;
+
+/// Upper bound on a decompressed payload, so a malicious bz2 bomb inside a
+/// ≤31 KB transfer can't balloon into an enormous allocation on the device.
+/// Generous vs. anything the chat UI can display (a dialogue's whole byte
+/// budget is 56 KB).
+const DECOMPRESSED_MAX: u64 = 256 * 1024;
 
 /// Bytes per map-hash (`Resource.MAPHASH_LEN`).
 const MAPHASH_LEN: usize = 4;
@@ -58,6 +67,7 @@ pub struct ResourceReceiver {
     parts: Vec<Option<Vec<u8>>>,
     received: usize,
     encrypted: bool,
+    compressed: bool,
 }
 
 impl ResourceReceiver {
@@ -67,9 +77,6 @@ impl ResourceReceiver {
         let adv = parse_advertisement(adv_plaintext)?;
         if adv.total_segments > 1 {
             return Err("multi-segment resource not supported");
-        }
-        if adv.compressed {
-            return Err("compressed resource not supported");
         }
         if adv.parts == 0 || adv.hashmap.len() < adv.parts * MAPHASH_LEN {
             return Err("resource advertisement hashmap too short");
@@ -87,6 +94,7 @@ impl ResourceReceiver {
             parts: vec![None; adv.parts],
             received: 0,
             encrypted: adv.encrypted,
+            compressed: adv.compressed,
         })
     }
 
@@ -146,14 +154,20 @@ impl ResourceReceiver {
     }
 
     /// Finish the transfer from the (already link-decrypted, if [`Self::encrypted`])
-    /// stream: strip the 4-byte random prefix, verify `full_hash(payload || r) ==
-    /// hash`, and return `(payload, proof_data)` where `proof_data = hash ||
-    /// full_hash(payload || hash)` for a `RESOURCE_PRF` proof packet.
+    /// stream: strip the 4-byte random prefix, bz2-decompress if the sender
+    /// compressed, verify `full_hash(payload || r) == hash`, and return
+    /// `(payload, proof_data)` where `proof_data = hash || full_hash(payload ||
+    /// hash)` for a `RESOURCE_PRF` proof packet. Hash and proof are over the
+    /// decompressed payload, exactly as `RNS/Resource.py` computes them.
     pub fn finish(&self, stream_plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), &'static str> {
         if stream_plaintext.len() < RANDOM_HASH_SIZE {
             return Err("resource stream shorter than random prefix");
         }
-        let payload = stream_plaintext[RANDOM_HASH_SIZE..].to_vec();
+        let payload = if self.compressed {
+            decompress_bz2(&stream_plaintext[RANDOM_HASH_SIZE..])?
+        } else {
+            stream_plaintext[RANDOM_HASH_SIZE..].to_vec()
+        };
 
         let mut salted = Vec::with_capacity(payload.len() + self.random_hash.len());
         salted.extend_from_slice(&payload);
@@ -169,6 +183,18 @@ impl ResourceReceiver {
         proof_data.extend_from_slice(&self.hash);
         proof_data.extend_from_slice(&full_hash(&proof_salted));
         Ok((payload, proof_data))
+    }
+}
+
+/// bz2-decompress a resource payload, bounded by [`DECOMPRESSED_MAX`].
+fn decompress_bz2(data: &[u8]) -> Result<Vec<u8>, &'static str> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    let mut decoder = bzip2_rs::DecoderReader::new(data).take(DECOMPRESSED_MAX + 1);
+    match decoder.read_to_end(&mut out) {
+        Ok(_) if out.len() as u64 > DECOMPRESSED_MAX => Err("decompressed resource too large"),
+        Ok(_) => Ok(out),
+        Err(_) => Err("resource bz2 decompression failed"),
     }
 }
 
@@ -400,11 +426,81 @@ mod tests {
     }
 
     #[test]
-    fn rejects_compressed_and_multisegment() {
+    fn decompresses_a_bz2_compressed_resource() {
+        // RNS compresses with Python's bz2; this vector is bz2.compress() of the
+        // payload below, generated with the reference implementation.
+        let payload: Vec<u8> = b"reticulum resource test payload ".repeat(40);
+        let comp = hexdec(
+            "425a6839314159265359096f7be00001c1918040002e26de202000902980000a551a9a36534f53c13b13a1\
+             3d89913427d1342644d09813227027026c4d84fc26c4d89813809e04c09c89c89d89d09e09a13f8bb9229c\
+             284804b7bdf000",
+        );
+
+        // The sender prefixes + link-encrypts the COMPRESSED data, but hashes the
+        // ORIGINAL payload (RNS/Resource.py: hash = full_hash(data + random_hash)
+        // where `data` is pre-compression; assemble() verifies post-decompress).
+        let key = [0x77_u8; DERIVED_KEY_LENGTH];
+        let prefix = [0x10, 0x20, 0x30, 0x40];
+        let mut stream_plain = prefix.to_vec();
+        stream_plain.extend_from_slice(&comp);
+        let ciphertext = Token::new(&key).unwrap().encrypt_with_iv(&stream_plain, &[0x22; 16]);
+
+        let r = [0x05u8, 0x06, 0x07, 0x08];
+        let mut hsalt = payload.clone();
+        hsalt.extend_from_slice(&r);
+        let hash = full_hash(&hsalt);
+
+        let mut parts: Vec<Vec<u8>> = Vec::new();
+        let mut hashmap = Vec::new();
+        for chunk in ciphertext.chunks(50) {
+            parts.push(chunk.to_vec());
+            let mut salted = chunk.to_vec();
+            salted.extend_from_slice(&r);
+            hashmap.extend_from_slice(&full_hash(&salted)[..MAPHASH_LEN]);
+        }
+        let adv = build_adv(&hash, &r, &hashmap, parts.len(), 0x03); // encrypted | compressed
+
+        let mut rx = ResourceReceiver::accept(&adv).expect("accept compressed advertisement");
+        for p in &parts {
+            rx.receive_part(p);
+        }
+        assert!(rx.is_complete());
+        let decrypted = Token::new(&key).unwrap().decrypt(&rx.concat()).expect("token");
+        let (got, proof) = rx.finish(&decrypted).expect("finish");
+        assert_eq!(got, payload, "decompressed payload must match the original");
+
+        let mut proof_salted = payload.clone();
+        proof_salted.extend_from_slice(&hash);
+        let mut expected_proof = hash.to_vec();
+        expected_proof.extend_from_slice(&full_hash(&proof_salted));
+        assert_eq!(proof, expected_proof, "proof must be over the decompressed payload");
+    }
+
+    #[test]
+    fn rejects_multisegment_and_bz2_bombs() {
         let hash = [0u8; 32];
         let r = [0u8; 4];
         let hashmap = [0u8; 4];
-        // compressed flag (bit 1) set → rejected.
-        assert!(ResourceReceiver::accept(&build_adv(&hash, &r, &hashmap, 1, 0x02)).is_err());
+        // multi-segment (l = 2) → rejected.
+        let mut adv = build_adv(&hash, &r, &hashmap, 1, 0x01);
+        let lpos = adv.len() - 4; // ...key('l') 1 key('f') flags — patch l's value
+        assert_eq!(adv[lpos], 1);
+        adv[lpos] = 2;
+        assert!(ResourceReceiver::accept(&adv).is_err());
+        // compressed (bit 1) alone is fine now.
+        assert!(ResourceReceiver::accept(&build_adv(&hash, &r, &hashmap, 1, 0x03)).is_ok());
+        // a decompression result over the cap is rejected, not allocated:
+        // bz2 of 1 MB of zeros (tiny input, huge output) must error out.
+        // bz2.compress(b"\0" * (1024*1024)) — 45 bytes in, 1 MB out (> the cap).
+        let bomb = hexdec(
+            "425a683931415926535938571ce50008084000c0040008200030cc0529a60806c4201e2ee48a70a12070\
+             ae39ca",
+        );
+        assert_eq!(decompress_bz2(&bomb), Err("decompressed resource too large"));
+    }
+
+    fn hexdec(s: &str) -> Vec<u8> {
+        let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
     }
 }

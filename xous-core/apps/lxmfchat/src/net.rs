@@ -71,6 +71,9 @@ const MAX_ROUTE_TRIES: u8 = 3; // path requests (× KEY_RETRY) before escalating
 /// Runs once per app run, as soon as the node's route resolves; the "Sync
 /// messages" menu remains for manual re-syncs.
 const AUTO_SYNC_ON_CONNECT: bool = true;
+/// Cap on concurrent inbound Resource downloads (peers sending large direct
+/// messages). One per link; each holds at most ~31 KB of parts. Oldest evicted.
+const MAX_IN_RESOURCES: usize = 4;
 
 /// An outbound message tracked until it is delivered (✓), stored at the
 /// propagation node (⇪), or given up on (✗). Driven by [`pump_outbox`].
@@ -253,6 +256,11 @@ pub struct Shared {
     pub last_ts: Mutex<u64>,
     /// Propagation-node message sync state machine (download stored messages).
     pub sync: Mutex<SyncState>,
+    /// In-progress inbound Resource downloads — direct messages too large for a
+    /// single link packet, arriving on links peers opened to us — keyed by link
+    /// id. Bounded by [`MAX_IN_RESOURCES`]; cleared on reconnect (the links die
+    /// with the hub connection).
+    pub in_resources: Mutex<BTreeMap<[u8; TRUNCATED_HASHLENGTH], ResourceReceiver>>,
     /// Low-level I/O handle, used to buzz the vibration motor on a new inbound
     /// message. `vibe` is a fire-and-forget scalar, safe to call from any thread.
     pub llio: llio::Llio,
@@ -351,6 +359,7 @@ pub fn connection_manager(shared: Arc<Shared>, chat_cid: CID) {
                         // after a reconnect. Drop them so nothing reuses a link
                         // the hub can no longer route responses back on.
                         plock(&shared.transport).connection_reset();
+                        plock(&shared.in_resources).clear();
                         let sync_active = { plock(&shared.sync).phase != SyncPhase::Idle };
                         if sync_active {
                             sync_finish(&shared, chat_cid, "connection lost — try again");
@@ -484,6 +493,12 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
             write_to_hub(shared, &proof);
             deliver_lxmf(shared, chat_cid, pddb, trng, &plaintext, true);
         }
+        // A direct message too large for one link packet arrives as an RNS
+        // Resource on the inbound link: advertisement → we request the parts →
+        // parts → we prove receipt (the sender's delivery ack) and deliver.
+        Event::InLinkData { link_id, context, plaintext } => {
+            inbound_resource(shared, chat_cid, pddb, trng, link_id, context, plaintext);
+        }
         // A link we initiated is up. Real RNS responders only activate the link —
         // and start accepting data — once they receive an RTT packet, so send it
         // before any data (or the data is silently dropped). Then send queued msgs.
@@ -588,6 +603,103 @@ fn verify_and_store_ticket(
                 store_ticket(shared, chat_cid, pddb, src_hash, &t);
             }
         }
+    }
+}
+
+/// Drive an inbound Resource transfer — a direct message too large for a single
+/// link packet (~319 bytes of content), sent over a link the peer opened to us.
+/// Accept the advertisement, request every part, reassemble + decrypt + verify,
+/// send the `RESOURCE_PRF` proof (which is the sender's delivery confirmation),
+/// and deliver the recovered LXMF blob like any other direct message. Failures
+/// are log-only — the sender re-advertises or falls back to the propagation
+/// node, and a persisted error post per attempt would flood the dialogue.
+fn inbound_resource(
+    shared: &Arc<Shared>,
+    chat_cid: CID,
+    pddb: &Pddb,
+    trng: &Trng,
+    link_id: [u8; TRUNCATED_HASHLENGTH],
+    context: u8,
+    plaintext: Vec<u8>,
+) {
+    match context {
+        CONTEXT_RESOURCE_ADV => match ResourceReceiver::accept(&plaintext) {
+            Ok(rx) => {
+                let req = rx.request_data();
+                {
+                    // One transfer per link; a fresh advertisement on the same
+                    // link replaces (restarts) it, oldest evicted past the cap.
+                    let mut map = plock(&shared.in_resources);
+                    while map.len() >= MAX_IN_RESOURCES && !map.contains_key(&link_id) {
+                        map.pop_first();
+                    }
+                    map.insert(link_id, rx);
+                }
+                let mut iv = [0u8; IV_LENGTH];
+                crate::fill_random(trng, &mut iv);
+                // Bind first: don't hold the transport guard across the hub write.
+                let raw =
+                    { plock(&shared.transport).make_in_link_context(&link_id, CONTEXT_RESOURCE_REQ, &req, &iv) };
+                if let Some(raw) = raw {
+                    write_to_hub(shared, &raw);
+                }
+                chat::cf_set_status_text(chat_cid, "incoming message — receiving…");
+            }
+            Err(e) => {
+                // Multi-segment (> ~31 KB) or malformed: don't request it; the
+                // sender times out and falls back to the propagation node.
+                log::warn!("inbound resource on link {} rejected: {e}", hex(&link_id));
+            }
+        },
+        CONTEXT_RESOURCE => {
+            let complete = {
+                let mut map = plock(&shared.in_resources);
+                match map.get_mut(&link_id) {
+                    Some(rx) => {
+                        rx.receive_part(&plaintext);
+                        rx.is_complete()
+                    }
+                    None => false,
+                }
+            };
+            if !complete {
+                return;
+            }
+            // Take the receiver out: from here the transfer either delivers or
+            // is abandoned (the sender retries with a fresh advertisement).
+            let rx = match plock(&shared.in_resources).remove(&link_id) {
+                Some(rx) => rx,
+                None => return,
+            };
+            let stream = rx.concat();
+            let plain = if rx.encrypted() {
+                // Bind first (match-scrutinee guards outlive the arms).
+                let decrypted = { plock(&shared.transport).decrypt_in_link(&link_id, &stream) };
+                match decrypted {
+                    Some(p) => p,
+                    None => {
+                        log::warn!("inbound resource on link {}: stream decrypt failed", hex(&link_id));
+                        return;
+                    }
+                }
+            } else {
+                stream
+            };
+            match rx.finish(&plain) {
+                Ok((payload, proof)) => {
+                    // Bind first: don't hold the transport guard across the write.
+                    let raw = { plock(&shared.transport).make_in_link_resource_proof(&link_id, &proof) };
+                    if let Some(raw) = raw {
+                        write_to_hub(shared, &raw);
+                    }
+                    deliver_lxmf(shared, chat_cid, pddb, trng, &payload, true);
+                }
+                Err(e) => log::warn!("inbound resource on link {} invalid: {e}", hex(&link_id)),
+            }
+        }
+        // RESOURCE_HMU only occurs for resources whose hashmap doesn't fit the
+        // advertisement (> ~74 parts) — already rejected at the advertisement.
+        _ => log::debug!("inbound link {} resource ctx=0x{context:02x} ignored", hex(&link_id)),
     }
 }
 

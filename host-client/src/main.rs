@@ -98,6 +98,8 @@ fn main() {
 
     let mut sync_phase: u8 = 0; // 0 idle, 1 list requested, 2 messages requested
     let mut sync_rx: Option<ResourceReceiver> = None;
+    // Inbound resources: large direct messages arriving on links peers open to us.
+    let mut in_rxs: std::collections::HashMap<[u8; 16], ResourceReceiver> = std::collections::HashMap::new();
 
     let target: Option<[u8; 16]> = if needs_target {
         let v = unhex(&args[3]);
@@ -255,6 +257,9 @@ fn main() {
                     Event::OutLinkData { link_id, context, plaintext } => {
                         sync_handle_outlink(&mut writer, &tp, &mut sync_phase, &mut sync_rx, &link_id, context, plaintext);
                     }
+                    Event::InLinkData { link_id, context, plaintext } => {
+                        inbound_resource(&mut writer, &tp, &mut in_rxs, &link_id, context, plaintext);
+                    }
                     Event::OutLinkClosed { link_id } => {
                         println!("outbound link {} closed by responder", reticulum_core::hex(&link_id));
                     }
@@ -367,6 +372,93 @@ fn sync_handle_outlink(
             }
         }
         _ => {}
+    }
+}
+
+/// Receive a Resource on an INBOUND link — a peer sending us a direct message
+/// too large for a single link packet. Accept the advertisement, request the
+/// parts, reassemble + decrypt + verify, prove receipt (the sender's delivery
+/// confirmation), and parse the recovered LXMF message.
+fn inbound_resource(
+    writer: &mut TcpStream,
+    tp: &Transport,
+    rxs: &mut std::collections::HashMap<[u8; 16], ResourceReceiver>,
+    link_id: &[u8; 16],
+    context: u8,
+    plaintext: Vec<u8>,
+) {
+    match context {
+        CONTEXT_RESOURCE_ADV => match ResourceReceiver::accept(&plaintext) {
+            Ok(r) => {
+                let req = r.request_data();
+                rxs.insert(*link_id, r);
+                let mut iv = [0u8; 16];
+                rand_core::RngCore::fill_bytes(&mut OsRng, &mut iv);
+                if let Some(raw) = tp.make_in_link_context(link_id, CONTEXT_RESOURCE_REQ, &req, &iv) {
+                    writer.write_all(&frame(&raw)).ok();
+                    writer.flush().ok();
+                }
+                println!("inbound resource on link {} — requesting parts…", reticulum_core::hex(link_id));
+            }
+            Err(e) => println!("inbound resource advertisement rejected: {e}"),
+        },
+        CONTEXT_RESOURCE => {
+            let complete = match rxs.get_mut(link_id) {
+                Some(r) => {
+                    r.receive_part(&plaintext);
+                    r.is_complete()
+                }
+                None => false,
+            };
+            if !complete {
+                return;
+            }
+            let r = rxs.remove(link_id).unwrap();
+            let stream = r.concat();
+            let plain = if r.encrypted() {
+                match tp.decrypt_in_link(link_id, &stream) {
+                    Some(p) => p,
+                    None => {
+                        println!("inbound resource: stream decrypt failed");
+                        return;
+                    }
+                }
+            } else {
+                stream
+            };
+            match r.finish(&plain) {
+                Ok((payload, proof)) => {
+                    if let Some(p) = tp.make_in_link_resource_proof(link_id, &proof) {
+                        writer.write_all(&frame(&p)).ok();
+                        writer.flush().ok();
+                    }
+                    // The payload is a full packed LXMF (dest||source||sig||payload).
+                    let src_id = if payload.len() >= 32 {
+                        let mut h = [0u8; 16];
+                        h.copy_from_slice(&payload[16..32]);
+                        tp.known(&h).map(|k| k.identity.clone())
+                    } else {
+                        None
+                    };
+                    match message::parse(&payload, src_id.as_ref()) {
+                        Ok(m) => {
+                            let content = m.content_string();
+                            let head: String = content.chars().take(60).collect();
+                            println!(
+                                ">>> RESOURCE LXMF ({} bytes, content {} chars) head={:?} sig_valid={}",
+                                payload.len(),
+                                content.chars().count(),
+                                head,
+                                m.signature_validated
+                            );
+                        }
+                        Err(e) => println!("resource LXMF parse failed: {:?}", e),
+                    }
+                }
+                Err(e) => println!("inbound resource finish failed: {e}"),
+            }
+        }
+        _ => println!("inbound resource ctx=0x{context:02x} ignored"),
     }
 }
 
