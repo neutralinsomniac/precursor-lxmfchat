@@ -219,6 +219,9 @@ pub struct Shared {
     /// held — which wedges sync, sends, everything.
     pub beat_frames: core::sync::atomic::AtomicU32,
     pub frame_stage: core::sync::atomic::AtomicU32,
+    /// Keepalive/watchdog thread heartbeat (+1 per 5 s tick): if this freezes,
+    /// the stuck-write watchdog is itself wedged and can't break anything.
+    pub beat_ka: core::sync::atomic::AtomicU32,
     /// The hub to (re)connect to, as `host:port`. Read by the connection manager
     /// each cycle so a "Set hub" takes effect on the next (re)connect.
     pub hub: Mutex<String>,
@@ -457,8 +460,12 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
     shared.frame_stage.store(3, Ordering::SeqCst);
     shared.beat_frames.fetch_add(1, Ordering::SeqCst);
 
+    // Event-dispatch arm markers (frame_stage 31-42; 99 = dispatch complete):
+    // a frozen 3X names the arm the read thread is stuck in.
+    let arm = |n: u32| shared.frame_stage.store(n, Ordering::SeqCst);
     match event {
         Event::Announce { destination_hash, info } => {
+            arm(31);
             // Only list LXMF *delivery* destinations — skip propagation-node and
             // other-app announces, whose app_data isn't a messageable peer name.
             if info.name_hash != crate::lxmf_delivery_name_hash() {
@@ -485,6 +492,7 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
         // Opportunistic delivery: the destination hash is stripped on the wire, so
         // prepend ours to reconstruct the full LXMF blob.
         Event::Data { destination_hash, plaintext } => {
+            arm(32);
             let mut lxmf_bytes = destination_hash.to_vec();
             lxmf_bytes.extend_from_slice(&plaintext);
             deliver_lxmf(shared, chat_cid, pddb, trng, &lxmf_bytes, true);
@@ -492,6 +500,7 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
         // We accepted an inbound link request: send the proof so the initiator
         // starts transmitting the message over the link.
         Event::LinkEstablished { link_id, proof } => {
+            arm(33);
             log::info!("accepted inbound link {}", hex(&link_id));
             write_to_hub(shared, &proof);
             // Transient status only — NOT a persisted post. A persisted
@@ -505,6 +514,7 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
         // blob. Send the packet proof back so the sender confirms delivery (and
         // stops retrying / tearing the link down).
         Event::LinkData { plaintext, proof, .. } => {
+            arm(34);
             write_to_hub(shared, &proof);
             deliver_lxmf(shared, chat_cid, pddb, trng, &plaintext, true);
         }
@@ -512,6 +522,7 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
         // and start accepting data — once they receive an RTT packet, so send it
         // before any data (or the data is silently dropped). Then send queued msgs.
         Event::OutboundLinkUp { link_id, target } => {
+            arm(35);
             log::info!("outbound link {} up to {}", hex(&link_id), hex(&target));
             let mut iv = [0u8; IV_LENGTH];
             crate::fill_random(trng, &mut iv);
@@ -524,17 +535,20 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
         }
         // A packet proof confirmed one of our sent messages reached its target.
         Event::Delivered { packet_hash } => {
+            arm(36);
             mark_delivered(shared, chat_cid, pddb, &packet_hash);
         }
         // Response / resource-transfer data on a link we opened (propagation-node
         // sync): drive the sync state machine.
         Event::OutLinkData { link_id, context, plaintext } => {
+            arm(37);
             sync_on_outlink_data(shared, chat_cid, pddb, trng, link_id, context, plaintext);
         }
         // The responder closed a link we initiated (transport already forgot it).
         // If a sync was mid-flight on it, abort now and let the user retry over a
         // fresh link instead of waiting out the 2-minute watchdog.
         Event::OutLinkClosed { link_id } => {
+            arm(38);
             log::info!("outbound link {} closed by responder", hex(&link_id));
             let sync_was_on_it = {
                 let s = shared.sync.lock().unwrap();
@@ -545,6 +559,7 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
             }
         }
         Event::DataUndecryptable { destination_hash, reason } => {
+            arm(39);
             // Log-only — NEVER a persisted post. A repeated undecryptable packet
             // (stale ratchet, retransmit, AP-hub cross-traffic) would otherwise
             // flood the dialogue and overflow the PDDB on the next read.
@@ -555,19 +570,25 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
         // post is DialogueSave'd) during an announce storm, which ballooned the
         // PDDB. Keep the persistent thread for real messages only.
         Event::AddressedUnhandled { destination_hash, packet_type, context } => {
+            arm(40);
             log::debug!(
                 "link {} addressed-but-unhandled type={} ctx=0x{:02x}",
                 hex(&destination_hash), packet_type, context
             );
         }
         Event::Unhandled { destination_hash, packet_type, context } => {
+            arm(41);
             log::debug!(
                 "unrouted packet to {} type={} ctx=0x{:02x}",
                 hex(&destination_hash), packet_type, context
             );
         }
-        Event::Dropped(why) => log::debug!("dropped frame: {}", why),
+        Event::Dropped(why) => {
+            arm(42);
+            log::debug!("dropped frame: {}", why);
+        }
     }
+    arm(99); // dispatch complete; back to the read loop
 }
 
 /// Store a freshly-received outbound ticket (keyed by the peer) if it is newer
@@ -739,6 +760,7 @@ pub fn keepalive_thread(shared: Arc<Shared>, chat_cid: CID) {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(TICK_SECS));
         ticks += 1;
+        shared.beat_ka.fetch_add(1, Ordering::SeqCst);
         let started = shared.write_started.load(Ordering::SeqCst);
         if started != 0 && (now_secs() as u32).saturating_sub(started) > WRITE_STUCK_SECS {
             log::warn!("hub write stuck >{WRITE_STUCK_SECS}s — shutting the socket down to unwedge it");
@@ -947,10 +969,12 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
             // write so it shows even if the write stalls.
             let hops = { shared.transport.lock().unwrap().path_hops(&pn) };
             let hops = hops.map(|h| h.to_string()).unwrap_or_else(|| "?".to_string());
+            stage(shared, 151); // transport (path_hops) done; about to do the status IPC
             chat::cf_set_status_text_forced(
                 chat_cid,
                 &format!("sync: contacting node (try 1, hops {hops})…"),
             );
+            stage(shared, 152); // status IPC returned; entering send_pn_link_request
             let outcome = send_pn_link_request(shared, trng, &pn, &known.identity, now);
             stage(shared, 17);
             match outcome {
@@ -985,6 +1009,9 @@ fn send_pn_link_request(
     pn_identity: &reticulum_core::identity::PublicIdentity,
     now: u64,
 ) -> LinkReqOutcome {
+    // Sub-stages 161-164 of the `g` diagnostic (only meaningful for the sync
+    // thread; the pump only calls this while the outbox is non-empty).
+    stage(shared, 161); // about to take the transport lock
     let raw = {
         let mut tp = shared.transport.lock().unwrap();
         if tp.pending_link_to(pn, now) {
@@ -997,10 +1024,14 @@ fn send_pn_link_request(
             Some(tp.make_link_request(pn, pn_identity, &ex, &ed, now).0)
         }
     };
+    stage(shared, 162); // transport done; about to write (if a request was built)
     match raw {
         None => LinkReqOutcome::Pending,
         Some(raw) => {
-            if write_to_hub(shared, &raw) {
+            stage(shared, 163); // about to write_to_hub the LINKREQUEST
+            let ok = write_to_hub(shared, &raw);
+            stage(shared, 164); // write returned
+            if ok {
                 LinkReqOutcome::Sent
             } else {
                 LinkReqOutcome::WriteFailed

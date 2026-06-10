@@ -182,6 +182,7 @@ impl<'a> LxmfChat<'a> {
             sync_stage: core::sync::atomic::AtomicU32::new(0),
             beat_frames: core::sync::atomic::AtomicU32::new(0),
             frame_stage: core::sync::atomic::AtomicU32::new(0),
+            beat_ka: core::sync::atomic::AtomicU32::new(0),
             our_dh,
             dialogue_id: DIALOGUE_WELCOME.to_string(),
             seen: Mutex::new(BTreeMap::new()),
@@ -305,7 +306,14 @@ impl<'a> LxmfChat<'a> {
         // i.e. a hardware-crypto call hung while holding the transport lock).
         let f = self.shared.beat_frames.load(Ordering::SeqCst);
         let fs = self.shared.frame_stage.load(Ordering::SeqCst);
-        self.chat.set_status_text(&format!("sync requested… [s{s} p{p} r{r} f{f}:{fs} g{g} c{c}]"));
+        // k = keepalive/watchdog heartbeat; w = seconds the current hub write
+        // has been in flight (0 = none). k advancing while w grows past ~25 means
+        // the watchdog's shutdown() cannot unblock a stuck write.
+        let k = self.shared.beat_ka.load(Ordering::SeqCst);
+        let ws = self.shared.write_started.load(Ordering::SeqCst);
+        let w = if ws == 0 { 0 } else { (now() as u32).saturating_sub(ws) };
+        self.chat
+            .set_status_text(&format!("sync requested… [s{s} p{p} r{r} f{f}:{fs} g{g} c{c} k{k} w{w}]"));
     }
 
     /// Send an opportunistic LXMF message to the current peer.
