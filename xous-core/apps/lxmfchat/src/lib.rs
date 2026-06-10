@@ -195,6 +195,7 @@ impl<'a> LxmfChat<'a> {
             sync: Mutex::new(net::SyncState::new()),
             in_resources: Mutex::new(BTreeMap::new()),
             stamp_costs: Mutex::new(BTreeMap::new()),
+            found_addrs: Mutex::new(Vec::new()),
             llio: llio::Llio::new(&xns),
             hub: Mutex::new(hub.clone()),
             unread: Mutex::new(unread_map),
@@ -551,6 +552,46 @@ impl<'a> LxmfChat<'a> {
         }
     }
 
+    /// Add a contact from an LXMF address someone sent us in a message
+    /// ("here's Bob: <32 hex>") — no announce and no manual hex entry needed.
+    /// Lists addresses spotted in inbound message text, newest first; picking
+    /// one prompts for a name, saves the contact (key-less at first — the key
+    /// arrives via the usual path request when you message them, like any
+    /// contact saved without an announce), and opens their thread.
+    pub fn import_contact_interactive(&mut self, modals: &modals::Modals) {
+        let entries: Vec<_> = {
+            plock(&self.shared.found_addrs)
+                .iter()
+                .rev()
+                .map(|(a, from, _)| (*a, format!("from {}", from)))
+                .collect()
+        };
+        let (addr, _) = match self.pick_peer(
+            modals,
+            entries,
+            "Import which address?",
+            "No addresses received — have someone send one in a message.",
+        ) {
+            Some(p) => p,
+            None => return,
+        };
+        match modals
+            .alert_builder(&format!("Name for {}…", &hex(&addr)[..8]))
+            .field(None, None)
+            .build()
+        {
+            Ok(p) => {
+                let name = p.first().as_str().trim().to_string();
+                let name = if name.is_empty() { hex(&addr) } else { name };
+                save_contact(&self.shared, &self.pddb, &addr, &name);
+                plock(&self.shared.found_addrs).retain(|(a, _, _)| *a != addr);
+                self.activate_peer(&addr);
+                self.chat.set_status_text(&format!("added {}", name));
+            }
+            Err(_) => {}
+        }
+    }
+
     /// Pick a saved contact and give it a new display name (shown in the
     /// contact list, bubble headers, and the status bar). Address, key
     /// material, ticket, and message history are untouched. A manually-set
@@ -716,7 +757,7 @@ impl<'a> LxmfChat<'a> {
     }
 }
 
-fn parse_addr(s: &str) -> Option<[u8; TRUNCATED_HASHLENGTH]> {
+pub(crate) fn parse_addr(s: &str) -> Option<[u8; TRUNCATED_HASHLENGTH]> {
     let s = s.trim();
     if s.len() != TRUNCATED_HASHLENGTH * 2 {
         return None;

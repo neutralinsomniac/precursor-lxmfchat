@@ -25,6 +25,8 @@ pub enum MenuOp {
     Contacts,
     /// Give a saved contact a new display name.
     RenameContact,
+    /// Add a contact from an address received in a message.
+    ImportContact,
     /// (Re)connect to the configured hub and announce our address
     Connect,
     /// Announce our lxmf.delivery destination on the connected hub

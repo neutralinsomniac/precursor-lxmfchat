@@ -72,8 +72,10 @@ const MAX_ROUTE_TRIES: u8 = 3; // path requests (× KEY_RETRY) before escalating
 /// messages" menu remains for manual re-syncs.
 const AUTO_SYNC_ON_CONNECT: bool = true;
 /// Cap on concurrent inbound Resource downloads (peers sending large direct
-/// messages). One per link; each holds at most ~31 KB of parts. Oldest evicted.
+/// messages). One per link; oldest evicted.
 const MAX_IN_RESOURCES: usize = 4;
+/// Cap on remembered shared addresses awaiting "Import contact" (oldest dropped).
+const MAX_FOUND_ADDRS: usize = 16;
 
 /// An outbound message tracked until it is delivered (✓), stored at the
 /// propagation node (⇪), or given up on (✗). Driven by [`pump_outbox`].
@@ -238,6 +240,13 @@ pub struct Shared {
     /// (author, timestamp, text) until the user opens that thread, then flushed
     /// into it. In-memory only (not yet persisted across an app restart).
     pub pending: Mutex<BTreeMap<[u8; TRUNCATED_HASHLENGTH], Vec<(String, u64, String)>>>,
+    /// LXMF addresses spotted in inbound message text (32-hex tokens), newest
+    /// last — so a contact can be shared by simply messaging us their address
+    /// ("here's Bob: <hex>") and imported from the menu, with no announce and
+    /// no manual hex entry. Each entry: (address, label of who sent it, when).
+    /// Bounded; in-memory only (the carrying message persists in its thread,
+    /// so a missed import can be re-found by re-sending).
+    pub found_addrs: Mutex<Vec<([u8; TRUNCATED_HASHLENGTH], String, u64)>>,
     /// Delivery stamp costs peers have announced (msgpack element 1 of an
     /// lxmf.delivery announce). A message to one of these peers must carry a
     /// stamp: a ticket-derived one if they trusted us, else mined
@@ -826,6 +835,32 @@ fn send_out_link_request(shared: &Arc<Shared>, trng: &Trng, link_id: &[u8; TRUNC
     }
 }
 
+/// Candidate LXMF destination addresses in message text: maximal runs of hex
+/// digits that are EXACTLY 32 chars. Longer runs are skipped — a 64-hex
+/// identity key is not an address, and grabbing half of one would import
+/// garbage.
+fn extract_addresses(text: &str) -> Vec<[u8; TRUNCATED_HASHLENGTH]> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_hexdigit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+                i += 1;
+            }
+            if i - start == 2 * TRUNCATED_HASHLENGTH {
+                if let Some(a) = crate::parse_addr(&text[start..i]) {
+                    out.push(a);
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Parse a full LXMF blob (`dest||source||sig||payload`), verify, de-duplicate,
 /// route into the sender's thread, and post it.
 /// `notify`: buzz the vibration motor for this message (live receipt). The sync
@@ -885,6 +920,33 @@ fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, l
     }
 
     crate::save_contact(shared, pddb, &src_hash, &author);
+
+    // A shared contact: any 32-hex token in the text is a candidate LXMF
+    // address — remember it so "Import contact" can add it without an
+    // announce or manual hex entry.
+    {
+        let ours = shared.our_dh;
+        let mut fresh = Vec::new();
+        for a in extract_addresses(&text) {
+            if a == ours || a == src_hash || plock(&shared.contacts).contains_key(&a) {
+                continue;
+            }
+            fresh.push(a);
+        }
+        if !fresh.is_empty() {
+            let mut found = plock(&shared.found_addrs);
+            for a in fresh {
+                if !found.iter().any(|(fa, _, _)| *fa == a) {
+                    found.push((a, author.clone(), now_secs()));
+                }
+            }
+            while found.len() > MAX_FOUND_ADDRS {
+                found.remove(0);
+            }
+            drop(found);
+            chat::cf_set_status_text(chat_cid, "address received — menu \u{2192} Import contact");
+        }
+    }
 
     // If this peer trusts us with a ticket (so we can satisfy their stamp cost
     // when replying), remember it. Only honour tickets from a verified sender — an
