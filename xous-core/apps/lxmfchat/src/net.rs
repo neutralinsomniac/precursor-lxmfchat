@@ -92,6 +92,12 @@ pub struct OutboundMsg {
     /// [`compute_pending_delivery_stamp`]) and appends it to `packed`; nothing
     /// is sent until then. None = ready (no cost, ticket-stamped, or mined).
     pub needs_stamp: Option<u32>,
+    /// `packed` already carries a (ticket) stamp. Distinct from `needs_stamp`
+    /// being None — the recipient's stamp cost may be UNKNOWN at enqueue time
+    /// (key not learned yet); when their announce later reveals a cost, an
+    /// unstamped, not-yet-sent message gets `needs_stamp` set, but a
+    /// ticket-stamped one must not be double-stamped.
+    pub stamped: bool,
     /// Currently attempting propagation-node delivery (vs direct).
     pub via_pn: bool,
     /// A propagation attempt has already been made (don't loop forever).
@@ -551,6 +557,33 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
             let cached = plock(&shared.ticket_pending).remove(&destination_hash);
             if let Some(bytes) = cached {
                 verify_and_store_ticket(shared, chat_cid, pddb, &destination_hash, &info.identity, &bytes);
+            }
+            // A queued message may have been waiting for exactly this key. Two
+            // things: (a) the announce just revealed the peer's stamp cost — a
+            // not-yet-sent unstamped message must mine a stamp first or the
+            // recipient drops it; (b) send now instead of waiting out the pump
+            // tick, and say so (the wait was otherwise silent-ish).
+            let cost = plock(&shared.stamp_costs).get(&destination_hash).copied();
+            let waiting = {
+                let mut outbox = plock(&shared.outbox);
+                let mut waiting = false;
+                for m in outbox.iter_mut().filter(|m| m.peer == destination_hash) {
+                    if m.attempts == 0 && m.in_flight.is_none() {
+                        waiting = true;
+                        if let Some(c) = cost {
+                            if !m.stamped && m.needs_stamp.is_none() {
+                                m.needs_stamp = Some(c);
+                            }
+                        }
+                        m.next_action = 0; // act immediately
+                    }
+                }
+                waiting
+            };
+            if waiting {
+                let label = peer_label(shared, &destination_hash);
+                chat::cf_set_status_text(chat_cid, &format!("{label}: key received — sending…"));
+                pump_outbox(shared, chat_cid, pddb, trng);
             }
         }
         // Opportunistic delivery: the destination hash is stripped on the wire, so
@@ -1661,6 +1694,7 @@ pub fn enqueue_outbound(
     text: String,
     packed: Vec<u8>,
     needs_stamp: Option<u32>,
+    stamped: bool,
 ) {
     plock(&shared.outbox).push(OutboundMsg {
         peer,
@@ -1668,6 +1702,7 @@ pub fn enqueue_outbound(
         text,
         packed,
         needs_stamp,
+        stamped,
         via_pn: false,
         tried_pn: false,
         in_flight: None,
@@ -2115,6 +2150,12 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                 let known = match known {
                     Some(k) => k,
                     None => {
+                        // No key yet (e.g. the contact was imported from an
+                        // address, never announced to us): keep asking. The
+                        // Announce handler fires the send the moment the key
+                        // lands; the deadline turns this into "no route found".
+                        let label = peer_label(shared, &outbox[i].peer);
+                        chat::cf_set_status_text(chat_cid, &format!("{label}: requesting key…"));
                         request_peer_key(shared, trng, &outbox[i].peer);
                         outbox[i].next_action = now + KEY_RETRY;
                         i += 1;

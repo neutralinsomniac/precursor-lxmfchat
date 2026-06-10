@@ -332,14 +332,11 @@ impl<'a> LxmfChat<'a> {
                 return;
             }
         };
-        // Direct delivery needs the peer's key. If we don't have it (e.g. we never
-        // saw its announce on an access_point interface), ask for it and bail —
-        // the reply arrives as an announce; the user retries in a moment.
-        if plock(&self.shared.transport).known(&peer).is_none() {
-            net::request_peer_key(&self.shared, &self.trng, &peer);
-            self.chat.set_status_text("requesting peer's key… try again in a moment");
-            return;
-        }
+        // NOTE: the peer's key is NOT required here. A message to a peer whose
+        // key we don't have yet still enqueues (and echoes a ○ bubble); the
+        // delivery engine requests the key, sends the moment the announce
+        // arrives, and fails visibly ("no route found") if it never does. An
+        // earlier version bailed out here — silently eating the typed message.
 
         // Echo our own message FIRST, before the heavier sign + PDDB work below, so
         // the bubble appears the instant Enter is pressed (responsiveness). It gets
@@ -427,6 +424,7 @@ impl<'a> LxmfChat<'a> {
             text.to_string(),
             packed,
             needs_stamp,
+            ticket.is_some(),
         );
     }
 
