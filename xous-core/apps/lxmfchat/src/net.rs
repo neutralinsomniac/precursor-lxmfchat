@@ -180,7 +180,26 @@ impl SyncState {
 pub struct Shared {
     pub transport: Mutex<Transport>,
     /// The write half of the hub connection (None until connected).
+    ///
+    /// LOCK DISCIPLINE: only [`write_to_hub`] (with a BOUNDED try_lock wait) and
+    /// the connection manager may take this. A hub write on real hardware can
+    /// block indefinitely (the 10 s socket write timeout has been observed not
+    /// to save us), and a thread blocking on this mutex forever wedged the sync
+    /// thread, the pump, and even the manager's reconnect — all at once.
     pub writer: Mutex<Option<TcpStream>>,
+    /// Whether a hub connection is currently up — readable without touching
+    /// `writer` (so an is-connected check can never block behind a stuck write).
+    /// Maintained by the connection manager and the write-error path.
+    pub connected: core::sync::atomic::AtomicBool,
+    /// A control clone of the live socket, used to `shutdown()` it from OUTSIDE
+    /// a stuck write (the stuck thread holds `writer`, so the watchdog needs an
+    /// independent handle to unblock it). Never held across I/O.
+    pub ctl: Mutex<Option<TcpStream>>,
+    /// Unix seconds (truncated to u32) when the in-flight hub write started; 0
+    /// when no write is in flight. The keepalive thread's watchdog kills the
+    /// socket if this stays nonzero too long, which errors the blocked write out
+    /// and lets the connection manager reconnect.
+    pub write_started: core::sync::atomic::AtomicU32,
     /// The hub to (re)connect to, as `host:port`. Read by the connection manager
     /// each cycle so a "Set hub" takes effect on the next (re)connect.
     pub hub: Mutex<String>,
@@ -294,9 +313,12 @@ pub fn connection_manager(shared: Arc<Shared>, chat_cid: CID) {
                 // transfer) can't block a writer forever and wedge the threads
                 // that share it (no-op if the Xous TcpStream ignores it).
                 stream.set_write_timeout(Some(std::time::Duration::from_secs(10))).ok();
-                match stream.try_clone() {
-                    Ok(reader) => {
+                let clones = stream.try_clone().and_then(|r| stream.try_clone().map(|c| (r, c)));
+                match clones {
+                    Ok((reader, ctl)) => {
                         *shared.writer.lock().unwrap() = Some(stream);
+                        *shared.ctl.lock().unwrap() = Some(ctl);
+                        shared.connected.store(true, core::sync::atomic::Ordering::SeqCst);
                         backoff = 2;
                         chat::cf_set_status_text(chat_cid, &format!("connected to {hub}"));
                         send_announce(&shared, &trng);
@@ -305,7 +327,24 @@ pub fn connection_manager(shared: Arc<Shared>, chat_cid: CID) {
                         // it mid-escalation (which burns the retry deadline).
                         request_propagation_path(&shared, &trng);
                         read_until_closed(&shared, chat_cid, &pddb, &trng, reader);
-                        *shared.writer.lock().unwrap() = None;
+                        shared.connected.store(false, core::sync::atomic::Ordering::SeqCst);
+                        shared.ctl.lock().unwrap().take();
+                        // Clear the writer with a BOUNDED wait: a write stuck on
+                        // the dying socket may hold the mutex until the watchdog
+                        // breaks it — never let the manager (the only thing that
+                        // can reconnect us) block behind that.
+                        for _ in 0..40 {
+                            match shared.writer.try_lock() {
+                                Ok(mut g) => {
+                                    g.take();
+                                    break;
+                                }
+                                Err(std::sync::TryLockError::WouldBlock) => {
+                                    std::thread::sleep(std::time::Duration::from_millis(50))
+                                }
+                                Err(std::sync::TryLockError::Poisoned(_)) => break,
+                            }
+                        }
                         // The hub routes link traffic and proofs by interface
                         // session: every link / pending request / receipt is dead
                         // after a reconnect. Drop them so nothing reuses a link
@@ -318,7 +357,7 @@ pub fn connection_manager(shared: Arc<Shared>, chat_cid: CID) {
                         chat::cf_set_status_text(chat_cid, "hub connection lost — reconnecting…");
                     }
                     Err(e) => {
-                        *shared.writer.lock().unwrap() = None;
+                        shared.connected.store(false, core::sync::atomic::Ordering::SeqCst);
                         chat::cf_set_status_text(chat_cid, &format!("socket clone failed: {e}"));
                     }
                 }
@@ -653,16 +692,36 @@ fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, l
 /// HDLC frame: RNS discards any frame smaller than a packet header, so it's a
 /// protocol-safe no-op, but the outbound bytes refresh the idle timers. One
 /// thread runs per connection and exits when the write fails (connection gone).
-pub fn keepalive_thread(shared: Arc<Shared>) {
-    const KEEPALIVE_SECS: u64 = 30;
-    // Runs for the app's lifetime (one instance). Sends a periodic empty frame
-    // whenever a connection exists. A failed write tears the connection down (see
-    // `write_to_hub`) so a silently-dead socket gets detected within KEEPALIVE_SECS
-    // and the manager reconnects — even if nothing else is trying to write.
+pub fn keepalive_thread(shared: Arc<Shared>, chat_cid: CID) {
+    use core::sync::atomic::Ordering;
+    const TICK_SECS: u64 = 5;
+    const KEEPALIVE_TICKS: u64 = 6; // empty frame every 30 s
+    // Runs for the app's lifetime (one instance). Two jobs:
+    // 1. STUCK-WRITE WATCHDOG (every tick): a hub write that's been in flight
+    //    past WRITE_STUCK_SECS has hung the writer mutex (the socket write
+    //    timeout demonstrably doesn't always fire on hardware) — shut the socket
+    //    down via the control clone, which errors the blocked write out, releases
+    //    the mutex, ends the read loop, and lets the manager reconnect. Without
+    //    this, ONE stuck write silently wedged sync + sends + reconnect forever.
+    // 2. KEEPALIVE (every 6th tick): send an empty HDLC frame (a protocol-safe
+    //    no-op RNS discards) so NAT/hub idle timers don't drop a quiet link, and
+    //    so a silently-dead socket is detected within ~30 s.
+    let mut ticks: u64 = 0;
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(KEEPALIVE_SECS));
-        let connected = shared.writer.lock().unwrap().is_some();
-        if connected {
+        std::thread::sleep(std::time::Duration::from_secs(TICK_SECS));
+        ticks += 1;
+        let started = shared.write_started.load(Ordering::SeqCst);
+        if started != 0 && (now_secs() as u32).saturating_sub(started) > WRITE_STUCK_SECS {
+            log::warn!("hub write stuck >{WRITE_STUCK_SECS}s — shutting the socket down to unwedge it");
+            chat::cf_set_status_text(chat_cid, "hub write stalled — resetting connection…");
+            shared.write_started.store(0, Ordering::SeqCst);
+            shared.connected.store(false, Ordering::SeqCst);
+            if let Some(c) = shared.ctl.lock().unwrap().take() {
+                c.shutdown(std::net::Shutdown::Both).ok();
+            }
+            continue;
+        }
+        if ticks % KEEPALIVE_TICKS == 0 && shared.connected.load(Ordering::SeqCst) {
             write_to_hub(&shared, &[]);
         }
     }
@@ -679,22 +738,56 @@ pub fn request_peer_key(shared: &Arc<Shared>, trng: &Trng, target: &[u8; TRUNCAT
     log::info!("sent path request for {}", hex(target));
 }
 
+/// A hub write counts as stuck after this long; the keepalive thread's watchdog
+/// then shuts the socket down out from under it, erroring the write out.
+const WRITE_STUCK_SECS: u32 = 20;
+
 /// Frame and write `raw` to the hub. Returns true only if the bytes were fully
-/// written; false if there is no connection or the write failed (callers that
-/// need delivery — like the sync state machine — surface that instead of
-/// silently doing nothing).
-fn write_to_hub(shared: &Arc<Shared>, raw: &[u8]) -> bool {
+/// written; false if there is no connection, the writer was busy too long, or
+/// the write failed (callers that need delivery — like the sync state machine —
+/// surface that instead of silently doing nothing).
+///
+/// Never blocks unboundedly: the writer mutex is acquired with a ~2 s bounded
+/// wait (a healthy write completes in milliseconds; a longer hold means a wedged
+/// write that the watchdog will kill), and the write itself is marked in
+/// `write_started` so the watchdog can detect and break a hang.
+pub(crate) fn write_to_hub(shared: &Arc<Shared>, raw: &[u8]) -> bool {
+    use core::sync::atomic::Ordering;
     let framed = frame(raw);
-    let mut guard = shared.writer.lock().unwrap();
+    let mut guard = None;
+    for _ in 0..40 {
+        match shared.writer.try_lock() {
+            Ok(g) => {
+                guard = Some(g);
+                break;
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => return false,
+        }
+    }
+    let mut guard = match guard {
+        Some(g) => g,
+        None => {
+            log::warn!("hub writer busy >2s, dropping a {}-byte frame", framed.len());
+            return false;
+        }
+    };
     match guard.as_mut() {
         Some(w) => {
-            if w.write_all(&framed).and_then(|_| w.flush()).is_err() {
+            shared.write_started.store(now_secs() as u32, Ordering::SeqCst);
+            let res = w.write_all(&framed).and_then(|_| w.flush());
+            shared.write_started.store(0, Ordering::SeqCst);
+            if res.is_err() {
                 // A failed/timed-out write means the connection is dead OR the HDLC
                 // stream is now half-written and desynced. Don't keep limping along
                 // (that silently drops every later message): shut the socket so the
                 // read loop returns and the connection manager reconnects cleanly.
                 w.shutdown(std::net::Shutdown::Both).ok();
                 *guard = None;
+                shared.connected.store(false, Ordering::SeqCst);
+                shared.ctl.lock().unwrap().take();
                 false
             } else {
                 true
@@ -744,8 +837,9 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
     let now = now_secs();
     // No hub connection: nothing we send can go anywhere. Wait for the manager
     // to reconnect (same bounded retry as the no-route case below) instead of
-    // burning the request on writes that go nowhere.
-    if shared.writer.lock().unwrap().is_none() {
+    // burning the request on writes that go nowhere. Atomic flag, NOT the writer
+    // mutex — this check must never block behind a stuck write.
+    if !shared.connected.load(core::sync::atomic::Ordering::SeqCst) {
         let give_up = {
             let mut s = shared.sync.lock().unwrap();
             s.route_tries = s.route_tries.saturating_add(1);
@@ -1220,7 +1314,11 @@ pub fn sync_thread(shared: Arc<Shared>, chat_cid: CID) {
     let trng = match XousNames::new().ok().and_then(|xns| Trng::new(&xns).ok()) {
         Some(t) => t,
         None => {
+            // Without this thread nothing ever consumes a sync request — make
+            // that loudly visible instead of "sync requested…" forever.
             log::error!("sync thread: TRNG init failed");
+            chat::cf_set_status_idle_text(chat_cid, "sync unavailable (init failed — restart app)");
+            chat::cf_set_status_text_forced(chat_cid, "sync unavailable (init failed — restart app)");
             return;
         }
     };
@@ -1236,7 +1334,18 @@ pub fn sync_thread(shared: Arc<Shared>, chat_cid: CID) {
 fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
     let pn = match crate::propagation_node() {
         Some(p) => p,
-        None => return,
+        None => {
+            // Still consume a manual request so the user gets an answer instead
+            // of "sync requested…" sitting there forever.
+            let requested = {
+                let mut s = shared.sync.lock().unwrap();
+                core::mem::replace(&mut s.requested, false)
+            };
+            if requested {
+                chat::cf_set_status_text_forced(chat_cid, "no propagation node configured");
+            }
+            return;
+        }
     };
     let now = now_secs();
     // Time out a stuck sync.

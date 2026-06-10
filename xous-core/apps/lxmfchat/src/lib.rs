@@ -173,6 +173,9 @@ impl<'a> LxmfChat<'a> {
         let shared = Arc::new(Shared {
             transport: Mutex::new(transport),
             writer: Mutex::new(None),
+            connected: core::sync::atomic::AtomicBool::new(false),
+            ctl: Mutex::new(None),
+            write_started: core::sync::atomic::AtomicU32::new(0),
             our_dh,
             dialogue_id: DIALOGUE_WELCOME.to_string(),
             seen: Mutex::new(BTreeMap::new()),
@@ -232,9 +235,11 @@ impl<'a> LxmfChat<'a> {
             let shared = self.shared.clone();
             let cid = self.chat_cid;
             std::thread::spawn(move || net::connection_manager(shared, cid));
-            // One keepalive thread for the app's lifetime (survives reconnects).
+            // One keepalive + stuck-write-watchdog thread for the app's lifetime
+            // (survives reconnects).
             let ka = self.shared.clone();
-            std::thread::spawn(move || net::keepalive_thread(ka));
+            let ka_cid = self.chat_cid;
+            std::thread::spawn(move || net::keepalive_thread(ka, ka_cid));
             // One outbox pump thread: drives delivery timeouts + propagation
             // fallback so sent messages reach a terminal mark (✓/⇪/✗).
             let pump = self.shared.clone();
@@ -250,9 +255,11 @@ impl<'a> LxmfChat<'a> {
         }
         // Manager already running: drop any live socket so it reconnects to the
         // (possibly newly-set) hub. If already disconnected it's mid-backoff and
-        // will pick up the new hub on its next attempt.
-        if let Some(stream) = self.shared.writer.lock().unwrap().as_ref() {
-            stream.shutdown(std::net::Shutdown::Both).ok();
+        // will pick up the new hub on its next attempt. Shutdown goes through the
+        // control clone — the writer mutex may be held by an in-flight (possibly
+        // stuck) write, and the main thread must never block on it.
+        if let Some(ctl) = self.shared.ctl.lock().unwrap().take() {
+            ctl.shutdown(std::net::Shutdown::Both).ok();
         }
         self.chat.set_status_text(&format!("reconnecting to {}…", self.hub));
     }
@@ -603,21 +610,19 @@ impl<'a> LxmfChat<'a> {
         }
     }
 
+    /// Send a raw packet to the hub from the MAIN (UI) thread. Routed through
+    /// `net::write_to_hub`, whose bounded mutex wait + stuck-write watchdog mean
+    /// this can delay the UI a couple of seconds at worst, never freeze it.
     fn write_framed(&self, raw: &[u8]) -> bool {
-        let framed = reticulum_core::hdlc::frame(raw);
-        let mut guard = self.shared.writer.lock().unwrap();
-        match guard.as_mut() {
-            Some(w) => match w.write_all(&framed).and_then(|_| w.flush()) {
-                Ok(_) => true,
-                Err(e) => {
-                    self.chat.set_status_text(&format!("send failed: {e}"));
-                    false
-                }
-            },
-            None => {
-                self.chat.set_status_text("not connected (menu → Connect)");
-                false
-            }
+        if !self.shared.connected.load(core::sync::atomic::Ordering::SeqCst) {
+            self.chat.set_status_text("not connected (menu → Connect)");
+            return false;
+        }
+        if net::write_to_hub(&self.shared, raw) {
+            true
+        } else {
+            self.chat.set_status_text("send failed (connection resetting…)");
+            false
         }
     }
 }
