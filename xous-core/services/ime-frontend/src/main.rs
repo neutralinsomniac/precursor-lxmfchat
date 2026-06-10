@@ -674,6 +674,55 @@ impl InputTracker {
                 } else {
                     self.last_height = input_tv.cursor.line_height as u32;
                 }
+
+                // Even after any growth, a long line may still not fit (growth
+                // stops at the layout's minimum content height, may be denied,
+                // or may not have triggered). When the insertion point is at
+                // the END — the normal typing case — show a TRAILING window of
+                // the line ("…tail") so the caret never disappears below the
+                // clip and you never type blind. Caret-in-the-middle edits of
+                // an overflowed line keep the old behavior (rare on this
+                // keyboard, and a windowed view would hide the caret region).
+                if input_tv.overflow == Some(true)
+                    && self.characters > 0
+                    && self.insertion == self.characters
+                {
+                    let chars: Vec<char> = self.line.chars().collect();
+                    let mut start = 0usize;
+                    for _ in 0..16 {
+                        // drop a chunk of the head and dry-run the typesetter
+                        // until the tail fits; ≥1/4 of the remainder per step
+                        // converges fast even for very long lines
+                        start += ((chars.len() - start) / 4).max(8).min(chars.len() - start);
+                        if start >= chars.len() {
+                            break;
+                        }
+                        let mut probe = TextView::new(
+                            ic,
+                            TextBounds::BoundingBox(Rectangle::new(Point::new(0, 1), ic_bounds)),
+                        );
+                        probe.draw_border = false;
+                        probe.style = gam::SYSTEM_STYLE;
+                        let tail: String = chars[start..].iter().collect();
+                        write!(probe.text, "…{}", tail).ok();
+                        self.gam
+                            .bounds_compute_textview(&mut probe)
+                            .expect("couldn't compute tail bounds");
+                        if probe.overflow != Some(true) {
+                            break;
+                        }
+                    }
+                    if start < chars.len() {
+                        let tail: String = chars[start..].iter().collect();
+                        input_tv.text.clear();
+                        write!(input_tv.text, "…{}", tail)
+                            .expect("couldn't update TextView string in input canvas");
+                        // caret sits at the end of the visible window
+                        input_tv.insertion = Some((chars.len() - start + 1) as _);
+                        input_tv.bounds_computed = None;
+                        self.gam.post_textview(&mut input_tv).expect("can't draw input TextView");
+                    }
+                }
             }
         }
 
