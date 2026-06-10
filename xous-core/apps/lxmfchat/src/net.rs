@@ -927,13 +927,27 @@ fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, l
     {
         let ours = shared.our_dh;
         let mut fresh = Vec::new();
+        // When every address gets filtered, say WHY — otherwise the import
+        // appears to silently swallow it ("no addresses received" while the
+        // hex sits right there in the thread).
+        let mut filtered: Option<String> = None;
         for a in extract_addresses(&text) {
-            if a == ours || a == src_hash || plock(&shared.contacts).contains_key(&a) {
-                continue;
+            log::info!("address in message text: {}", hex(&a));
+            if a == ours {
+                filtered = Some("that address is this device's own".to_string());
+            } else if a == src_hash {
+                filtered = Some(format!("that's {author}'s address (already a contact)"));
+            } else if let Some(n) = plock(&shared.contacts).get(&a).cloned() {
+                filtered = Some(format!("address already saved as {n}"));
+            } else {
+                fresh.push(a);
             }
-            fresh.push(a);
         }
-        if !fresh.is_empty() {
+        if fresh.is_empty() {
+            if let Some(why) = filtered {
+                chat::cf_set_status_text(chat_cid, &why);
+            }
+        } else {
             let mut found = plock(&shared.found_addrs);
             for a in fresh {
                 if !found.iter().any(|(fa, _, _)| *fa == a) {
