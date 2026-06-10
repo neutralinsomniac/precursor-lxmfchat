@@ -39,17 +39,20 @@ Protocol:
 
 - Identity (X25519 + Ed25519), destination hashing, packet codec, HDLC framing,
   Token (AES-256-CBC + HMAC-SHA256), HKDF, announces (HEADER_1 + HEADER_2).
-- **Opportunistic delivery with delivery proofs** — every sent message is
-  tracked and confirmed (LXMF proves all delivered packets), with retries.
-- **Direct delivery over links**, both directions: we accept inbound links
-  (idempotently, so high-RTT retransmits can't desync the session key) and
-  initiate outbound ones (LINKREQUEST → LRPROOF validation → RTT activation).
-- **Inbound Resource transfers** — direct messages too large for one link
-  packet (> ~319 B of content) arrive as an RNS Resource: advertisement → part
-  requests → reassembly → whole-stream decrypt → bz2 decompression (RNS
-  auto-compresses text; pure-Rust decoder, output capped against bz2 bombs) →
-  proof (the sender's delivery ack), with windowed part requests and
-  hashmap-update paging for transfers up to a 256 KB device-memory budget.
+- **Direct delivery over links, both directions, as primary** (the reference
+  default): we accept inbound links (idempotently, so high-RTT retransmits
+  can't desync the session key) and initiate outbound ones (LINKREQUEST →
+  LRPROOF validation → RTT activation), with per-session forward secrecy and
+  every delivered packet proved (the sender's ✓). Inbound opportunistic
+  packets are decrypted and proved too. Link lifecycle matches the reference
+  (inactivity-based reuse under LXMF's 600 s teardown).
+- **Resource transfers, both directions** — messages too large for one link
+  packet move as an RNS Resource: advertisement → windowed part requests with
+  hashmap-update paging → reassembly → whole-stream decrypt → bz2
+  decompression inbound (pure-Rust decoder, output capped against bz2 bombs)
+  → proof (the delivery ack), up to a 256 KB device-memory budget per
+  transfer. The same machinery serves outbound: large direct messages and
+  large propagation-node transfers.
 - **Propagation node support**, both directions: outbound store-and-forward
   fallback when direct delivery fails (message re-encrypted to the recipient +
   a mined **proof-of-work propagation stamp**, midstate-cached SHA-256 so the
