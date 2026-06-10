@@ -180,6 +180,8 @@ impl<'a> LxmfChat<'a> {
             beat_pump: core::sync::atomic::AtomicU32::new(0),
             beat_read: core::sync::atomic::AtomicU32::new(0),
             sync_stage: core::sync::atomic::AtomicU32::new(0),
+            beat_frames: core::sync::atomic::AtomicU32::new(0),
+            frame_stage: core::sync::atomic::AtomicU32::new(0),
             our_dh,
             dialogue_id: DIALOGUE_WELCOME.to_string(),
             seen: Mutex::new(BTreeMap::new()),
@@ -298,7 +300,12 @@ impl<'a> LxmfChat<'a> {
         let r = self.shared.beat_read.load(Ordering::SeqCst);
         let g = self.shared.sync_stage.load(Ordering::SeqCst);
         let c = self.shared.connected.load(Ordering::SeqCst) as u32;
-        self.chat.set_status_text(&format!("sync requested… [s{s} p{p} r{r} g{g} c{c}]"));
+        // f = frames fully processed : where the in-flight frame is (net.rs
+        // frame_stage; a frozen ":2" = stuck inside Transport::handle_frame —
+        // i.e. a hardware-crypto call hung while holding the transport lock).
+        let f = self.shared.beat_frames.load(Ordering::SeqCst);
+        let fs = self.shared.frame_stage.load(Ordering::SeqCst);
+        self.chat.set_status_text(&format!("sync requested… [s{s} p{p} r{r} f{f}:{fs} g{g} c{c}]"));
     }
 
     /// Send an opportunistic LXMF message to the current peer.

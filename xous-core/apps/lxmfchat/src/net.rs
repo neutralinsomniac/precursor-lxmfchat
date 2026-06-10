@@ -210,6 +210,15 @@ pub struct Shared {
     pub beat_pump: core::sync::atomic::AtomicU32,
     pub beat_read: core::sync::atomic::AtomicU32,
     pub sync_stage: core::sync::atomic::AtomicU32,
+    /// Frames fully processed by the read thread (incremented after each
+    /// `handle_frame` returns), and where the in-flight frame is: 1 = waiting
+    /// for the transport lock, 2 = INSIDE Transport::handle_frame (under the
+    /// lock — where the hardware-crypto IPC calls live), 3 = transport work
+    /// done, dispatching the event. A frozen stage 2 means a hardware engine
+    /// call (SHA / Ed25519 / TRNG) never returned, with the transport mutex
+    /// held — which wedges sync, sends, everything.
+    pub beat_frames: core::sync::atomic::AtomicU32,
+    pub frame_stage: core::sync::atomic::AtomicU32,
     /// The hub to (re)connect to, as `host:port`. Read by the connection manager
     /// each cycle so a "Set hub" takes effect on the next (re)connect.
     pub hub: Mutex<String>,
@@ -430,14 +439,23 @@ fn request_propagation_path(shared: &Arc<Shared>, trng: &Trng) {
 }
 
 fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, frame_bytes: &[u8]) {
-    // Fresh per-link ephemeral X25519 key material, drawn from the TRNG only when
-    // the transport needs to answer a link request.
-    let mut gen_ephemeral = || {
-        let mut b = [0u8; KEY_HALF];
-        crate::fill_random(trng, &mut b);
-        b
+    use core::sync::atomic::Ordering;
+    // Fresh per-link ephemeral X25519 key material for answering a link request.
+    // Drawn from the TRNG *before* taking the transport lock: a TRNG IPC is a
+    // blocking service call, and blocking while holding the transport mutex
+    // wedges every other thread in the app (sync, sends, …). At most one link
+    // request per frame, so one pregenerated value is enough.
+    let mut eph = [0u8; KEY_HALF];
+    crate::fill_random(trng, &mut eph);
+    let mut gen_ephemeral = || eph;
+    shared.frame_stage.store(1, Ordering::SeqCst);
+    let event = {
+        let mut tp = shared.transport.lock().unwrap();
+        shared.frame_stage.store(2, Ordering::SeqCst);
+        tp.handle_frame(frame_bytes, &mut gen_ephemeral)
     };
-    let event = { shared.transport.lock().unwrap().handle_frame(frame_bytes, &mut gen_ephemeral) };
+    shared.frame_stage.store(3, Ordering::SeqCst);
+    shared.beat_frames.fetch_add(1, Ordering::SeqCst);
 
     match event {
         Event::Announce { destination_hash, info } => {
