@@ -2,7 +2,7 @@
 //! and the per-recipient encrypt/decrypt + sign/validate operations.
 //! Mirrors `RNS/Identity.py`.
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey};
 use zeroize::Zeroize;
 
 use crate::constants::*;
@@ -51,16 +51,18 @@ impl PublicIdentity {
     }
 
     /// Verify an Ed25519 signature over `message`.
+    ///
+    /// Uses the vendored software verifier ([`crate::ed25519`]), NOT
+    /// `ed25519-dalek`: on the Precursor, dalek's hardware-engine verify takes
+    /// tens of seconds per call (signing is fast and stays on dalek). Announce
+    /// validation runs under the transport lock, so a slow verify there stalls
+    /// the whole app. Validated against RFC 8032 vectors + live RNS interop.
     pub fn validate(&self, signature: &[u8], message: &[u8]) -> bool {
-        let vk = match VerifyingKey::from_bytes(&self.sig_pub) {
-            Ok(vk) => vk,
-            Err(_) => return false,
-        };
         let sig = match <[u8; SIG_LENGTH]>::try_from(signature) {
-            Ok(s) => Signature::from_bytes(&s),
+            Ok(s) => s,
             Err(_) => return false,
         };
-        vk.verify(message, &sig).is_ok()
+        crate::ed25519::verify(&self.sig_pub, message, &sig)
     }
 
     /// Encrypt `plaintext` to this identity (RNS `Identity.encrypt`).

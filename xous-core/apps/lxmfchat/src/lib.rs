@@ -211,6 +211,20 @@ impl<'a> LxmfChat<'a> {
         // hardware crypto backend differs from software and is why ECDH-derived
         // link/opportunistic keys fail HMAC while announces still work.
         let st = reticulum_core::self_test();
+        // Time one Ed25519 sign (hardware dalek) and one verify (vendored
+        // software): hardware VERIFY was measured at tens of seconds per call on
+        // this device (it stalled sync + sends behind the transport lock), which
+        // is why verify is software now. This line keeps both costs visible.
+        let st = {
+            let t0 = std::time::Instant::now();
+            let sig = shared.transport.lock().unwrap().identity().sign(b"selftest timing");
+            let sign_ms = t0.elapsed().as_millis();
+            let pubid = shared.transport.lock().unwrap().identity().public().clone();
+            let t1 = std::time::Instant::now();
+            let ok = pubid.validate(&sig, b"selftest timing");
+            let verify_ms = t1.elapsed().as_millis();
+            format!("{st} sign:{sign_ms}ms verify(sw):{verify_ms}ms:{}", if ok { "OK" } else { "FAIL" })
+        };
         log::info!("crypto self-test: {}", st);
         let post = Post {
             dialogue_id: initial_key.clone(),

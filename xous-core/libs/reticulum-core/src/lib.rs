@@ -18,6 +18,7 @@ pub mod announce;
 pub mod constants;
 pub mod crypto;
 pub mod destination;
+pub mod ed25519;
 pub mod hdlc;
 pub mod identity;
 pub mod link;

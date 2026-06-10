@@ -15,11 +15,11 @@
 //! RFC 7748 §5.2 test vector (see `lib::self_test`).
 
 /// Field element: 16 limbs, radix 2^16, signed to allow lazy reduction.
-type Gf = [i64; 16];
+pub(crate) type Gf = [i64; 16];
 
 const GF_121665: Gf = [0xDB41, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
-fn car25519(o: &mut Gf) {
+pub(crate) fn car25519(o: &mut Gf) {
     for i in 0..16 {
         o[i] += 1 << 16;
         let c = o[i] >> 16;
@@ -30,7 +30,7 @@ fn car25519(o: &mut Gf) {
 }
 
 /// Constant-time conditional swap of `p` and `q` when `b == 1`.
-fn sel25519(p: &mut Gf, q: &mut Gf, b: i64) {
+pub(crate) fn sel25519(p: &mut Gf, q: &mut Gf, b: i64) {
     let c = !(b - 1);
     for i in 0..16 {
         let t = c & (p[i] ^ q[i]);
@@ -39,7 +39,7 @@ fn sel25519(p: &mut Gf, q: &mut Gf, b: i64) {
     }
 }
 
-fn add(a: &Gf, b: &Gf) -> Gf {
+pub(crate) fn add(a: &Gf, b: &Gf) -> Gf {
     let mut o = [0i64; 16];
     for i in 0..16 {
         o[i] = a[i] + b[i];
@@ -47,7 +47,7 @@ fn add(a: &Gf, b: &Gf) -> Gf {
     o
 }
 
-fn sub(a: &Gf, b: &Gf) -> Gf {
+pub(crate) fn sub(a: &Gf, b: &Gf) -> Gf {
     let mut o = [0i64; 16];
     for i in 0..16 {
         o[i] = a[i] - b[i];
@@ -55,7 +55,7 @@ fn sub(a: &Gf, b: &Gf) -> Gf {
     o
 }
 
-fn mul(a: &Gf, b: &Gf) -> Gf {
+pub(crate) fn mul(a: &Gf, b: &Gf) -> Gf {
     let mut t = [0i64; 31];
     for i in 0..16 {
         for j in 0..16 {
@@ -72,11 +72,11 @@ fn mul(a: &Gf, b: &Gf) -> Gf {
     o
 }
 
-fn sqr(a: &Gf) -> Gf {
+pub(crate) fn sqr(a: &Gf) -> Gf {
     mul(a, a)
 }
 
-fn inv25519(input: &Gf) -> Gf {
+pub(crate) fn inv25519(input: &Gf) -> Gf {
     let mut c = *input;
     for a in (0..=253).rev() {
         c = sqr(&c);
@@ -87,7 +87,7 @@ fn inv25519(input: &Gf) -> Gf {
     c
 }
 
-fn unpack25519(n: &[u8; 32]) -> Gf {
+pub(crate) fn unpack25519(n: &[u8; 32]) -> Gf {
     let mut o = [0i64; 16];
     for i in 0..16 {
         o[i] = n[2 * i] as i64 + ((n[2 * i + 1] as i64) << 8);
@@ -96,7 +96,7 @@ fn unpack25519(n: &[u8; 32]) -> Gf {
     o
 }
 
-fn pack25519(n: &Gf) -> [u8; 32] {
+pub(crate) fn pack25519(n: &Gf) -> [u8; 32] {
     let mut t = *n;
     car25519(&mut t);
     car25519(&mut t);
