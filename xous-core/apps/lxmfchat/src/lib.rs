@@ -521,7 +521,6 @@ impl<'a> LxmfChat<'a> {
         {
             self.activate_peer(&addr);
             save_contact(&self.shared, &self.pddb, &addr, &name);
-            self.chat.set_status_text(&format!("messaging {}", name));
         }
     }
 
@@ -544,11 +543,13 @@ impl<'a> LxmfChat<'a> {
                 u => (h, format!("{} [{}]", n, u)),
             })
             .collect();
-        if let Some((addr, name)) =
+        if let Some((addr, _)) =
             self.pick_peer(modals, entries, "Message who?", "No saved contacts yet — use Announces to find peers.")
         {
+            // activate_peer already shows "◉ <name>" in the status bar; don't
+            // overwrite it (the picker label may carry an unread badge, which
+            // only makes sense inside the list).
             self.activate_peer(&addr);
-            self.chat.set_status_text(&format!("messaging {}", name));
         }
     }
 
