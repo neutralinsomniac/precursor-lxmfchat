@@ -9,7 +9,6 @@
 //!
 //! * Default features: Rust >= 1.34.2 is supported
 //! * `rustc_1_37`: bump MSRV to 1.37, enable more optimizations
-//! * `nightly`: require Rust Nightly, enable more optimizations
 //!
 //! ## Usage
 //!
@@ -54,7 +53,4 @@ pub mod header;
 mod huffman;
 mod move_to_front;
 
-#[cfg(feature = "nightly")]
-const LEN_258: usize = 258;
-#[cfg(not(feature = "nightly"))]
 const LEN_258: usize = 512;

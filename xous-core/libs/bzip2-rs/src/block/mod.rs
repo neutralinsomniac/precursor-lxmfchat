@@ -244,11 +244,9 @@ impl Block {
             .read_u16(15)
             .ok_or_else(|| BlockError::new("selectors used truncated"))?;
 
-        #[cfg(feature = "nightly")]
-        let mut selectors_list = ArrayVec::<[u8; 18001]>::new();
-        #[cfg(feature = "nightly")]
-        selectors_list.set_len(usize::from(selectors_used));
-        #[cfg(not(feature = "nightly"))]
+        // PRECURSOR PATCH: upstream's `nightly` feature (stack ArrayVec here,
+        // a tighter const below) is dropped from the vendored copy; only the
+        // stable paths remain.
         let mut selectors_list = vec![0u8; usize::from(selectors_used)];
 
         let mut move_to_front_decoder = MoveToFrontDecoder::new();
