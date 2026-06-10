@@ -26,8 +26,11 @@ use ux_api::service::api::*;
 use xous::{msg_blocking_scalar_unpack, msg_scalar_unpack};
 use xous_ipc::Buffer;
 
-/// This sets the initial app focus on boot
-const INITIAL_APP_FOCUS: &'static str = gam::APP_NAME_SHELLCHAT;
+/// This sets the initial app focus on boot. The name must match the app's GAM
+/// registration (lxmfchat registers as "[reticulum]"; see gam::APP_NAME_LXMFCHAT
+/// in the generated apps.rs). Hardcoded as a string so images built without
+/// lxmfchat still compile — they simply boot with no initial app focused.
+const INITIAL_APP_FOCUS: &'static str = "[reticulum]";
 
 static CB_TO_MAIN_CONN: AtomicU32 = AtomicU32::new(0);
 fn imef_cb(s: String) {

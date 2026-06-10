@@ -299,6 +299,12 @@ pub fn connection_manager(shared: Arc<Shared>, chat_cid: CID) {
             return;
         }
     };
+    // On hardware, the wifi link takes a while to associate + DHCP after boot;
+    // the net service reports an IPv4 config only once that's done. Hosted mode
+    // rides the host OS's network (no DHCP event ever arrives there), so the
+    // readiness check is hardware-only.
+    #[cfg(target_os = "xous")]
+    let netmgr = net::NetManager::new();
     let mut backoff = 2u64;
     loop {
         let hub = plock(&shared.hub).clone();
@@ -313,6 +319,24 @@ pub fn connection_manager(shared: Arc<Shared>, chat_cid: CID) {
                 continue;
             }
         };
+
+        // Don't dial until the network is actually up — connecting into a down
+        // interface just burns long connect timeouts and clutters the status bar
+        // with failures that aren't the hub's fault.
+        #[cfg(target_os = "xous")]
+        {
+            let mut waited = false;
+            while netmgr.get_ipv4_config().is_none() {
+                if !waited {
+                    chat::cf_set_status_text(chat_cid, "waiting for wifi…");
+                    waited = true;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+            if waited {
+                backoff = 2; // network just came up: connect promptly
+            }
+        }
 
         chat::cf_set_status_text(chat_cid, &format!("connecting to {hub}…"));
         match TcpStream::connect((host.as_str(), port)) {
