@@ -2314,9 +2314,31 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                         // is left alone). The OutboundLinkUp event pumps the
                         // outbox the moment the LRPROOF arrives, so the message
                         // goes out without waiting for the next tick.
+                        //
+                        // If the link never establishes (peer offline, stale
+                        // path), `attempts` stays 0 and nothing else escalates —
+                        // count establishment tries and fall back to the
+                        // propagation node like the no-route path does, instead
+                        // of spinning until the deadline ✗'s the message. Each
+                        // expired request window is ~20 s (PENDING_LINK_EXPIRY),
+                        // so this is about a minute of trying.
+                        if outbox[i].route_tries >= MAX_ROUTE_TRIES
+                            && !outbox[i].tried_pn
+                            && pn.is_some()
+                        {
+                            outbox[i].via_pn = true;
+                            outbox[i].deadline = now + PROP_DEADLINE; // fresh budget
+                            outbox[i].next_action = now;
+                            chat::cf_set_status_text(
+                                chat_cid,
+                                &format!("{label}: link won't establish — trying propagation node…"),
+                            );
+                            continue;
+                        }
                         if let LinkReqOutcome::Sent =
                             send_link_request(shared, trng, &peer, &known.identity, now)
                         {
+                            outbox[i].route_tries += 1;
                             chat::cf_set_status_text(chat_cid, &format!("{label}: establishing link…"));
                         }
                         outbox[i].next_action = now + 2;
