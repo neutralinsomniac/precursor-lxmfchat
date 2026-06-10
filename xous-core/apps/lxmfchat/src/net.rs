@@ -222,6 +222,10 @@ pub struct Shared {
     /// Keepalive/watchdog thread heartbeat (+1 per 5 s tick): if this freezes,
     /// the stuck-write watchdog is itself wedged and can't break anything.
     pub beat_ka: core::sync::atomic::AtomicU32,
+    /// Seconds the last completed `Transport::handle_frame` call took. That call
+    /// is pure compute plus hardware-crypto IPC (Ed25519 engine verify, SHA), so
+    /// a large value here directly measures a degraded crypto engine.
+    pub tspan: core::sync::atomic::AtomicU32,
     /// The hub to (re)connect to, as `host:port`. Read by the connection manager
     /// each cycle so a "Set hub" takes effect on the next (re)connect.
     pub hub: Mutex<String>,
@@ -452,11 +456,13 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
     crate::fill_random(trng, &mut eph);
     let mut gen_ephemeral = || eph;
     shared.frame_stage.store(1, Ordering::SeqCst);
+    let t0 = now_secs();
     let event = {
         let mut tp = shared.transport.lock().unwrap();
         shared.frame_stage.store(2, Ordering::SeqCst);
         tp.handle_frame(frame_bytes, &mut gen_ephemeral)
     };
+    shared.tspan.store((now_secs().saturating_sub(t0)) as u32, Ordering::SeqCst);
     shared.frame_stage.store(3, Ordering::SeqCst);
     shared.beat_frames.fetch_add(1, Ordering::SeqCst);
 
@@ -469,8 +475,10 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
             // Only list LXMF *delivery* destinations — skip propagation-node and
             // other-app announces, whose app_data isn't a messageable peer name.
             if info.name_hash != crate::lxmf_delivery_name_hash() {
+                arm(99);
                 return;
             }
+            arm(311); // name filter passed
             // Announces populate the live directory only; they are NOT saved as
             // contacts until you actually message them (or they message you).
             let name = crate::lxmf_display_name(&info.app_data).unwrap_or_else(|| hex(&destination_hash));
@@ -479,15 +487,18 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
             // before we had their key — common on an access_point interface),
             // upgrade their record now that we have the key + a display name.
             let is_contact = shared.contacts.lock().unwrap().contains_key(&destination_hash);
+            arm(312); // directory updated; about to persist the contact (PDDB)
             if is_contact {
                 crate::save_contact(shared, pddb, &destination_hash, &name);
             }
+            arm(313); // contact persisted; about to verify any cached ticket
             // Now that we have this peer's key, recover a ticket from any earlier
             // message we couldn't verify at the time (access-point interface).
             let cached = shared.ticket_pending.lock().unwrap().remove(&destination_hash);
             if let Some(bytes) = cached {
                 verify_and_store_ticket(shared, chat_cid, pddb, &destination_hash, &info.identity, &bytes);
             }
+            arm(314); // announce arm complete
         }
         // Opportunistic delivery: the destination hash is stripped on the wire, so
         // prepend ours to reconstruct the full LXMF blob.
