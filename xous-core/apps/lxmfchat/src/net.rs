@@ -587,8 +587,12 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
             }
         }
         // Opportunistic delivery: the destination hash is stripped on the wire, so
-        // prepend ours to reconstruct the full LXMF blob.
-        Event::Data { destination_hash, plaintext } => {
+        // prepend ours to reconstruct the full LXMF blob. Send the delivery proof
+        // back FIRST — it's how the sender gets its ✓ instead of retrying and
+        // falling back to its propagation node (sent per packet, including
+        // retransmits, before any dedup — mirrors LXMRouter.delivery_packet).
+        Event::Data { destination_hash, plaintext, proof } => {
+            write_to_hub(shared, &proof);
             let mut lxmf_bytes = destination_hash.to_vec();
             lxmf_bytes.extend_from_slice(&plaintext);
             deliver_lxmf(shared, chat_cid, pddb, trng, &lxmf_bytes, true);

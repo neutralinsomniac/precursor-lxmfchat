@@ -116,8 +116,12 @@ pub enum Event {
     Announce { destination_hash: [u8; TRUNCATED_HASHLENGTH], info: KnownDest },
     /// A single-destination DATA packet addressed to one of our destinations was
     /// received and decrypted. `plaintext` is the decrypted payload (for LXMF
-    /// opportunistic, this is `source||sig||payload`, with the dest hash stripped).
-    Data { destination_hash: [u8; TRUNCATED_HASHLENGTH], plaintext: Vec<u8> },
+    /// opportunistic, this is `source||sig||payload`, with the dest hash
+    /// stripped). `proof` is the delivery receipt to transmit back: LXMF proves
+    /// EVERY delivered packet (`LXMRouter.delivery_packet` → `packet.prove()`),
+    /// and without it the sender retries and then falls back to its propagation
+    /// node even though the message arrived.
+    Data { destination_hash: [u8; TRUNCATED_HASHLENGTH], plaintext: Vec<u8>, proof: Vec<u8> },
     /// We accepted an inbound link request; `proof` must be transmitted back to
     /// the initiator so it can start sending data over the link.
     LinkEstablished { link_id: [u8; TRUNCATED_HASHLENGTH], proof: Vec<u8> },
@@ -569,7 +573,23 @@ impl Transport {
                     PACKET_DATA => {
                         // Opportunistic delivery: try our ratchets (none yet) then our key.
                         match self.identity.decrypt(&packet.data, &[]) {
-                            Ok(plaintext) => Event::Data { destination_hash: packet.destination_hash, plaintext },
+                            Ok(plaintext) => {
+                                // Delivery receipt, mirroring `RNS.Packet.prove`:
+                                // an explicit proof `packet_hash(32) || sig` as a
+                                // PROOF packet addressed to the truncated packet
+                                // hash (RNS `ProofDestination`); the hub routes it
+                                // back to the sender via its reverse table.
+                                let ph = packet.packet_hash();
+                                let mut trunc = [0u8; TRUNCATED_HASHLENGTH];
+                                trunc.copy_from_slice(&ph[..TRUNCATED_HASHLENGTH]);
+                                let mut proof_data = ph.to_vec();
+                                proof_data.extend_from_slice(&self.identity.sign(&ph));
+                                let proof = Packet::header1(
+                                    DEST_SINGLE, PACKET_PROOF, CONTEXT_NONE, trunc, proof_data,
+                                )
+                                .encode();
+                                Event::Data { destination_hash: packet.destination_hash, plaintext, proof }
+                            }
                             Err(reason) => {
                                 Event::DataUndecryptable { destination_hash: packet.destination_hash, reason }
                             }
@@ -1228,7 +1248,6 @@ mod tests {
 
     #[test]
     fn opportunistic_send_is_acknowledged_by_proof() {
-        use crate::packet::Packet;
         let sender_id = id(0x70);
         let recipient_id = id(0x60);
         let recipient_dh = single_destination_hash("lxmf", &["delivery"], &recipient_id.hash());
@@ -1246,32 +1265,31 @@ mod tests {
         );
 
         // Send a tracked opportunistic packet.
-        let (_raw, full_hash) = sender.make_opportunistic_tracked(
+        let (raw, full_hash) = sender.make_opportunistic_tracked(
             &recipient_dh, recipient_id.public(), None, b"payload", &[3u8; KEY_HALF], &[4u8; IV_LENGTH],
         );
 
-        // The recipient's LXMF layer proves it: PROOF (packet_hash || signature)
-        // addressed to the truncated packet hash.
-        let mut trunc = [0u8; TRUNCATED_HASHLENGTH];
-        trunc.copy_from_slice(&full_hash[..TRUNCATED_HASHLENGTH]);
-        let mut proof_data = Vec::new();
-        proof_data.extend_from_slice(&full_hash);
-        proof_data.extend_from_slice(&recipient_id.sign(&full_hash));
-        let proof = Packet::header1(DEST_SINGLE, PACKET_PROOF, CONTEXT_NONE, trunc, proof_data).encode();
-
+        // END TO END: the RECEIVING transport must produce the delivery proof
+        // itself. (An earlier version of this test hand-built the proof — which
+        // hid that our receiver never sent one, so Precursor→Precursor sends
+        // were never acknowledged and always fell back to the propagation node.)
         let mut eph = || [0u8; KEY_HALF];
+        let mut recipient = Transport::new(id(0x60));
+        recipient.register_destination(recipient_dh);
+        let proof = match recipient.handle_frame(&raw, &mut eph) {
+            Event::Data { plaintext, proof, .. } => {
+                assert_eq!(plaintext, b"payload");
+                proof
+            }
+            _ => panic!("expected data at the recipient"),
+        };
+
         match sender.handle_frame(&proof, &mut eph) {
             Event::Delivered { packet_hash } => assert_eq!(packet_hash, full_hash),
             _ => panic!("expected delivered"),
         }
         // A second copy of the proof no longer matches (receipt consumed).
-        let proof2 = {
-            let mut d = Vec::new();
-            d.extend_from_slice(&full_hash);
-            d.extend_from_slice(&recipient_id.sign(&full_hash));
-            Packet::header1(DEST_SINGLE, PACKET_PROOF, CONTEXT_NONE, trunc, d).encode()
-        };
-        assert!(!matches!(sender.handle_frame(&proof2, &mut eph), Event::Delivered { .. }));
+        assert!(!matches!(sender.handle_frame(&proof, &mut eph), Event::Delivered { .. }));
     }
 
     #[test]
@@ -1297,9 +1315,16 @@ mod tests {
         let mut bob_tp = Transport::new(id(0x20));
         bob_tp.register_destination(bob_dh);
         match bob_tp.handle_frame(&pkt, &mut eph) {
-            Event::Data { destination_hash, plaintext } => {
+            Event::Data { destination_hash, plaintext, proof } => {
                 assert_eq!(destination_hash, bob_dh);
                 assert_eq!(plaintext, b"secret payload");
+                // Bob must produce a delivery proof (LXMF proves every
+                // delivered packet); a PROOF packet addressed to the truncated
+                // hash of the data packet.
+                let p = Packet::decode(&proof).expect("proof decodes");
+                assert_eq!(p.packet_type, PACKET_PROOF);
+                let data_hash = Packet::decode(&pkt).unwrap().packet_hash();
+                assert_eq!(p.destination_hash, data_hash[..TRUNCATED_HASHLENGTH]);
             }
             Event::Dropped(e) => panic!("dropped: {e}"),
             _ => panic!("expected data"),

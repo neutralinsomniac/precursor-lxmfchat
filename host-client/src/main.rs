@@ -232,8 +232,11 @@ fn main() {
                     Event::Delivered { packet_hash } => {
                         println!(">>> DELIVERED (proof matched {})", reticulum_core::hex(&packet_hash));
                     }
-                    Event::Data { destination_hash, plaintext } => {
-                        // Opportunistic LXMF: prepend our dest hash, parse.
+                    Event::Data { destination_hash, plaintext, proof } => {
+                        // Send the delivery proof back (the sender's ✓), then
+                        // prepend our dest hash and parse the LXMF.
+                        writer.write_all(&frame(&proof)).ok();
+                        writer.flush().ok();
                         let mut lxmf_bytes = destination_hash.to_vec();
                         lxmf_bytes.extend_from_slice(&plaintext);
                         let src_hash = if lxmf_bytes.len() >= 32 {

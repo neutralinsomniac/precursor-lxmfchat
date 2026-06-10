@@ -38,10 +38,14 @@ def main():
     print("waiting to learn recipient", recipient_hash.hex())
     deadline = time.time() + 30
     recalled = None
+    asked = 0
     while time.time() < deadline:
         recalled = RNS.Identity.recall(recipient_hash)
         if recalled is not None:
             break
+        if asked % 6 == 0:
+            RNS.Transport.request_path(recipient_hash)
+        asked += 1
         time.sleep(0.5)
     if recalled is None:
         print("FAIL: never learned recipient identity")
@@ -52,9 +56,16 @@ def main():
     msg = LXMF.LXMessage(dst_dest, src_dest, text, "", desired_method=LXMF.LXMessage.OPPORTUNISTIC)
     msg.pack()
     pkt = RNS.Packet(dst_dest, msg.packed[LXMF.LXMessage.DESTINATION_LENGTH:])
-    pkt.send()
+    receipt = pkt.send()
     print("sent opportunistic LXMF:", text)
-    time.sleep(3)  # allow delivery
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if receipt.status == RNS.PacketReceipt.DELIVERED:
+            print("=== DELIVERED (proof validated by RNS)")
+            break
+        time.sleep(0.2)
+    else:
+        print("=== NO PROOF, receipt status:", receipt.status)
 
 
 if __name__ == "__main__":
