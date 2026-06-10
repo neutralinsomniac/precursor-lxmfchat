@@ -285,20 +285,24 @@ fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// Block until libstd's wall-clock time server is up. `SystemTime::now()`
-/// panics *inside libstd* ("failed to request utc time in ms") when called
-/// before the dns service registers the well-known "timeserverpublic" server —
-/// and as the boot app, our network threads (spawned on the first Focus, i.e.
-/// within milliseconds of boot) can win that race. Call once at the top of any
-/// thread that uses wall-clock time. Hosted mode uses the host clock directly;
-/// nothing to wait for there.
+/// Block until libstd's wall-clock time server (the well-known
+/// "timeserverpublic", registered by the dns service during boot) exists. The
+/// kernel parks a connect to a not-yet-existing server and retries it
+/// internally, so this is simply a blocking connect — it returns as soon as
+/// the server is up. Belt-and-suspenders for threads that use wall-clock time
+/// from the first instant of boot (we're the boot app). Hosted mode uses the
+/// host clock directly; nothing to wait for there.
+///
+/// NOTE the panic "failed to request utc time in ms: the requested server
+/// could not be found" is NOT a boot race: it means the process's (deduped,
+/// shared!) connection to the time server was DISCONNECTED — e.g. by dropping
+/// a temporary `llio::LocalTime`, whose refcounted Drop severs the very
+/// connection libstd caches for `SystemTime::now()`. Never let the last
+/// `LocalTime` in a process drop.
 fn wait_for_time_server() {
     #[cfg(target_os = "xous")]
-    loop {
-        if xous::connect(xous::SID::from_bytes(b"timeserverpublic").unwrap()).is_ok() {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(250));
+    {
+        let _ = xous::connect(xous::SID::from_bytes(b"timeserverpublic").unwrap());
     }
 }
 

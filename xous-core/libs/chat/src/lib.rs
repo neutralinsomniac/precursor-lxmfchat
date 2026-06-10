@@ -675,10 +675,11 @@ pub fn server(
 pub fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().try_into().unwrap() }
 
 /// True once libstd's wall-clock time server is up (the dns service registers
-/// the well-known "timeserverpublic" server some time into boot).
-/// `SystemTime::now()` and `llio::LocalTime` both panic *inside libstd* if
-/// used before then — and a bubble can be rendered that early now that a chat
-/// app can be the boot app. Probe cheaply, cache the success.
+/// the well-known "timeserverpublic" server during boot). The kernel parks a
+/// connect to a not-yet-existing server and retries internally, so on
+/// hardware the first call may briefly block; afterwards it's a cached flag.
+/// Keeps the render path from ever waiting on (or being surprised by) time
+/// availability semantics this early in boot.
 fn time_server_ready() -> bool {
     #[cfg(not(target_os = "xous"))]
     {
@@ -718,7 +719,19 @@ fn tz_offset_secs() -> i64 {
         return 0;
     }
     LAST_TRY.store(utc as u32, Ordering::Relaxed);
-    match llio::LocalTime::new().get_local_time_ms() {
+    // CRITICAL: the LocalTime must live for the PROCESS lifetime, never be a
+    // temporary. Its Drop disconnects its kernel connection when llio's
+    // refcount hits zero — and the kernel DEDUPES per-process connections to
+    // a server, so that is the very same connection libstd caches for
+    // SystemTime::now(). Dropping a temporary here severed it and made the
+    // next SystemTime::now() anywhere in the process panic with
+    // "failed to request utc time in ms: the requested server could not be
+    // found" (std/src/sys/pal/xous/time.rs:40).
+    static LOCAL_TIME: std::sync::OnceLock<std::sync::Mutex<llio::LocalTime>> =
+        std::sync::OnceLock::new();
+    let lt = LOCAL_TIME.get_or_init(|| std::sync::Mutex::new(llio::LocalTime::new()));
+    let local = lt.lock().map(|mut lt| lt.get_local_time_ms()).unwrap_or(None);
+    match local {
         Some(local_ms) => {
             // round to the nearest 15 minutes to absorb the IPC latency (all
             // real utc offsets are multiples of 15 minutes)
