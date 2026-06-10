@@ -641,7 +641,12 @@ fn wrapped_main() -> ! {
             }
         }
     };
-    sec_notes.lock().unwrap().insert("current_app".to_string(), format!("Running: Shellchat").to_string()); // this is the default app on boot
+    // This must match the GAM's INITIAL_APP_FOCUS (lxmfchat boots focused);
+    // same display name app_dispatch writes when switching via the app menu.
+    sec_notes.lock().unwrap().insert(
+        "current_app".to_string(),
+        format!("Running: {}", t!("appmenu.lxmfchat", locales::LANG)).to_string(),
+    );
     if ec_updated {
         netmgr.reset(); // have to do this to get the net manager stack into a known state after reset
     }
