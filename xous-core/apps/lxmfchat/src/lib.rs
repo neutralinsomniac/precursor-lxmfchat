@@ -177,16 +177,6 @@ impl<'a> LxmfChat<'a> {
             connected: core::sync::atomic::AtomicBool::new(false),
             ctl: Mutex::new(None),
             write_started: core::sync::atomic::AtomicU32::new(0),
-            beat_sync: core::sync::atomic::AtomicU32::new(0),
-            beat_pump: core::sync::atomic::AtomicU32::new(0),
-            beat_read: core::sync::atomic::AtomicU32::new(0),
-            sync_stage: core::sync::atomic::AtomicU32::new(0),
-            beat_frames: core::sync::atomic::AtomicU32::new(0),
-            frame_stage: core::sync::atomic::AtomicU32::new(0),
-            sync_stage_at: core::sync::atomic::AtomicU32::new(0),
-            beat_sync_done: core::sync::atomic::AtomicU32::new(0),
-            beat_ka: core::sync::atomic::AtomicU32::new(0),
-            tspan: core::sync::atomic::AtomicU32::new(0),
             our_dh,
             dialogue_id: DIALOGUE_WELCOME.to_string(),
             seen: Mutex::new(BTreeMap::new()),
@@ -308,43 +298,7 @@ impl<'a> LxmfChat<'a> {
     /// this returns immediately and never blocks the UI on a hub write.
     pub fn sync_now(&self) {
         net::request_sync(&self.shared);
-        // Liveness snapshot, rendered by the MAIN thread from lock-free atomics
-        // (so it displays no matter which mutex/thread is wedged): s/p/r =
-        // sync/pump/read thread heartbeats, g = last sync-path stage reached
-        // (see net.rs stage table), c = connected. Press Sync twice ~15 s apart:
-        // s should advance by ~15 and g should move — whichever number FREEZES
-        // identifies the wedged thread / exact blocking statement.
-        use core::sync::atomic::Ordering;
-        let s = self.shared.beat_sync.load(Ordering::SeqCst);
-        // s = passes started / completed: "s66/65" frozen with started ahead
-        // means the sync thread is blocked INSIDE a pass; both frozen means it
-        // isn't being scheduled at all.
-        let sd = self.shared.beat_sync_done.load(Ordering::SeqCst);
-        let p = self.shared.beat_pump.load(Ordering::SeqCst);
-        let r = self.shared.beat_read.load(Ordering::SeqCst);
-        let g = self.shared.sync_stage.load(Ordering::SeqCst);
-        // Age of the current sync stage: "g16+43" = sitting at stage 16 for 43s,
-        // i.e. blocked in the statement right after that marker.
-        let ga = self.shared.sync_stage_at.load(Ordering::SeqCst);
-        let gage = if ga == 0 { 0 } else { (now() as u32).saturating_sub(ga) };
-        let c = self.shared.connected.load(Ordering::SeqCst) as u32;
-        // f = frames fully processed : where the in-flight frame is (net.rs
-        // frame_stage; a frozen ":2" = stuck inside Transport::handle_frame —
-        // i.e. a hardware-crypto call hung while holding the transport lock).
-        let f = self.shared.beat_frames.load(Ordering::SeqCst);
-        let fs = self.shared.frame_stage.load(Ordering::SeqCst);
-        // k = keepalive/watchdog heartbeat; w = seconds the current hub write
-        // has been in flight (0 = none). k advancing while w grows past ~25 means
-        // the watchdog's shutdown() cannot unblock a stuck write.
-        let k = self.shared.beat_ka.load(Ordering::SeqCst);
-        let ws = self.shared.write_started.load(Ordering::SeqCst);
-        let w = if ws == 0 { 0 } else { (now() as u32).saturating_sub(ws) };
-        // t = seconds the LAST completed Transport::handle_frame took — a direct
-        // measurement of hardware-crypto (Ed25519/SHA engine) speed per frame.
-        let t = self.shared.tspan.load(Ordering::SeqCst);
-        self.chat.set_status_text(&format!(
-            "sync requested… [s{s}/{sd} p{p} r{r} f{f}:{fs} t{t} g{g}+{gage} c{c} k{k} w{w}]"
-        ));
+        self.chat.set_status_text("sync requested…");
     }
 
     /// Send an opportunistic LXMF message to the current peer.

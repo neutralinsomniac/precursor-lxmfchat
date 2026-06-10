@@ -200,40 +200,6 @@ pub struct Shared {
     /// socket if this stays nonzero too long, which errors the blocked write out
     /// and lets the connection manager reconnect.
     pub write_started: core::sync::atomic::AtomicU32,
-    /// LIVENESS DIAGNOSTICS, displayed by the MAIN thread in `sync_now`'s status
-    /// line (`[sN pN rN gN cN]`). Lock-free on purpose: the main thread must be
-    /// able to render them no matter which mutex is wedged. Heartbeats tick once
-    /// per loop iteration of their thread; `sync_stage` records the last numbered
-    /// step the sync path reached (see [`stage`] constants), so a wedged sync
-    /// pinpoints the exact statement it blocked on.
-    pub beat_sync: core::sync::atomic::AtomicU32,
-    pub beat_pump: core::sync::atomic::AtomicU32,
-    pub beat_read: core::sync::atomic::AtomicU32,
-    pub sync_stage: core::sync::atomic::AtomicU32,
-    /// Frames fully processed by the read thread (incremented after each
-    /// `handle_frame` returns), and where the in-flight frame is: 1 = waiting
-    /// for the transport lock, 2 = INSIDE Transport::handle_frame (under the
-    /// lock — where the hardware-crypto IPC calls live), 3 = transport work
-    /// done, dispatching the event. A frozen stage 2 means a hardware engine
-    /// call (SHA / Ed25519 / TRNG) never returned, with the transport mutex
-    /// held — which wedges sync, sends, everything.
-    pub beat_frames: core::sync::atomic::AtomicU32,
-    pub frame_stage: core::sync::atomic::AtomicU32,
-    /// Unix seconds (u32) when `sync_stage` was last stored — the bracket shows
-    /// the AGE of the current stage, so "g16+43" means the sync thread has sat
-    /// at stage 16 for 43 s and names the exact statement it's inside.
-    pub sync_stage_at: core::sync::atomic::AtomicU32,
-    /// maybe_auto_sync passes COMPLETED (vs `beat_sync` = passes started): if
-    /// started keeps leading completed by 1 for a long time, the thread is
-    /// blocked inside the pass; if both freeze, it isn't being scheduled.
-    pub beat_sync_done: core::sync::atomic::AtomicU32,
-    /// Keepalive/watchdog thread heartbeat (+1 per 5 s tick): if this freezes,
-    /// the stuck-write watchdog is itself wedged and can't break anything.
-    pub beat_ka: core::sync::atomic::AtomicU32,
-    /// Seconds the last completed `Transport::handle_frame` call took. That call
-    /// is pure compute plus hardware-crypto IPC (Ed25519 engine verify, SHA), so
-    /// a large value here directly measures a degraded crypto engine.
-    pub tspan: core::sync::atomic::AtomicU32,
     /// The hub to (re)connect to, as `host:port`. Read by the connection manager
     /// each cycle so a "Set hub" takes effect on the next (re)connect.
     pub hub: Mutex<String>,
@@ -418,7 +384,6 @@ fn read_until_closed(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Tr
                 break;
             }
             Ok(n) => {
-                shared.beat_read.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
                 for frame in deframer.push(&buf[..n]) {
                     handle_frame(shared, chat_cid, pddb, trng, &frame);
                 }
@@ -454,7 +419,6 @@ fn request_propagation_path(shared: &Arc<Shared>, trng: &Trng) {
 }
 
 fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, frame_bytes: &[u8]) {
-    use core::sync::atomic::Ordering;
     // Fresh per-link ephemeral X25519 key material for answering a link request.
     // Drawn from the TRNG *before* taking the transport lock: a TRNG IPC is a
     // blocking service call, and blocking while holding the transport mutex
@@ -463,30 +427,18 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
     let mut eph = [0u8; KEY_HALF];
     crate::fill_random(trng, &mut eph);
     let mut gen_ephemeral = || eph;
-    shared.frame_stage.store(1, Ordering::SeqCst);
-    let t0 = now_secs();
     let event = {
         let mut tp = plock(&shared.transport);
-        shared.frame_stage.store(2, Ordering::SeqCst);
         tp.handle_frame(frame_bytes, &mut gen_ephemeral)
     };
-    shared.tspan.store((now_secs().saturating_sub(t0)) as u32, Ordering::SeqCst);
-    shared.frame_stage.store(3, Ordering::SeqCst);
-    shared.beat_frames.fetch_add(1, Ordering::SeqCst);
 
-    // Event-dispatch arm markers (frame_stage 31-42; 99 = dispatch complete):
-    // a frozen 3X names the arm the read thread is stuck in.
-    let arm = |n: u32| shared.frame_stage.store(n, Ordering::SeqCst);
     match event {
         Event::Announce { destination_hash, info } => {
-            arm(31);
             // Only list LXMF *delivery* destinations — skip propagation-node and
             // other-app announces, whose app_data isn't a messageable peer name.
             if info.name_hash != crate::lxmf_delivery_name_hash() {
-                arm(99);
                 return;
             }
-            arm(311); // name filter passed
             // Announces populate the live directory only; they are NOT saved as
             // contacts until you actually message them (or they message you).
             let name = crate::lxmf_display_name(&info.app_data).unwrap_or_else(|| hex(&destination_hash));
@@ -495,23 +447,19 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
             // before we had their key — common on an access_point interface),
             // upgrade their record now that we have the key + a display name.
             let is_contact = plock(&shared.contacts).contains_key(&destination_hash);
-            arm(312); // directory updated; about to persist the contact (PDDB)
             if is_contact {
                 crate::save_contact(shared, pddb, &destination_hash, &name);
             }
-            arm(313); // contact persisted; about to verify any cached ticket
             // Now that we have this peer's key, recover a ticket from any earlier
             // message we couldn't verify at the time (access-point interface).
             let cached = plock(&shared.ticket_pending).remove(&destination_hash);
             if let Some(bytes) = cached {
                 verify_and_store_ticket(shared, chat_cid, pddb, &destination_hash, &info.identity, &bytes);
             }
-            arm(314); // announce arm complete
         }
         // Opportunistic delivery: the destination hash is stripped on the wire, so
         // prepend ours to reconstruct the full LXMF blob.
         Event::Data { destination_hash, plaintext } => {
-            arm(32);
             let mut lxmf_bytes = destination_hash.to_vec();
             lxmf_bytes.extend_from_slice(&plaintext);
             deliver_lxmf(shared, chat_cid, pddb, trng, &lxmf_bytes, true);
@@ -519,7 +467,6 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
         // We accepted an inbound link request: send the proof so the initiator
         // starts transmitting the message over the link.
         Event::LinkEstablished { link_id, proof } => {
-            arm(33);
             log::info!("accepted inbound link {}", hex(&link_id));
             write_to_hub(shared, &proof);
             // Transient status only — NOT a persisted post. A persisted
@@ -533,7 +480,6 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
         // blob. Send the packet proof back so the sender confirms delivery (and
         // stops retrying / tearing the link down).
         Event::LinkData { plaintext, proof, .. } => {
-            arm(34);
             write_to_hub(shared, &proof);
             deliver_lxmf(shared, chat_cid, pddb, trng, &plaintext, true);
         }
@@ -541,7 +487,6 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
         // and start accepting data — once they receive an RTT packet, so send it
         // before any data (or the data is silently dropped). Then send queued msgs.
         Event::OutboundLinkUp { link_id, target } => {
-            arm(35);
             log::info!("outbound link {} up to {}", hex(&link_id), hex(&target));
             let mut iv = [0u8; IV_LENGTH];
             crate::fill_random(trng, &mut iv);
@@ -554,20 +499,17 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
         }
         // A packet proof confirmed one of our sent messages reached its target.
         Event::Delivered { packet_hash } => {
-            arm(36);
             mark_delivered(shared, chat_cid, pddb, &packet_hash);
         }
         // Response / resource-transfer data on a link we opened (propagation-node
         // sync): drive the sync state machine.
         Event::OutLinkData { link_id, context, plaintext } => {
-            arm(37);
             sync_on_outlink_data(shared, chat_cid, pddb, trng, link_id, context, plaintext);
         }
         // The responder closed a link we initiated (transport already forgot it).
         // If a sync was mid-flight on it, abort now and let the user retry over a
         // fresh link instead of waiting out the 2-minute watchdog.
         Event::OutLinkClosed { link_id } => {
-            arm(38);
             log::info!("outbound link {} closed by responder", hex(&link_id));
             let sync_was_on_it = {
                 let s = plock(&shared.sync);
@@ -578,7 +520,6 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
             }
         }
         Event::DataUndecryptable { destination_hash, reason } => {
-            arm(39);
             // Log-only — NEVER a persisted post. A repeated undecryptable packet
             // (stale ratchet, retransmit, AP-hub cross-traffic) would otherwise
             // flood the dialogue and overflow the PDDB on the next read.
@@ -589,25 +530,21 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
         // post is DialogueSave'd) during an announce storm, which ballooned the
         // PDDB. Keep the persistent thread for real messages only.
         Event::AddressedUnhandled { destination_hash, packet_type, context } => {
-            arm(40);
             log::debug!(
                 "link {} addressed-but-unhandled type={} ctx=0x{:02x}",
                 hex(&destination_hash), packet_type, context
             );
         }
         Event::Unhandled { destination_hash, packet_type, context } => {
-            arm(41);
             log::debug!(
                 "unrouted packet to {} type={} ctx=0x{:02x}",
                 hex(&destination_hash), packet_type, context
             );
         }
         Event::Dropped(why) => {
-            arm(42);
             log::debug!("dropped frame: {}", why);
         }
     }
-    arm(99); // dispatch complete; back to the read loop
 }
 
 /// Store a freshly-received outbound ticket (keyed by the peer) if it is newer
@@ -779,7 +716,6 @@ pub fn keepalive_thread(shared: Arc<Shared>, chat_cid: CID) {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(TICK_SECS));
         ticks += 1;
-        shared.beat_ka.fetch_add(1, Ordering::SeqCst);
         let started = shared.write_started.load(Ordering::SeqCst);
         if started != 0 && (now_secs() as u32).saturating_sub(started) > WRITE_STUCK_SECS {
             log::warn!("hub write stuck >{WRITE_STUCK_SECS}s — shutting the socket down to unwedge it");
@@ -919,7 +855,6 @@ const SYNC_ROUTE_TRIES: u8 = 20;
 /// Begin a propagation-node sync (from the menu or auto on first connect). Ensures
 /// the node's key + route, (re)uses or opens the link, and kicks the exchange.
 pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
-    stage(shared, 11);
     let pn = match crate::propagation_node() {
         Some(p) => p,
         None => {
@@ -931,7 +866,6 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         chat::cf_set_status_text_forced(chat_cid, "sync already in progress");
         return;
     }
-    stage(shared, 12);
     let now = now_secs();
     // No hub connection: nothing we send can go anywhere. Wait for the manager
     // to reconnect (same bounded retry as the no-route case below) instead of
@@ -956,12 +890,10 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         }
         return;
     }
-    stage(shared, 13);
     let (known, have_path) = {
         let tp = plock(&shared.transport);
         (tp.known(&pn).cloned(), tp.has_path(&pn))
     };
-    stage(shared, 14);
     let known = match (known, have_path) {
         (Some(k), true) => k,
         _ => {
@@ -1000,7 +932,6 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         s.next_attempt = 0;
         s.link_tries = 0;
     }
-    stage(shared, 15);
     // BIND the lookup result before matching. A lock inside a `match` scrutinee
     // — even wrapped in braces — keeps its guard alive through EVERY ARM (Rust
     // temporary-scope rules), so the old `match { lock().outbound_link_for() }`
@@ -1015,21 +946,17 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
             sync_send_identify_and_list(shared, chat_cid, trng, lid);
         }
         None => {
-            stage(shared, 16);
             // The hop count distinguishes a HEADER_1 (hops ≤ 1, direct) from a
             // HEADER_2 (routed) link request — and the try counter advancing
             // proves the sync thread is alive and writing. Status BEFORE the
             // write so it shows even if the write stalls.
             let hops = { plock(&shared.transport).path_hops(&pn) };
             let hops = hops.map(|h| h.to_string()).unwrap_or_else(|| "?".to_string());
-            stage(shared, 151); // transport (path_hops) done; about to do the status IPC
             chat::cf_set_status_text_forced(
                 chat_cid,
                 &format!("sync: contacting node (try 1, hops {hops})…"),
             );
-            stage(shared, 152); // status IPC returned; entering send_pn_link_request
             let outcome = send_pn_link_request(shared, trng, &pn, &known.identity, now);
-            stage(shared, 17);
             match outcome {
                 LinkReqOutcome::WriteFailed => {
                     sync_finish(shared, chat_cid, "hub write failed — try again");
@@ -1064,7 +991,6 @@ fn send_pn_link_request(
 ) -> LinkReqOutcome {
     // Sub-stages 161-164 of the `g` diagnostic (only meaningful for the sync
     // thread; the pump only calls this while the outbox is non-empty).
-    stage(shared, 161); // about to take the transport lock
     let raw = {
         let mut tp = plock(&shared.transport);
         if tp.pending_link_to(pn, now) {
@@ -1077,13 +1003,10 @@ fn send_pn_link_request(
             Some(tp.make_link_request(pn, pn_identity, &ex, &ed, now).0)
         }
     };
-    stage(shared, 162); // transport done; about to write (if a request was built)
     match raw {
         None => LinkReqOutcome::Pending,
         Some(raw) => {
-            stage(shared, 163); // about to write_to_hub the LINKREQUEST
             let ok = write_to_hub(shared, &raw);
-            stage(shared, 164); // write returned
             if ok {
                 LinkReqOutcome::Sent
             } else {
@@ -1432,7 +1355,6 @@ pub fn outbox_pump_thread(shared: Arc<Shared>, chat_cid: CID) {
     };
     loop {
         std::thread::sleep(std::time::Duration::from_secs(2));
-        shared.beat_pump.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         if !plock(&shared.outbox).is_empty() {
             // Mine any pending propagation stamp first (slow, lock-free), so the
             // blob is ready when pump_outbox reaches the PN-send step. Doing it
@@ -1461,30 +1383,10 @@ pub fn sync_thread(shared: Arc<Shared>, chat_cid: CID) {
     };
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
-        shared.beat_sync.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         maybe_auto_sync(&shared, chat_cid, &trng);
-        shared.beat_sync_done.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     }
 }
 
-// Sync-path progress markers for the `[gN]` diagnostic (see Shared.sync_stage).
-// Each is stored just BEFORE the statement it names, so a frozen value points at
-// the exact blocking statement:
-//  1 maybe_auto_sync entered (about to take the sync lock for the watchdog)
-//  2 watchdog done (about to take the sync lock for the linking check)
-//  3 linking check done (about to take the sync lock to consume the request)
-// 10 request consumed (about to call start_sync)
-// 11 start_sync entered (about to take the sync lock for the phase check)
-// 12 phase check done (about to read the connected flag)
-// 13 connected (about to take the TRANSPORT lock for known/path)
-// 14 known/path read (about to take the sync lock to init Linking state)
-// 15 Linking state set (about to take the TRANSPORT lock for outbound_link_for)
-// 16 no reusable link (about to build + write the LINKREQUEST)
-// 17 LINKREQUEST write returned
-fn stage(shared: &Arc<Shared>, s: u32) {
-    shared.sync_stage.store(s, core::sync::atomic::Ordering::SeqCst);
-    shared.sync_stage_at.store(now_secs() as u32, core::sync::atomic::Ordering::SeqCst);
-}
 
 /// Kick off a one-time sync once the propagation node's route is known (after the
 /// connect-time path request resolves), and time out a stalled sync. Called on the
@@ -1506,7 +1408,6 @@ fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         }
     };
     let now = now_secs();
-    stage(shared, 1);
     // Time out a stuck sync.
     let stalled = {
         let s = plock(&shared.sync);
@@ -1516,7 +1417,6 @@ fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         sync_finish(shared, chat_cid, "timed out");
         return;
     }
-    stage(shared, 2);
     // Mid-sync, still waiting for the link: if the LINKREQUEST was lost (its
     // pending entry expired with no proof), send a fresh one — otherwise a single
     // lost request used to mean nothing more ever went out and the sync just sat
@@ -1551,7 +1451,6 @@ fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
     // A manual sync request (from the menu) is executed HERE — on the sync thread
     // — never on the main thread, so a blocking hub write can't freeze the UI.
     // `next_attempt` is the backoff while the node's route is being resolved.
-    stage(shared, 3);
     let requested = {
         let mut s = plock(&shared.sync);
         if s.requested && now >= s.next_attempt {
@@ -1562,7 +1461,6 @@ fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         }
     };
     if requested {
-        stage(shared, 10);
         start_sync(shared, chat_cid, trng); // handles not-ready / already-running itself
         return;
     }
