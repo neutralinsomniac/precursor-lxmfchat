@@ -1133,15 +1133,29 @@ fn main() -> ! {
                                     }
                                     // reset the default route, in case it has changed
                                     iface.routes_mut().remove_default_ipv4_route();
-                                    iface
-                                        .routes_mut()
-                                        .add_default_ipv4_route(Ipv4Address::new(
-                                            config.gtwy[0],
-                                            config.gtwy[1],
-                                            config.gtwy[2],
-                                            config.gtwy[3],
-                                        ))
-                                        .unwrap();
+                                    let gw = Ipv4Address::new(
+                                        config.gtwy[0],
+                                        config.gtwy[1],
+                                        config.gtwy[2],
+                                        config.gtwy[3],
+                                    );
+                                    // NEVER install a non-unicast gateway (0.0.0.0 /
+                                    // broadcast / multicast — seen from DHCP during
+                                    // lease-renewal hiccups): smoltcp asserts
+                                    // `is_unicast()` on the next-hop at TRANSMIT time
+                                    // (smoltcp-0.11.0 iface/neighbor.rs:134), so one
+                                    // TCP retransmit routed through a bogus default
+                                    // gateway PANICS the entire net service. Better
+                                    // no default route (transmit fails gracefully)
+                                    // until the next valid DHCP config arrives.
+                                    if gw.is_unicast() {
+                                        iface.routes_mut().add_default_ipv4_route(gw).unwrap();
+                                    } else {
+                                        log::warn!(
+                                            "DHCP supplied non-unicast gateway {:?}; leaving default route unset",
+                                            gw
+                                        );
+                                    }
 
                                     dns_allclear_hook.notify();
                                     dns_ipv4_hook.notify_custom_args([
