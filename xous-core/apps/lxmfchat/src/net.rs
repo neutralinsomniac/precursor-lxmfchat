@@ -82,6 +82,10 @@ const MAX_FOUND_ADDRS: usize = 16;
 /// an outbound Resource sender (not implemented) — they go store-and-forward
 /// via the propagation node instead.
 const LINK_PACKED_MAX: usize = 431;
+/// Proof wait for a message sent as a Resource (multiple request/part round
+/// trips before the receiver can prove it) — longer than the single-packet
+/// DELIVERY_RETRY. On timeout the send is retried as a fresh resource.
+const RESOURCE_RETRY: u64 = 45;
 
 /// An outbound message tracked until it is delivered (✓), stored at the
 /// propagation node (⇪), or given up on (✗). Driven by [`pump_outbox`].
@@ -646,9 +650,24 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
         Event::Delivered { packet_hash } => {
             mark_delivered(shared, chat_cid, pddb, &packet_hash);
         }
-        // Response / resource-transfer data on a link we opened (propagation-node
-        // sync): drive the sync state machine.
+        // Data on a link we opened. A RESOURCE_REQ here is a receiver
+        // downloading a Resource WE are sending (a large direct message, or a
+        // large transfer to the propagation node) — serve it. Everything else
+        // drives the propagation-node sync state machine (sync never receives
+        // requests: we're the requester there).
         Event::OutLinkData { link_id, context, plaintext } => {
+            if context == CONTEXT_RESOURCE_REQ {
+                let mut iv = [0u8; IV_LENGTH];
+                crate::fill_random(trng, &mut iv);
+                // Bind first: never hold the transport guard across hub writes.
+                let packets = { plock(&shared.transport).serve_link_resource(&link_id, &plaintext, &iv) };
+                if !packets.is_empty() {
+                    for p in packets {
+                        write_to_hub(shared, &p);
+                    }
+                    return;
+                }
+            }
             sync_on_outlink_data(shared, chat_cid, pddb, trng, link_id, context, plaintext);
         }
         // The responder closed a link we initiated (transport already forgot it).
@@ -855,6 +874,31 @@ fn inbound_resource(
         }
         _ => log::debug!("inbound link {} resource ctx=0x{context:02x} ignored", hex(&link_id)),
     }
+}
+
+/// Start a Resource transfer of `data` on an established outbound link and
+/// transmit its advertisement; returns the resource hash (the in_flight
+/// receipt key — the receiver's RESOURCE_PRF surfaces Event::Delivered with
+/// it). Bind-then-write: never hold the transport guard across the hub write.
+fn make_resource_on_link(
+    shared: &Arc<Shared>,
+    trng: &Trng,
+    link_id: &[u8; TRUNCATED_HASHLENGTH],
+    data: &[u8],
+) -> Option<[u8; 32]> {
+    let mut r = [0u8; 4];
+    let mut prefix = [0u8; 4];
+    let mut iv = [0u8; IV_LENGTH];
+    let mut adv_iv = [0u8; IV_LENGTH];
+    crate::fill_random(trng, &mut r);
+    crate::fill_random(trng, &mut prefix);
+    crate::fill_random(trng, &mut iv);
+    crate::fill_random(trng, &mut adv_iv);
+    let made =
+        { plock(&shared.transport).make_link_resource(link_id, data, r, prefix, &iv, &adv_iv) };
+    let (adv, hash) = made?;
+    write_to_hub(shared, &adv);
+    Some(hash)
 }
 
 /// Send a `RESOURCE_REQ` on an inbound link. Bind-then-write: never hold the
@@ -2136,6 +2180,26 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                         continue;
                     }
                 };
+                if blob.len() > LINK_PACKED_MAX {
+                    // Too big for one link packet: transfer it as a Resource
+                    // (LXMF does the same for large PROPAGATED messages).
+                    let sent = make_resource_on_link(shared, trng, &link, &blob);
+                    match sent {
+                        Some(res_hash) => {
+                            outbox[i].in_flight = Some(res_hash);
+                            outbox[i].tried_pn = true;
+                            outbox[i].next_action = now + RESOURCE_RETRY;
+                            let label = peer_label(shared, &outbox[i].peer);
+                            chat::cf_set_status_text(
+                                chat_cid,
+                                &format!("{label}: transferring to propagation node…"),
+                            );
+                        }
+                        None => outbox[i].next_action = now + 2,
+                    }
+                    i += 1;
+                    continue;
+                }
                 let mut div = [0u8; IV_LENGTH];
                 crate::fill_random(trng, &mut div);
                 let sent = { plock(&shared.transport).make_link_data(&link, &blob, &div) };
@@ -2202,26 +2266,25 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                 }
                 let peer = outbox[i].peer;
                 let label = peer_label(shared, &peer);
-                // One link packet carries at most ~431 B of plaintext; bigger
-                // messages need an outbound Resource sender we don't have yet,
-                // so they go store-and-forward instead.
-                if outbox[i].packed.len() > LINK_PACKED_MAX {
-                    if !outbox[i].tried_pn && pn.is_some() {
-                        outbox[i].via_pn = true;
-                        outbox[i].deadline = now + PROP_DEADLINE;
-                        outbox[i].next_action = now;
-                        chat::cf_set_status_text(
-                            chat_cid,
-                            &format!("{label}: too large for direct — via propagation node…"),
-                        );
-                        continue;
-                    }
-                    let m = outbox.remove(i);
-                    failures.push((m.peer, m.display_ts, m.text, "too large for direct delivery"));
-                    continue;
-                }
                 let link = { plock(&shared.transport).outbound_link_for(&peer, now) };
                 match link {
+                    Some(lid) if outbox[i].packed.len() > LINK_PACKED_MAX => {
+                        // Too big for one link packet: send it as a Resource
+                        // over the link, exactly as LXMF does for large DIRECT
+                        // messages. The receiver's RESOURCE_PRF is the proof.
+                        match make_resource_on_link(shared, trng, &lid, &outbox[i].packed) {
+                            Some(res_hash) => {
+                                outbox[i].in_flight = Some(res_hash);
+                                outbox[i].attempts += 1;
+                                outbox[i].next_action = now + RESOURCE_RETRY;
+                                chat::cf_set_status_text(
+                                    chat_cid,
+                                    &format!("{label}: transferring (large message)…"),
+                                );
+                            }
+                            None => outbox[i].next_action = now + 1,
+                        }
+                    }
                     Some(lid) => {
                         let mut iv = [0u8; IV_LENGTH];
                         crate::fill_random(trng, &mut iv);

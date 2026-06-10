@@ -192,6 +192,11 @@ pub struct Transport {
     /// Outstanding link DATA packets awaiting a proof: packet hash -> link id.
     receipts: HashMap<[u8; 32], [u8; TRUNCATED_HASHLENGTH]>,
     receipts_order: VecDeque<[u8; 32]>,
+    /// Outbound Resource transfers in progress on links we initiated (one per
+    /// link): how a message too large for a single link packet is sent. The
+    /// receiver's RESOURCE_PRF retires it (surfaced as Event::Delivered with
+    /// the resource hash).
+    out_resources: HashMap<[u8; TRUNCATED_HASHLENGTH], crate::resource::ResourceSender>,
     /// Outstanding opportunistic packets awaiting a delivery proof, keyed by the
     /// truncated packet hash (== the proof's destination).
     opp_receipts: HashMap<[u8; TRUNCATED_HASHLENGTH], OppReceipt>,
@@ -217,6 +222,7 @@ impl Transport {
             receipts_order: VecDeque::new(),
             opp_receipts: HashMap::new(),
             opp_receipts_order: VecDeque::new(),
+            out_resources: HashMap::new(),
         }
     }
 
@@ -412,6 +418,20 @@ impl Transport {
                 }
                 None => Event::Dropped("invalid LRPROOF for initiated link"),
             };
+        }
+
+        // 0a-2. Resource proof (RESOURCE_PRF) confirming an outbound Resource we
+        // served on a link finished and verified at the receiver — the delivery
+        // confirmation for a message too large for one link packet. Unencrypted,
+        // addressed to the link.
+        if packet.packet_type == PACKET_PROOF && packet.context == CONTEXT_RESOURCE_PRF {
+            if let Some(tx) = self.out_resources.get(&packet.destination_hash) {
+                if tx.proof_is_valid(&packet.data) {
+                    let hash = tx.resource_hash();
+                    self.out_resources.remove(&packet.destination_hash);
+                    return Event::Delivered { packet_hash: hash };
+                }
+            }
         }
 
         // 0b. Packet proof (receipt) confirming a link DATA packet we sent.
@@ -813,6 +833,7 @@ impl Transport {
     }
 
     fn remove_out_link(&mut self, link_id: &[u8; TRUNCATED_HASHLENGTH]) {
+        self.out_resources.remove(link_id);
         self.out_links.remove(link_id);
         self.out_links_order.retain(|i| i != link_id);
     }
@@ -834,6 +855,7 @@ impl Transport {
         self.receipts_order.clear();
         self.opp_receipts.clear();
         self.opp_receipts_order.clear();
+        self.out_resources.clear();
     }
 
     /// Build the RTT activation packet for an established outbound link (see
@@ -912,6 +934,68 @@ impl Transport {
     ) -> Option<Vec<u8>> {
         let key = self.out_links.get(link_id)?.key;
         link::make_link_context_packet(link_id, &key, context, plaintext, iv).ok()
+    }
+
+    /// Start sending `data` as a Resource on an established outbound link — for
+    /// a message too large for a single link DATA packet (LXMF sends
+    /// `LXMessage.packed` / `propagation_packed` this way). Returns the
+    /// link-encrypted `RESOURCE_ADV` packet to transmit and the resource hash
+    /// (the receipt key: the receiver's RESOURCE_PRF surfaces
+    /// `Event::Delivered` with it). One in-flight resource per link — a new
+    /// one replaces (restarts) the old. `r`/`prefix`/`iv`/`adv_iv` are fresh
+    /// random bytes from the caller's TRNG.
+    pub fn make_link_resource(
+        &mut self,
+        link_id: &[u8; TRUNCATED_HASHLENGTH],
+        data: &[u8],
+        r: [u8; 4],
+        prefix: [u8; 4],
+        iv: &[u8; IV_LENGTH],
+        adv_iv: &[u8; IV_LENGTH],
+    ) -> Option<(Vec<u8>, [u8; 32])> {
+        let key = self.out_links.get(link_id)?.key;
+        let tx = crate::resource::ResourceSender::new(data, &key, r, prefix, iv);
+        let hash = tx.resource_hash();
+        let adv = link::make_link_context_packet(
+            link_id,
+            &key,
+            CONTEXT_RESOURCE_ADV,
+            &tx.advertisement(),
+            adv_iv,
+        )
+        .ok()?;
+        self.out_resources.insert(*link_id, tx);
+        Some((adv, hash))
+    }
+
+    /// Serve a receiver's `RESOURCE_REQ` (link-decrypted plaintext) for the
+    /// Resource in flight on `link_id`: returns the raw packets to transmit —
+    /// the requested parts (raw `CONTEXT_RESOURCE` DATA: parts are chunks of
+    /// the already-encrypted stream) and, if asked, a link-encrypted
+    /// `RESOURCE_HMU` page. Empty if no resource is in flight on this link.
+    pub fn serve_link_resource(
+        &self,
+        link_id: &[u8; TRUNCATED_HASHLENGTH],
+        req_plaintext: &[u8],
+        hmu_iv: &[u8; IV_LENGTH],
+    ) -> Vec<Vec<u8>> {
+        let (tx, key) = match (self.out_resources.get(link_id), self.out_links.get(link_id)) {
+            (Some(tx), Some(l)) => (tx, l.key),
+            _ => return Vec::new(),
+        };
+        let (parts, hmu) = tx.handle_request(req_plaintext);
+        let mut out: Vec<Vec<u8>> = parts
+            .into_iter()
+            .map(|p| Packet::header1(DEST_LINK, PACKET_DATA, CONTEXT_RESOURCE, *link_id, p).encode())
+            .collect();
+        if let Some(hmu) = hmu {
+            if let Ok(raw) =
+                link::make_link_context_packet(link_id, &key, CONTEXT_RESOURCE_HMU, &hmu, hmu_iv)
+            {
+                out.push(raw);
+            }
+        }
+        out
     }
 
     /// Build an encrypted DATA packet with an arbitrary `context` on an
@@ -1191,6 +1275,86 @@ mod tests {
         psalt.extend_from_slice(&res_hash);
         expected.extend_from_slice(&full_hash(&psalt));
         assert_eq!(decoded.data, expected, "proof must be hash || full_hash(payload||hash)");
+    }
+
+    #[test]
+    fn outbound_resource_delivers_and_gets_proof() {
+        use crate::resource::ResourceReceiver;
+        // Initiator sends a >1-packet message as a Resource over the link;
+        // the responder downloads it with the inbound machinery and its
+        // RESOURCE_PRF surfaces Event::Delivered with the resource hash.
+        let initiator_id = id(0x80);
+        let responder_id = id(0x90);
+        let responder_dh = single_destination_hash("lxmf", &["delivery"], &responder_id.hash());
+        let mut initiator = Transport::new(initiator_id);
+        let mut responder = Transport::new(responder_id);
+        responder.register_destination(responder_dh);
+        let mut eph = || [0x77u8; KEY_HALF];
+        let peer_pub = PrivateIdentity::from_bytes(&[0x90; KEY_HALF], &[0x91; KEY_HALF]).public().clone();
+        let (req, lid) = initiator.make_link_request(&responder_dh, &peer_pub, &[1; KEY_HALF], &[2; KEY_HALF], 1000);
+        let proof = match responder.handle_frame(&req, &mut eph) {
+            Event::LinkEstablished { proof, .. } => proof,
+            _ => panic!("responder should accept the link"),
+        };
+        match initiator.handle_frame(&proof, &mut eph) {
+            Event::OutboundLinkUp { .. } => {}
+            _ => panic!("expected outbound link up"),
+        }
+
+        let data: Vec<u8> = (0..5000u32).map(|i| (i * 11) as u8).collect();
+        let (adv_pkt, res_hash) = initiator
+            .make_link_resource(&lid, &data, [1, 2, 3, 4], [5, 6, 7, 8], &[0x10; IV_LENGTH], &[0x11; IV_LENGTH])
+            .expect("resource started");
+
+        let mut rx = match responder.handle_frame(&adv_pkt, &mut eph) {
+            Event::InLinkData { context, plaintext, .. } => {
+                assert_eq!(context, CONTEXT_RESOURCE_ADV);
+                ResourceReceiver::accept(&plaintext).expect("accept our own ADV")
+            }
+            other => panic!("expected ADV, got {:?}", core::mem::discriminant(&other)),
+        };
+
+        // Drive the transfer: receiver request → initiator serves → parts in.
+        let mut guard = 0;
+        while !rx.is_complete() {
+            let req = rx.next_request().expect("next step");
+            let req_pkt = responder
+                .make_in_link_context(&lid, CONTEXT_RESOURCE_REQ, &req, &[0x12; IV_LENGTH])
+                .expect("request packet");
+            // The initiator's transport surfaces the REQ decrypted…
+            let req_plain = match initiator.handle_frame(&req_pkt, &mut eph) {
+                Event::OutLinkData { context, plaintext, .. } => {
+                    assert_eq!(context, CONTEXT_RESOURCE_REQ);
+                    plaintext
+                }
+                other => panic!("expected REQ, got {:?}", core::mem::discriminant(&other)),
+            };
+            // …and serve_link_resource answers with parts (+HMU when asked).
+            for raw in initiator.serve_link_resource(&lid, &req_plain, &[0x13; IV_LENGTH]) {
+                match responder.handle_frame(&raw, &mut eph) {
+                    Event::InLinkData { context: CONTEXT_RESOURCE, plaintext, .. } => {
+                        rx.receive_part(&plaintext);
+                    }
+                    Event::InLinkData { context: CONTEXT_RESOURCE_HMU, plaintext, .. } => {
+                        rx.receive_hashmap_update(&plaintext).expect("hmu");
+                    }
+                    other => panic!("unexpected frame {:?}", core::mem::discriminant(&other)),
+                }
+            }
+            guard += 1;
+            assert!(guard < 100, "did not converge");
+        }
+
+        let stream = responder.decrypt_in_link(&lid, &rx.concat()).expect("stream decrypt");
+        let (payload, proof_data) = rx.finish(&stream).expect("finish");
+        assert_eq!(payload, data);
+        let prf = responder.make_in_link_resource_proof(&lid, &proof_data).expect("proof packet");
+        match initiator.handle_frame(&prf, &mut eph) {
+            Event::Delivered { packet_hash } => assert_eq!(packet_hash, res_hash),
+            other => panic!("expected delivered, got {:?}", core::mem::discriminant(&other)),
+        }
+        // Retired: a replayed proof no longer matches.
+        assert!(!matches!(initiator.handle_frame(&prf, &mut eph), Event::Delivered { .. }));
     }
 
     /// A full link setup between two in-process transports, returning the

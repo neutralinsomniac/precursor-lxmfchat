@@ -41,6 +41,13 @@ const DECOMPRESSED_MAX: u64 = 256 * 1024;
 /// limit. ~600 parts.
 pub const MAX_TRANSFER_BYTES: usize = 256 * 1024;
 
+/// Bytes per Resource part — the chunk size BOTH sides must agree on, because
+/// a receiver ignores the advertised part count and recomputes it as
+/// `ceil(t / sdu)` (`Resource.accept`): `sdu = MTU(500) − HEADER_MAXSIZE(35)
+/// − IFAC_MIN_SIZE(1)`. Mismatching this desyncs the receiver's part/hashmap
+/// indexing entirely (found the hard way against a real RNS receiver).
+pub const RESOURCE_SDU: usize = 464;
+
 /// Bytes per map-hash (`Resource.MAPHASH_LEN`).
 const MAPHASH_LEN: usize = 4;
 /// Random-hash size, both the stream prefix and the hash salt (`RANDOM_HASH_SIZE`).
@@ -120,7 +127,7 @@ impl ResourceReceiver {
             return Err("resource advertisement has no parts");
         }
         // SDU-sized parts: bound the whole transfer by the device budget.
-        if adv.parts > MAX_TRANSFER_BYTES / 431 + 1 {
+        if adv.parts > MAX_TRANSFER_BYTES / RESOURCE_SDU + 1 {
             return Err("resource too large");
         }
         // The advertisement carries (at most) the first page of map-hashes.
@@ -308,6 +315,211 @@ impl ResourceReceiver {
         proof_data.extend_from_slice(&self.hash);
         proof_data.extend_from_slice(&full_hash(&proof_salted));
         Ok((payload, proof_data))
+    }
+}
+
+/// The SENDER half: serve a blob to a remote Resource receiver over a link —
+/// how a message too large for one link packet is transmitted (LXMF sends
+/// `LXMessage.packed` this way for DIRECT, and `propagation_packed` for
+/// PROPAGATED). Single-segment, uncompressed (we carry no bz2 encoder; the
+/// `compressed` flag is optional), encrypted (the whole stream is
+/// link-encrypted once, parts are raw chunks of that ciphertext).
+///
+/// Sans-IO: the caller link-encrypts/sends the advertisement, feeds inbound
+/// `RESOURCE_REQ` plaintexts to [`Self::handle_request`] and transmits what it
+/// returns, and validates the final `RESOURCE_PRF` with
+/// [`Self::proof_is_valid`].
+pub struct ResourceSender {
+    hash: [u8; 32],
+    expected_proof: [u8; 32],
+    random_hash: [u8; RANDOM_HASH_SIZE],
+    parts: Vec<Vec<u8>>,
+    map_hashes: Vec<[u8; MAPHASH_LEN]>,
+    /// Uncompressed data size (advertisement `d`).
+    data_size: usize,
+    /// Encrypted transfer size (advertisement `t`).
+    transfer_size: usize,
+}
+
+impl ResourceSender {
+    /// Build the resource exactly as `RNS.Resource.__init__` does for
+    /// link-borne data: `stream = prefix(4) || data`, link-encrypted with the
+    /// session `key`, split into [`RESOURCE_SDU`]-sized parts;
+    /// `hash = full_hash(data || r)` over the PLAINTEXT data. `r`, `prefix`
+    /// and `iv` are fresh random bytes from the caller's TRNG.
+    pub fn new(
+        data: &[u8],
+        key: &[u8; crate::constants::DERIVED_KEY_LENGTH],
+        r: [u8; RANDOM_HASH_SIZE],
+        prefix: [u8; RANDOM_HASH_SIZE],
+        iv: &[u8; crate::constants::IV_LENGTH],
+    ) -> ResourceSender {
+        let mut stream = prefix.to_vec();
+        stream.extend_from_slice(data);
+        let ciphertext =
+            crate::crypto::Token::new(key).expect("link key").encrypt_with_iv(&stream, iv);
+
+        let mut parts = Vec::new();
+        let mut map_hashes = Vec::new();
+        for chunk in ciphertext.chunks(RESOURCE_SDU) {
+            let mut salted = chunk.to_vec();
+            salted.extend_from_slice(&r);
+            let mut mh = [0u8; MAPHASH_LEN];
+            mh.copy_from_slice(&full_hash(&salted)[..MAPHASH_LEN]);
+            map_hashes.push(mh);
+            parts.push(chunk.to_vec());
+        }
+
+        let mut hsalt = data.to_vec();
+        hsalt.extend_from_slice(&r);
+        let hash = full_hash(&hsalt);
+        let mut psalt = data.to_vec();
+        psalt.extend_from_slice(&hash);
+        let expected_proof = full_hash(&psalt);
+
+        ResourceSender {
+            hash,
+            expected_proof,
+            random_hash: r,
+            parts,
+            map_hashes,
+            data_size: data.len(),
+            transfer_size: ciphertext.len(),
+        }
+    }
+
+    pub fn resource_hash(&self) -> [u8; 32] { self.hash }
+
+    /// The `RESOURCE_ADV` plaintext: the umsgpack map `ResourceAdvertisement.
+    /// pack` emits, fields `t,d,n,h,r,o,i,l,q,f,m` — `o` = `h` (unsplit),
+    /// `i`=1, `l`=1, `q`=nil (not a request/response), `f`=0x01 (encrypted,
+    /// uncompressed, unsplit, no metadata), `m` = the first hashmap page.
+    pub fn advertisement(&self) -> Vec<u8> {
+        fn uint(out: &mut Vec<u8>, v: u64) {
+            if v < 128 {
+                out.push(v as u8);
+            } else if v <= u8::MAX as u64 {
+                out.push(0xcc);
+                out.push(v as u8);
+            } else if v <= u16::MAX as u64 {
+                out.push(0xcd);
+                out.extend_from_slice(&(v as u16).to_be_bytes());
+            } else {
+                out.push(0xce);
+                out.extend_from_slice(&(v as u32).to_be_bytes());
+            }
+        }
+        fn bin(out: &mut Vec<u8>, b: &[u8]) {
+            if b.len() <= u8::MAX as usize {
+                out.push(0xc4);
+                out.push(b.len() as u8);
+            } else {
+                out.push(0xc5);
+                out.extend_from_slice(&(b.len() as u16).to_be_bytes());
+            }
+            out.extend_from_slice(b);
+        }
+        fn key(out: &mut Vec<u8>, k: u8) {
+            out.push(0xa1);
+            out.push(k);
+        }
+        let page0: Vec<u8> = self
+            .map_hashes
+            .iter()
+            .take(HASHMAP_MAX_LEN)
+            .flat_map(|h| h.to_vec())
+            .collect();
+        let mut out = vec![0x8b]; // fixmap, 11 entries
+        key(&mut out, b't'); uint(&mut out, self.transfer_size as u64);
+        key(&mut out, b'd'); uint(&mut out, self.data_size as u64);
+        key(&mut out, b'n'); uint(&mut out, self.parts.len() as u64);
+        key(&mut out, b'h'); bin(&mut out, &self.hash);
+        key(&mut out, b'r'); bin(&mut out, &self.random_hash);
+        key(&mut out, b'o'); bin(&mut out, &self.hash); // original hash = ours (unsplit)
+        key(&mut out, b'i'); uint(&mut out, 1);
+        key(&mut out, b'l'); uint(&mut out, 1);
+        key(&mut out, b'q'); out.push(0xc0); // nil: not a request/response resource
+        key(&mut out, b'f'); uint(&mut out, 0x01); // encrypted only
+        key(&mut out, b'm'); bin(&mut out, &page0);
+        out
+    }
+
+    /// Serve a receiver's `RESOURCE_REQ` (link-decrypted plaintext):
+    /// `flag(1) [last_map_hash(4) if exhausted] hash(32) wanted-map-hashes…`.
+    /// Returns the raw part chunks to transmit (as `CONTEXT_RESOURCE` link
+    /// DATA, NOT re-encrypted) and, if the receiver's hashmap is exhausted,
+    /// the next hashmap-update plaintext (`hash(32) || umsgpack([page,
+    /// bytes])`) to link-encrypt as `CONTEXT_RESOURCE_HMU`. Mirrors
+    /// `Resource.request`.
+    pub fn handle_request(&self, req: &[u8]) -> (Vec<Vec<u8>>, Option<Vec<u8>>) {
+        if req.is_empty() {
+            return (Vec::new(), None);
+        }
+        let exhausted = req[0] == HASHMAP_EXHAUSTED;
+        let body = &req[1..];
+        let (last_hash, body) = if exhausted {
+            if body.len() < MAPHASH_LEN + 32 {
+                return (Vec::new(), None);
+            }
+            (Some(&body[..MAPHASH_LEN]), &body[MAPHASH_LEN..])
+        } else {
+            if body.len() < 32 {
+                return (Vec::new(), None);
+            }
+            (None, body)
+        };
+        if body[..32] != self.hash {
+            return (Vec::new(), None); // some other resource's request
+        }
+        let mut out = Vec::new();
+        for w in body[32..].chunks_exact(MAPHASH_LEN) {
+            if let Some(i) = self.map_hashes.iter().position(|h| h == w) {
+                out.push(self.parts[i].clone());
+            }
+        }
+        let hmu = last_hash.and_then(|lh| {
+            // The receiver's known hashmap always ends on a page boundary
+            // (the ADV page and every update are HASHMAP_MAX_LEN entries);
+            // serve the page after the one containing `lh`.
+            let idx = self.map_hashes.iter().position(|h| h == lh)?;
+            if (idx + 1) % HASHMAP_MAX_LEN != 0 {
+                return None; // sequencing error; reference cancels here
+            }
+            let page = (idx + 1) / HASHMAP_MAX_LEN;
+            let bytes: Vec<u8> = self
+                .map_hashes
+                .iter()
+                .skip(page * HASHMAP_MAX_LEN)
+                .take(HASHMAP_MAX_LEN)
+                .flat_map(|h| h.to_vec())
+                .collect();
+            let mut hmu = self.hash.to_vec();
+            hmu.push(0x92); // fixarray(2)
+            if page < 128 {
+                hmu.push(page as u8);
+            } else {
+                hmu.push(0xcd);
+                hmu.extend_from_slice(&(page as u16).to_be_bytes());
+            }
+            if bytes.len() <= u8::MAX as usize {
+                hmu.push(0xc4);
+                hmu.push(bytes.len() as u8);
+            } else {
+                hmu.push(0xc5);
+                hmu.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+            }
+            hmu.extend_from_slice(&bytes);
+            Some(hmu)
+        });
+        (out, hmu)
+    }
+
+    /// True iff `proof_data` (a `RESOURCE_PRF` payload) proves this resource:
+    /// `hash(32) || full_hash(data || hash)`.
+    pub fn proof_is_valid(&self, proof_data: &[u8]) -> bool {
+        proof_data.len() == 64
+            && proof_data[..32] == self.hash
+            && proof_data[32..] == self.expected_proof
     }
 }
 
@@ -686,6 +898,43 @@ mod tests {
         let decrypted = Token::new(&key).unwrap().decrypt(&rx.concat()).expect("token");
         let (got, _proof) = rx.finish(&decrypted).expect("finish");
         assert_eq!(got, payload, "recovered 60 KB payload must match");
+    }
+
+    #[test]
+    fn sender_and_receiver_complete_a_transfer_end_to_end() {
+        // Our ResourceSender serving our ResourceReceiver: validates the
+        // advertisement BUILDER against the PARSER, multi-page hashmaps, the
+        // window pump, and the final proof — the full outbound path for a
+        // large direct message.
+        let key = [0x42_u8; DERIVED_KEY_LENGTH];
+        let data: Vec<u8> = (0..50_000u32).map(|i| (i * 13 + i / 97) as u8).collect();
+        let tx = ResourceSender::new(&data, &key, [9, 8, 7, 6], [1, 2, 3, 4], &[0x33; 16]);
+        assert!(tx.parts.len() > HASHMAP_MAX_LEN, "must take multiple hashmap pages");
+
+        let mut rx = ResourceReceiver::accept(&tx.advertisement()).expect("receiver accepts our ADV");
+        assert!(rx.encrypted());
+        let mut hmus = 0;
+        let mut guard = 0;
+        while !rx.is_complete() {
+            let req = rx.next_request().expect("a next step");
+            let (parts, hmu) = tx.handle_request(&req);
+            for p in &parts {
+                rx.receive_part(p);
+            }
+            if let Some(h) = hmu {
+                hmus += 1;
+                rx.receive_hashmap_update(&h).expect("hashmap update");
+            }
+            guard += 1;
+            assert!(guard < 1000, "did not converge");
+        }
+        assert!(hmus >= 1, "transfer must have paged the hashmap");
+
+        let stream = Token::new(&key).unwrap().decrypt(&rx.concat()).expect("token");
+        let (payload, proof) = rx.finish(&stream).expect("finish");
+        assert_eq!(payload, data);
+        assert!(tx.proof_is_valid(&proof), "sender must accept the receiver's proof");
+        assert!(!tx.proof_is_valid(&proof[..63]), "truncated proof rejected");
     }
 
     #[test]

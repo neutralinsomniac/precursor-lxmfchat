@@ -220,12 +220,35 @@ fn main() {
                             let msg = message::pack(
                                 tp.identity(), &lt, &our_dh, now() as f64, b"", text.as_bytes(), &Fields::new(), None,
                             );
-                            let mut iv = [0u8; 16];
-                            rand_core::RngCore::fill_bytes(&mut OsRng, &mut iv);
-                            if let Some((raw, ph)) = tp.make_link_data(&link_id, &msg.packed, &iv) {
-                                writer.write_all(&frame(&raw)).ok();
-                                writer.flush().ok();
-                                println!("sent direct LXMF over link ({} bytes), awaiting proof {}", raw.len(), reticulum_core::hex(&ph));
+                            if msg.packed.len() > 431 {
+                                // Too big for one link packet: send as a Resource.
+                                let mut r = [0u8; 4];
+                                let mut pf = [0u8; 4];
+                                let mut iv = [0u8; 16];
+                                let mut aiv = [0u8; 16];
+                                rand_core::RngCore::fill_bytes(&mut OsRng, &mut r);
+                                rand_core::RngCore::fill_bytes(&mut OsRng, &mut pf);
+                                rand_core::RngCore::fill_bytes(&mut OsRng, &mut iv);
+                                rand_core::RngCore::fill_bytes(&mut OsRng, &mut aiv);
+                                if let Some((adv, h)) =
+                                    tp.make_link_resource(&link_id, &msg.packed, r, pf, &iv, &aiv)
+                                {
+                                    writer.write_all(&frame(&adv)).ok();
+                                    writer.flush().ok();
+                                    println!(
+                                        "sent RESOURCE advertisement ({} bytes payload), awaiting proof {}",
+                                        msg.packed.len(),
+                                        reticulum_core::hex(&h)
+                                    );
+                                }
+                            } else {
+                                let mut iv = [0u8; 16];
+                                rand_core::RngCore::fill_bytes(&mut OsRng, &mut iv);
+                                if let Some((raw, ph)) = tp.make_link_data(&link_id, &msg.packed, &iv) {
+                                    writer.write_all(&frame(&raw)).ok();
+                                    writer.flush().ok();
+                                    println!("sent direct LXMF over link ({} bytes), awaiting proof {}", raw.len(), reticulum_core::hex(&ph));
+                                }
                             }
                         }
                     }
@@ -259,6 +282,20 @@ fn main() {
                         }
                     }
                     Event::OutLinkData { link_id, context, plaintext } => {
+                        // Serve part requests for a Resource we're sending.
+                        if context == CONTEXT_RESOURCE_REQ {
+                            let mut iv = [0u8; 16];
+                            rand_core::RngCore::fill_bytes(&mut OsRng, &mut iv);
+                            let packets = tp.serve_link_resource(&link_id, &plaintext, &iv);
+                            if !packets.is_empty() {
+                                println!("serving {} resource packet(s)", packets.len());
+                                for p in packets {
+                                    writer.write_all(&frame(&p)).ok();
+                                }
+                                writer.flush().ok();
+                                continue;
+                            }
+                        }
                         sync_handle_outlink(&mut writer, &tp, &mut sync_phase, &mut sync_rx, &link_id, context, plaintext);
                     }
                     Event::InLinkData { link_id, context, plaintext } => {
