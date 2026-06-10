@@ -244,8 +244,8 @@ pub struct Shared {
     /// last — so a contact can be shared by simply messaging us their address
     /// ("here's Bob: <hex>") and imported from the menu, with no announce and
     /// no manual hex entry. Each entry: (address, label of who sent it, when).
-    /// Bounded; in-memory only (the carrying message persists in its thread,
-    /// so a missed import can be re-found by re-sending).
+    /// Bounded; persisted (PDDB `found_addrs`) so an address received before a
+    /// reboot is still importable after it.
     pub found_addrs: Mutex<Vec<([u8; TRUNCATED_HASHLENGTH], String, u64)>>,
     /// Delivery stamp costs peers have announced (msgpack element 1 of an
     /// lxmf.delivery announce). A message to one of these peers must carry a
@@ -943,6 +943,9 @@ fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, l
             while found.len() > MAX_FOUND_ADDRS {
                 found.remove(0);
             }
+            // Persist: an address received before a reboot stays importable
+            // after it (restored scrollback never re-runs this scan).
+            crate::persist_found_addrs(pddb, &found);
             drop(found);
             chat::cf_set_status_text(chat_cid, "address received — menu \u{2192} Import contact");
         }

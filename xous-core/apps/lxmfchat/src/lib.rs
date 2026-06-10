@@ -195,7 +195,7 @@ impl<'a> LxmfChat<'a> {
             sync: Mutex::new(net::SyncState::new()),
             in_resources: Mutex::new(BTreeMap::new()),
             stamp_costs: Mutex::new(BTreeMap::new()),
-            found_addrs: Mutex::new(Vec::new()),
+            found_addrs: Mutex::new(load_found_addrs(&pddb)),
             llio: llio::Llio::new(&xns),
             hub: Mutex::new(hub.clone()),
             unread: Mutex::new(unread_map),
@@ -584,7 +584,11 @@ impl<'a> LxmfChat<'a> {
                 let name = p.first().as_str().trim().to_string();
                 let name = if name.is_empty() { hex(&addr) } else { name };
                 save_contact(&self.shared, &self.pddb, &addr, &name);
-                plock(&self.shared.found_addrs).retain(|(a, _, _)| *a != addr);
+                {
+                    let mut found = plock(&self.shared.found_addrs);
+                    found.retain(|(a, _, _)| *a != addr);
+                    persist_found_addrs(&self.pddb, &found);
+                }
                 self.activate_peer(&addr);
                 self.chat.set_status_text(&format!("added {}", name));
             }
@@ -806,6 +810,71 @@ fn write_string(pddb: &Pddb, key: &str, value: &str) {
         k.write(value.as_bytes()).ok();
         pddb.sync().ok();
     }
+}
+
+/// PDDB key (under `PDDB_DICT`) for addresses received in message text and not
+/// yet imported as contacts. Records: `addr(16) || ts(8 BE) || from_len(4 BE)
+/// || from`. Persisted so an address received before a reboot is still
+/// importable after it (the restored scrollback never re-runs `deliver_lxmf`,
+/// so it can't be re-scanned).
+const KEY_FOUND_ADDRS: &str = "found_addrs";
+
+/// Write the whole found-address list (empty list deletes the key).
+/// Delete-then-write with `write_all`: a shorter rewrite must not leave a
+/// stale tail (PDDB writes don't truncate).
+pub(crate) fn persist_found_addrs(pddb: &Pddb, list: &[([u8; TRUNCATED_HASHLENGTH], String, u64)]) {
+    pddb.delete_key(PDDB_DICT, KEY_FOUND_ADDRS, None).ok();
+    if list.is_empty() {
+        pddb.sync().ok();
+        return;
+    }
+    let mut buf = Vec::new();
+    for (addr, from, ts) in list {
+        buf.extend_from_slice(addr);
+        buf.extend_from_slice(&ts.to_be_bytes());
+        buf.extend_from_slice(&(from.len() as u32).to_be_bytes());
+        buf.extend_from_slice(from.as_bytes());
+    }
+    if let Ok(mut k) = pddb.get(PDDB_DICT, KEY_FOUND_ADDRS, None, true, true, Some(buf.len()), None::<fn()>)
+    {
+        k.write_all(&buf).ok();
+        pddb.sync().ok();
+    }
+}
+
+/// Load the persisted found-address list at startup (tolerates a missing key;
+/// a malformed record ends the parse — better a short list than a bogus one).
+fn load_found_addrs(pddb: &Pddb) -> Vec<([u8; TRUNCATED_HASHLENGTH], String, u64)> {
+    let mut buf = Vec::new();
+    match pddb.get(PDDB_DICT, KEY_FOUND_ADDRS, None, false, false, None, None::<fn()>) {
+        Ok(mut k) => {
+            if k.read_to_end(&mut buf).is_err() {
+                return Vec::new();
+            }
+        }
+        Err(_) => return Vec::new(),
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + TRUNCATED_HASHLENGTH + 12 <= buf.len() {
+        let mut addr = [0u8; TRUNCATED_HASHLENGTH];
+        addr.copy_from_slice(&buf[i..i + TRUNCATED_HASHLENGTH]);
+        i += TRUNCATED_HASHLENGTH;
+        let mut ts8 = [0u8; 8];
+        ts8.copy_from_slice(&buf[i..i + 8]);
+        i += 8;
+        let mut len4 = [0u8; 4];
+        len4.copy_from_slice(&buf[i..i + 4]);
+        i += 4;
+        let flen = u32::from_be_bytes(len4) as usize;
+        if i + flen > buf.len() {
+            break;
+        }
+        let from = String::from_utf8_lossy(&buf[i..i + flen]).into_owned();
+        i += flen;
+        out.push((addr, from, u64::from_be_bytes(ts8)));
+    }
+    out
 }
 
 fn unhex(s: &str) -> Option<Vec<u8>> {
