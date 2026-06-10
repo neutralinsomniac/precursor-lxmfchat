@@ -223,7 +223,7 @@ impl<'a> LxmfChat<'a> {
             let t1 = std::time::Instant::now();
             let ok = pubid.validate(&sig, b"selftest timing");
             let verify_ms = t1.elapsed().as_millis();
-            format!("{st} sign:{sign_ms}ms verify(sw):{verify_ms}ms:{}", if ok { "OK" } else { "FAIL" })
+            format!("{st} sign(sw):{sign_ms}ms verify(sw):{verify_ms}ms:{}", if ok { "OK" } else { "FAIL" })
         };
         log::info!("crypto self-test: {}", st);
         let post = Post {

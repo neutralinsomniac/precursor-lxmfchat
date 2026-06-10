@@ -207,6 +207,57 @@ fn modl(r: &mut [u8; 32], x: &mut [i64; 64]) {
     }
 }
 
+/// Produce a detached Ed25519 signature (RFC 8032, deterministic) — the
+/// TweetNaCl `crypto_sign` core. `seed` is the 32-byte private seed,
+/// `public_key` the matching compressed public key (passed in so we don't pay
+/// an extra scalar-mult deriving it).
+///
+/// Software for the same reason as [`verify`]: the hardware engine measured
+/// 3.2 s per *sign* on device; this runs in a fraction of that and keeps every
+/// signature operation off the engine entirely.
+pub fn sign(seed: &[u8; 32], public_key: &[u8; 32], message: &[u8]) -> [u8; 64] {
+    // Expanded secret: scalar a (clamped low half) + prefix (high half).
+    let d = sha512(seed);
+    let mut a = [0u8; 32];
+    a.copy_from_slice(&d[..32]);
+    a[0] &= 248;
+    a[31] &= 127;
+    a[31] |= 64;
+
+    // r = H(prefix || M) mod l ; R = r·B
+    let mut pre = Vec::with_capacity(32 + message.len());
+    pre.extend_from_slice(&d[32..]);
+    pre.extend_from_slice(message);
+    let r = reduce(&sha512(&pre));
+    let big_r = pack_point(&scalarbase(&r));
+
+    // h = H(R || A || M) mod l
+    let mut hin = Vec::with_capacity(64 + message.len());
+    hin.extend_from_slice(&big_r);
+    hin.extend_from_slice(public_key);
+    hin.extend_from_slice(message);
+    let h = reduce(&sha512(&hin));
+
+    // s = (r + h·a) mod l, accumulated per byte exactly as TweetNaCl's modL
+    // expects (products fit comfortably in i64).
+    let mut x = [0i64; 64];
+    for i in 0..32 {
+        x[i] = r[i] as i64;
+    }
+    for i in 0..32 {
+        for j in 0..32 {
+            x[i + j] += (h[i] as i64) * (a[j] as i64);
+        }
+    }
+    let mut s = [0u8; 32];
+    modl(&mut s, &mut x);
+
+    let mut sig = [0u8; 64];
+    sig[..32].copy_from_slice(&big_r);
+    sig[32..].copy_from_slice(&s);
+    sig
+}
+
 /// Verify a detached Ed25519 signature. `true` iff valid.
 pub fn verify(public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
     let q = match unpackneg(public_key) {
@@ -386,6 +437,50 @@ mod tests {
         assert!(!verify(&pk3, &unhex("af82"), &bad));
         // Wrong message must fail.
         assert!(!verify(&pk3, &unhex("af83"), &sig3));
+    }
+
+    #[test]
+    fn rfc8032_test_vectors_sign() {
+        // RFC 8032 §7.1 TEST 1: signing must reproduce the exact vector.
+        let seed: [u8; 32] =
+            unhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60").try_into().unwrap();
+        let pk: [u8; 32] =
+            unhex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a").try_into().unwrap();
+        let expected: [u8; 64] = unhex(
+            "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155\
+             5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(sign(&seed, &pk, b""), expected);
+
+        // TEST 3 (message af82).
+        let seed3: [u8; 32] =
+            unhex("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7").try_into().unwrap();
+        let pk3: [u8; 32] =
+            unhex("fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025").try_into().unwrap();
+        let expected3: [u8; 64] = unhex(
+            "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac\
+             18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a",
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(sign(&seed3, &pk3, &unhex("af82")), expected3);
+    }
+
+    #[test]
+    fn dalek_verifies_our_signature() {
+        // Cross-check the other way: dalek (software on host) must accept what
+        // we sign — proves on-wire compatibility with every RNS peer.
+        use ed25519_dalek::{Signature, Verifier, SigningKey};
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let msg = b"tweetnacl sign, dalek verify";
+        let sig = sign(&[9u8; 32], &pk, msg);
+        let vk = sk.verifying_key();
+        assert!(vk.verify(msg, &Signature::from_bytes(&sig)).is_ok());
+        // And our own verify accepts it too.
+        assert!(verify(&pk, msg, &sig));
     }
 
     #[test]

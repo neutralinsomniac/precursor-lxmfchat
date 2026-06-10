@@ -2,7 +2,7 @@
 //! and the per-recipient encrypt/decrypt + sign/validate operations.
 //! Mirrors `RNS/Identity.py`.
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use zeroize::Zeroize;
 
 use crate::constants::*;
@@ -131,8 +131,14 @@ impl PrivateIdentity {
     }
 
     /// Ed25519 signature over `message` (RNS `sign`).
+    ///
+    /// Vendored software implementation ([`crate::ed25519`]) — the Precursor's
+    /// hardware engine measured 3.2 s per sign (and worse per verify); the
+    /// software path is several times faster and engine-independent. Same RFC
+    /// 8032 output as `ed25519-dalek` (cross-tested), so nothing on the wire
+    /// changes. `ed25519-dalek` remains only for public-key derivation.
     pub fn sign(&self, message: &[u8]) -> [u8; SIG_LENGTH] {
-        self.ed25519.sign(message).to_bytes()
+        crate::ed25519::sign(&self.ed25519.to_bytes(), &self.public.sig_pub, message)
     }
 
     /// Decrypt a blob produced by `PublicIdentity::encrypt` (RNS `Identity.decrypt`).
