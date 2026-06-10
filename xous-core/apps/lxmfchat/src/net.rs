@@ -285,12 +285,30 @@ fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// Block until libstd's wall-clock time server is up. `SystemTime::now()`
+/// panics *inside libstd* ("failed to request utc time in ms") when called
+/// before the dns service registers the well-known "timeserverpublic" server —
+/// and as the boot app, our network threads (spawned on the first Focus, i.e.
+/// within milliseconds of boot) can win that race. Call once at the top of any
+/// thread that uses wall-clock time. Hosted mode uses the host clock directly;
+/// nothing to wait for there.
+fn wait_for_time_server() {
+    #[cfg(target_os = "xous")]
+    loop {
+        if xous::connect(xous::SID::from_bytes(b"timeserverpublic").unwrap()).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
 /// Connection manager: keeps a live connection to `shared.hub`, automatically
 /// reconnecting (with capped backoff) whenever it drops. Runs for the lifetime
 /// of the app — one instance, started on the first `connect()`. On each
 /// successful connect it announces our destination and runs the read loop until
 /// the socket closes, then loops to reconnect.
 pub fn connection_manager(shared: Arc<Shared>, chat_cid: CID) {
+    wait_for_time_server();
     let pddb = Pddb::new();
     let trng = match XousNames::new().ok().and_then(|xns| Trng::new(&xns).ok()) {
         Some(t) => t,
@@ -836,6 +854,7 @@ fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, l
 /// protocol-safe no-op, but the outbound bytes refresh the idle timers. One
 /// thread runs per connection and exits when the write fails (connection gone).
 pub fn keepalive_thread(shared: Arc<Shared>, chat_cid: CID) {
+    wait_for_time_server();
     use core::sync::atomic::Ordering;
     const TICK_SECS: u64 = 5;
     const KEEPALIVE_TICKS: u64 = 6; // empty frame every 30 s
@@ -1482,6 +1501,7 @@ pub fn enqueue_outbound(
 /// link establishment, and propagation fallback make progress without a network
 /// event. One instance for the app's lifetime.
 pub fn outbox_pump_thread(shared: Arc<Shared>, chat_cid: CID) {
+    wait_for_time_server();
     let pddb = Pddb::new();
     let trng = match XousNames::new().ok().and_then(|xns| Trng::new(&xns).ok()) {
         Some(t) => t,
@@ -1507,6 +1527,7 @@ pub fn outbox_pump_thread(shared: Arc<Shared>, chat_cid: CID) {
 /// so a slow sync can't delay message sending. Consumes the manual-sync flag and
 /// times out a stalled sync.
 pub fn sync_thread(shared: Arc<Shared>, chat_cid: CID) {
+    wait_for_time_server();
     let trng = match XousNames::new().ok().and_then(|xns| Trng::new(&xns).ok()) {
         Some(t) => t,
         None => {

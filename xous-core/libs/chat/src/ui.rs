@@ -236,7 +236,14 @@ impl Ui {
         // Safe: the checksum guarantees `body` is exactly what we serialized.
         let archive = unsafe { rkyv::access_unchecked::<dialogue::ArchivedDialogue>(body) };
         self.dialogue = match rkyv::deserialize::<Dialogue, rkyv::rancor::Error>(archive) {
-            Ok(dialogue) => {
+            Ok(mut dialogue) => {
+                // Bubble heights are persisted with the posts, but they depend
+                // on render details that can change between builds (e.g. the
+                // author/time header line). Invalidate on load; the layout
+                // recomputes them lazily for the posts it actually shows.
+                for post in dialogue.posts_as_slice_mut() {
+                    post.bounding_box = None;
+                }
                 // show most recent posts onscreen
                 self.layout_selected = dialogue.post_last();
                 self.layout_range.clear();

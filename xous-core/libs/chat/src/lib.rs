@@ -674,10 +674,37 @@ pub fn server(
 
 pub fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().try_into().unwrap() }
 
+/// True once libstd's wall-clock time server is up (the dns service registers
+/// the well-known "timeserverpublic" server some time into boot).
+/// `SystemTime::now()` and `llio::LocalTime` both panic *inside libstd* if
+/// used before then — and a bubble can be rendered that early now that a chat
+/// app can be the boot app. Probe cheaply, cache the success.
+fn time_server_ready() -> bool {
+    #[cfg(not(target_os = "xous"))]
+    {
+        true // hosted mode uses the host clock directly
+    }
+    #[cfg(target_os = "xous")]
+    {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        static READY: AtomicBool = AtomicBool::new(false);
+        if READY.load(Ordering::Relaxed) {
+            return true;
+        }
+        if xous::connect(xous::SID::from_bytes(b"timeserverpublic").unwrap()).is_ok() {
+            READY.store(true, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Seconds to add to a UTC unix timestamp to display it in local time, from
 /// the same source as the status-bar clock (`llio::LocalTime`). Cached once
 /// resolved; while the timezone is still unknown (e.g. the PDDB hasn't been
 /// unlocked yet) it falls back to UTC and retries at most every 30 s.
+/// Only call when [`time_server_ready`].
 fn tz_offset_secs() -> i64 {
     use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
     static CACHED: AtomicI32 = AtomicI32::new(i32::MIN); // MIN = not yet known
@@ -722,6 +749,13 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// Short local-time label for a bubble header: "HH:MM" for today,
 /// "MM-DD HH:MM" within the current year, "YYYY-MM-DD HH:MM" otherwise.
 fn format_when(ts: u64) -> String {
+    if !time_server_ready() {
+        // Too early in boot to ask "now" or the timezone (the calls would
+        // panic in libstd) — show the absolute UTC date instead.
+        let (y, mo, d) = civil_from_days((ts as i64).div_euclid(86400));
+        let s = (ts as i64).rem_euclid(86400);
+        return format!("{}-{:02}-{:02} {:02}:{:02}", y, mo, d, s / 3600, (s % 3600) / 60);
+    }
     let off = tz_offset_secs();
     let t = ts as i64 + off;
     let (y, mo, d) = civil_from_days(t.div_euclid(86400));
