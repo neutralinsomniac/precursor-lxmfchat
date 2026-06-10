@@ -41,6 +41,12 @@ const DELIVERY_DICT: &str = "lxmf.delivery";
 const KEY_IDENTITY: &str = "identity";
 const KEY_HUB: &str = "hub";
 const KEY_PEER: &str = "peer";
+/// PDDB key for our announced display name.
+const KEY_NAME: &str = "name";
+/// Display name announced when none has been set yet.
+const DEFAULT_DISPLAY_NAME: &str = "precursor";
+/// Sanity cap on the announced name (it travels in every announce packet).
+const DISPLAY_NAME_MAX: usize = 32;
 /// Each contact gets its own dialogue (scrollback) stored under this dict,
 /// keyed by the hex of its destination hash. `DIALOGUE_WELCOME` is shown before
 /// any peer is selected.
@@ -168,6 +174,8 @@ impl<'a> LxmfChat<'a> {
 
         let hub = read_string(&pddb, KEY_HUB).unwrap_or_else(|| DEFAULT_HUB.to_string());
         let current_peer = read_string(&pddb, KEY_PEER).and_then(|s| parse_addr(&s));
+        let display_name =
+            read_string(&pddb, KEY_NAME).unwrap_or_else(|| DEFAULT_DISPLAY_NAME.to_string());
 
         let chat_cid = chat.cid();
         let shared = Arc::new(Shared {
@@ -177,6 +185,7 @@ impl<'a> LxmfChat<'a> {
             ctl: Mutex::new(None),
             write_started: core::sync::atomic::AtomicU32::new(0),
             our_dh,
+            display_name: Mutex::new(display_name),
             dialogue_id: DIALOGUE_WELCOME.to_string(),
             seen: Mutex::new(BTreeMap::new()),
             contacts: Mutex::new(contacts_map),
@@ -270,12 +279,38 @@ impl<'a> LxmfChat<'a> {
     pub fn announce(&mut self) {
         let mut r5 = [0u8; 5];
         fill_random(&self.trng, &mut r5);
+        let name = plock(&self.shared.display_name).clone();
         let raw = {
             let tp = plock(&self.shared.transport);
-            tp.make_announce_with("lxmf", &["delivery"], b"precursor", &r5, now())
+            tp.make_announce_with("lxmf", &["delivery"], name.as_bytes(), &r5, now())
         };
         if self.write_framed(&raw) {
-            self.chat.set_status_text("announced");
+            self.chat.set_status_text(&format!("announced as {name}"));
+        }
+    }
+
+    /// Prompt for and store the display name we announce (what peers see in
+    /// their announce/contact lists). Persisted; takes effect immediately with
+    /// a fresh announce. Note peers who already saved us keep whatever name
+    /// they saved until their client updates it from the new announce.
+    pub fn set_name_interactive(&mut self, modals: &modals::Modals) {
+        let current = plock(&self.shared.display_name).clone();
+        match modals.alert_builder("Announced name").field(Some(current.clone()), None).build() {
+            Ok(p) => {
+                let mut name = p.first().as_str().trim().to_string();
+                name.truncate(DISPLAY_NAME_MAX);
+                if name.is_empty() || name == current {
+                    return;
+                }
+                *plock(&self.shared.display_name) = name.clone();
+                write_string(&self.pddb, KEY_NAME, &name);
+                if self.shared.connected.load(core::sync::atomic::Ordering::SeqCst) {
+                    self.announce(); // tell the network right away
+                } else {
+                    self.chat.set_status_text(&format!("name set: {name} (announced on connect)"));
+                }
+            }
+            Err(_) => {}
         }
     }
 

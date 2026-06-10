@@ -31,6 +31,8 @@ pub enum MenuOp {
     Announce,
     /// Show our own LXMF address
     MyAddress,
+    /// Set the display name we announce to the network.
+    SetName,
     /// Manually set the peer by pasting a 32-hex lxmf address (advanced/fallback)
     SetPeer,
     /// Set the transport hub (host / port)

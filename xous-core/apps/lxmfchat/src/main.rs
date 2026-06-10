@@ -63,6 +63,7 @@ fn wrapped_main() -> ! {
     chat.menu_add(menu_item("Connect", MenuOp::Connect)).ok();
     chat.menu_add(menu_item("Announce", MenuOp::Announce)).ok();
     chat.menu_add(menu_item("My address", MenuOp::MyAddress)).ok();
+    chat.menu_add(menu_item("My name", MenuOp::SetName)).ok();
     chat.menu_add(menu_item("Set peer", MenuOp::SetPeer)).ok();
     chat.menu_add(menu_item("Set hub", MenuOp::SetHub)).ok();
     chat.menu_add(menu_item("Sync messages", MenuOp::Sync)).ok();
@@ -102,6 +103,7 @@ fn wrapped_main() -> ! {
                                 .show_notification(&format!("Your LXMF address:\n{}", app.our_address()), None)
                                 .ok();
                         }
+                        Some(MenuOp::SetName) => app.set_name_interactive(&modals),
                         Some(MenuOp::SetPeer) => app.set_peer_interactive(&modals),
                         Some(MenuOp::SetHub) => app.set_hub_interactive(&modals),
                         Some(MenuOp::ClearHistory) => app.clear_history_interactive(&modals),

@@ -214,6 +214,9 @@ pub struct Shared {
     pub hub: Mutex<String>,
     /// Our own lxmf.delivery destination hash.
     pub our_dh: [u8; TRUNCATED_HASHLENGTH],
+    /// The display name we announce (announce app_data, legacy raw-utf8 form).
+    /// User-settable from the menu; persisted under `KEY_NAME`.
+    pub display_name: Mutex<String>,
     /// PDDB dialogue key the chat UI is bound to.
     pub dialogue_id: String,
     /// Live directory of LXMF announces seen this session:
@@ -467,9 +470,10 @@ fn read_until_closed(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Tr
 fn send_announce(shared: &Arc<Shared>, trng: &Trng) {
     let mut r5 = [0u8; 5];
     crate::fill_random(trng, &mut r5);
+    let name = plock(&shared.display_name).clone();
     let raw = {
         let tp = plock(&shared.transport);
-        tp.make_announce_with("lxmf", &["delivery"], b"precursor", &r5, now_secs())
+        tp.make_announce_with("lxmf", &["delivery"], name.as_bytes(), &r5, now_secs())
     };
     write_to_hub(shared, &raw);
 }
