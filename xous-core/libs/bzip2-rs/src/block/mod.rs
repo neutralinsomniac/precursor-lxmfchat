@@ -423,18 +423,21 @@ mod tests {
 
     use super::*;
 
-    // PRECURSOR PATCH: the upstream sample files all carry blocks larger than
-    // the clamped MAX_SUPPORTED_BLOCKSIZE (98–212 KB of content), so instead
-    // of asserting their decoded output, assert they now fail with a CLEAN
-    // error — not an abort, not an oversized allocation. Successful decoding
-    // of device-sized streams is covered by `decoder` tests below and by
-    // reticulum-core's resource tests (a real Python `BZh9` stream).
+    // PRECURSOR PATCH: upstream samples 1 (98 KB) and 3 (120 KB) have block
+    // content under the clamped MAX_SUPPORTED_BLOCKSIZE and must still decode
+    // byte-exactly — proving the clamp + lazy allocation change behavior only
+    // for oversized blocks.
     #[test]
-    fn oversized_blocks_error_cleanly() {
-        for compressed in [
-            include_bytes!("../../tests/samplefiles/sample1.bz2").as_ref(),
-            include_bytes!("../../tests/samplefiles/sample2.bz2").as_ref(),
-            include_bytes!("../../tests/samplefiles/sample3.bz2").as_ref(),
+    fn decodes_reference_samples_within_the_clamp() {
+        for (compressed, decompressed) in [
+            (
+                include_bytes!("../../tests/samplefiles/sample1.bz2").as_ref(),
+                include_bytes!("../../tests/samplefiles/sample1.ref").as_ref(),
+            ),
+            (
+                include_bytes!("../../tests/samplefiles/sample3.bz2").as_ref(),
+                include_bytes!("../../tests/samplefiles/sample3.ref").as_ref(),
+            ),
         ] {
             let header = Header::parse(compressed[..4].try_into().unwrap()).unwrap();
             let compressed = &compressed[4..];
@@ -442,12 +445,30 @@ mod tests {
             let mut bits = BitReader::new(compressed);
             let mut reader = Block::new(header);
 
-            let mut out = vec![0u8; 256 * 1024];
+            let mut out = vec![0u8; decompressed.len()];
             reader.set_ready_for_read();
-            assert!(
-                reader.read(&mut bits, &mut out).is_err(),
-                "a block bigger than MAX_SUPPORTED_BLOCKSIZE must be rejected"
-            );
+            let read = reader.read(&mut bits, &mut out).unwrap();
+            assert_eq!(&out[..read], decompressed);
         }
+    }
+
+    // PRECURSOR PATCH: sample2's blocks carry ~200 KB of content — past the
+    // clamp — and must fail with a CLEAN error, not an abort or an oversized
+    // allocation.
+    #[test]
+    fn oversized_blocks_error_cleanly() {
+        let compressed = include_bytes!("../../tests/samplefiles/sample2.bz2");
+        let header = Header::parse(compressed[..4].try_into().unwrap()).unwrap();
+        let compressed = &compressed[4..];
+
+        let mut bits = BitReader::new(compressed);
+        let mut reader = Block::new(header);
+
+        let mut out = vec![0u8; 256 * 1024];
+        reader.set_ready_for_read();
+        assert!(
+            reader.read(&mut bits, &mut out).is_err(),
+            "a block bigger than MAX_SUPPORTED_BLOCKSIZE must be rejected"
+        );
     }
 }

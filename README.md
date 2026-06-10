@@ -48,7 +48,8 @@ Protocol:
   packet (> ~319 B of content) arrive as an RNS Resource: advertisement → part
   requests → reassembly → whole-stream decrypt → bz2 decompression (RNS
   auto-compresses text; pure-Rust decoder, output capped against bz2 bombs) →
-  proof (the sender's delivery ack). Single-segment (≈ 31 KB transfer) only.
+  proof (the sender's delivery ack), with windowed part requests and
+  hashmap-update paging for transfers up to a 256 KB device-memory budget.
 - **Propagation node support**, both directions: outbound store-and-forward
   fallback when direct delivery fails (message re-encrypted to the recipient +
   a mined **proof-of-work propagation stamp**, midstate-cached SHA-256 so the
@@ -181,9 +182,11 @@ direct first, propagation fallback, with the delivery mark updating in place.
 
 ## Known limitations
 
-- Resource transfers are single-segment: ≈ 31 KB per transfer (direct
-  messages and per-sync batches; larger sync backlogs arrive over multiple
-  syncs, larger direct messages fall back to the propagation node).
+- Resource transfers are capped at 256 KB (a device-memory budget: parts and
+  the reassembled stream are buffered in RAM). Windowed part requests and
+  hashmap-update paging handle anything up to that; RNS's multi-*segment*
+  splitting (only used above 1 MB) is not supported. Sync batches advertise a
+  128 KB limit, so larger backlogs arrive over multiple syncs.
 - No proof-of-work **delivery** stamps (`LXStamper`): peers who enforce a
   stamp cost can only be messaged once they send us a ticket (NomadNet does
   this automatically for trusted peers). The propagation-node PoW stamp *is*

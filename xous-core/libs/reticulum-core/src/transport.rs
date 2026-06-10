@@ -1111,29 +1111,42 @@ mod tests {
             other => panic!("expected in-link data, got {:?}", core::mem::discriminant(&other)),
         };
 
-        // Our part request goes back encrypted on the same link; the sender
-        // must be able to decrypt it and see every map-hash requested.
-        let req_pkt = responder
-            .make_in_link_context(&lid, CONTEXT_RESOURCE_REQ, &rx.request_data(), &[7u8; IV_LENGTH])
-            .expect("request packet");
-        let decoded = Packet::decode(&req_pkt).expect("decode request");
-        assert_eq!(decoded.context, CONTEXT_RESOURCE_REQ);
-        assert_eq!(decoded.destination_hash, lid);
-        let req_plain = link::decrypt(&key, &decoded.data).expect("sender decrypts request");
-        assert_eq!(req_plain.len(), 1 + 32 + parts.len() * 4);
-
-        // Parts arrive raw (whole-stream ciphertext chunks), out of order.
-        for part in parts.iter().rev() {
-            let raw = Packet::header1(DEST_LINK, PACKET_DATA, CONTEXT_RESOURCE, lid, part.clone()).encode();
-            match responder.handle_frame(&raw, &mut eph) {
-                Event::InLinkData { context, plaintext, .. } => {
-                    assert_eq!(context, CONTEXT_RESOURCE);
-                    rx.receive_part(&plaintext);
+        // Drive the windowed request pump: each request goes back encrypted on
+        // the link; the "sender" answers with the requested parts (delivered
+        // out of order within the window), raw, until the transfer completes.
+        while !rx.is_complete() {
+            let req = rx.next_request().expect("transfer must have a next step");
+            let req_pkt = responder
+                .make_in_link_context(&lid, CONTEXT_RESOURCE_REQ, &req, &[7u8; IV_LENGTH])
+                .expect("request packet");
+            let decoded = Packet::decode(&req_pkt).expect("decode request");
+            assert_eq!(decoded.context, CONTEXT_RESOURCE_REQ);
+            assert_eq!(decoded.destination_hash, lid);
+            let req_plain = link::decrypt(&key, &decoded.data).expect("sender decrypts request");
+            assert_eq!(req_plain[0], 0x00, "small hashmap fits the advertisement");
+            assert_eq!(&req_plain[1..33], &res_hash[..]);
+            let mut batch: Vec<Vec<u8>> = req_plain[33..]
+                .chunks_exact(4)
+                .map(|w| {
+                    let i = hashmap.chunks_exact(4).position(|h| h == w).expect("known hash");
+                    parts[i].clone()
+                })
+                .collect();
+            batch.reverse();
+            for part in batch {
+                let raw =
+                    Packet::header1(DEST_LINK, PACKET_DATA, CONTEXT_RESOURCE, lid, part).encode();
+                match responder.handle_frame(&raw, &mut eph) {
+                    Event::InLinkData { context, plaintext, .. } => {
+                        assert_eq!(context, CONTEXT_RESOURCE);
+                        rx.receive_part(&plaintext);
+                    }
+                    other => {
+                        panic!("expected in-link part, got {:?}", core::mem::discriminant(&other))
+                    }
                 }
-                other => panic!("expected in-link part, got {:?}", core::mem::discriminant(&other)),
             }
         }
-        assert!(rx.is_complete());
 
         // Reassemble, link-decrypt the whole stream, verify, and prove.
         let stream = responder.decrypt_in_link(&lid, &rx.concat()).expect("stream decrypt");

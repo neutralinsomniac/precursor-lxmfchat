@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use chat::{ChatOp, Post};
 use pddb::Pddb;
 use reticulum_core::constants::{
-    CONTEXT_REQUEST, CONTEXT_RESOURCE, CONTEXT_RESOURCE_ADV, CONTEXT_RESOURCE_REQ, CONTEXT_RESPONSE,
-    IV_LENGTH, KEY_HALF, SIG_LENGTH, TRUNCATED_HASHLENGTH,
+    CONTEXT_REQUEST, CONTEXT_RESOURCE, CONTEXT_RESOURCE_ADV, CONTEXT_RESOURCE_HMU,
+    CONTEXT_RESOURCE_REQ, CONTEXT_RESPONSE, IV_LENGTH, KEY_HALF, SIG_LENGTH, TRUNCATED_HASHLENGTH,
 };
 use reticulum_core::crypto::{full_hash, truncated_hash};
 use reticulum_core::hdlc::{Deframer, frame};
@@ -701,8 +701,8 @@ fn inbound_resource(
 ) {
     match context {
         CONTEXT_RESOURCE_ADV => match ResourceReceiver::accept(&plaintext) {
-            Ok(rx) => {
-                let req = rx.request_data();
+            Ok(mut rx) => {
+                let req = rx.next_request();
                 {
                     // One transfer per link; a fresh advertisement on the same
                     // link replaces (restarts) it, oldest evicted past the cap.
@@ -712,33 +712,40 @@ fn inbound_resource(
                     }
                     map.insert(link_id, rx);
                 }
-                let mut iv = [0u8; IV_LENGTH];
-                crate::fill_random(trng, &mut iv);
-                // Bind first: don't hold the transport guard across the hub write.
-                let raw =
-                    { plock(&shared.transport).make_in_link_context(&link_id, CONTEXT_RESOURCE_REQ, &req, &iv) };
-                if let Some(raw) = raw {
-                    write_to_hub(shared, &raw);
+                if let Some(req) = req {
+                    send_in_link_request(shared, trng, &link_id, &req);
                 }
                 chat::cf_set_status_text(chat_cid, "incoming message — receiving…");
             }
             Err(e) => {
-                // Multi-segment (> ~31 KB) or malformed: don't request it; the
+                // Oversized / multi-segment / malformed: don't request it; the
                 // sender times out and falls back to the propagation node.
                 log::warn!("inbound resource on link {} rejected: {e}", hex(&link_id));
             }
         },
         CONTEXT_RESOURCE => {
-            let complete = {
+            // Ingest the part. When the current window completes, request the
+            // next one; when the whole transfer completes, fall through to
+            // assembly below.
+            let (complete, next_req) = {
                 let mut map = plock(&shared.in_resources);
                 match map.get_mut(&link_id) {
                     Some(rx) => {
-                        rx.receive_part(&plaintext);
-                        rx.is_complete()
+                        let window_done = rx.receive_part(&plaintext);
+                        if rx.is_complete() {
+                            (true, None)
+                        } else if window_done {
+                            (false, rx.next_request())
+                        } else {
+                            (false, None)
+                        }
                     }
-                    None => false,
+                    None => (false, None),
                 }
             };
+            if let Some(req) = next_req {
+                send_in_link_request(shared, trng, &link_id, &req);
+            }
             if !complete {
                 return;
             }
@@ -774,9 +781,48 @@ fn inbound_resource(
                 Err(e) => log::warn!("inbound resource on link {} invalid: {e}", hex(&link_id)),
             }
         }
-        // RESOURCE_HMU only occurs for resources whose hashmap doesn't fit the
-        // advertisement (> ~74 parts) — already rejected at the advertisement.
+        // A hashmap-update page: the transfer is bigger than the advertisement
+        // could describe; learn the next page of part hashes and keep going.
+        CONTEXT_RESOURCE_HMU => {
+            let next_req = {
+                let mut map = plock(&shared.in_resources);
+                match map.get_mut(&link_id) {
+                    Some(rx) => match rx.receive_hashmap_update(&plaintext) {
+                        Ok(()) => rx.next_request(),
+                        Err(e) => {
+                            log::warn!("inbound resource on link {}: bad hashmap update: {e}", hex(&link_id));
+                            None
+                        }
+                    },
+                    None => None,
+                }
+            };
+            if let Some(req) = next_req {
+                send_in_link_request(shared, trng, &link_id, &req);
+            }
+        }
         _ => log::debug!("inbound link {} resource ctx=0x{context:02x} ignored", hex(&link_id)),
+    }
+}
+
+/// Send a `RESOURCE_REQ` on an inbound link. Bind-then-write: never hold the
+/// transport guard across the hub write.
+fn send_in_link_request(shared: &Arc<Shared>, trng: &Trng, link_id: &[u8; TRUNCATED_HASHLENGTH], req: &[u8]) {
+    let mut iv = [0u8; IV_LENGTH];
+    crate::fill_random(trng, &mut iv);
+    let raw = { plock(&shared.transport).make_in_link_context(link_id, CONTEXT_RESOURCE_REQ, req, &iv) };
+    if let Some(raw) = raw {
+        write_to_hub(shared, &raw);
+    }
+}
+
+/// Send a `RESOURCE_REQ` on a link we initiated (the sync link). Bind-then-write.
+fn send_out_link_request(shared: &Arc<Shared>, trng: &Trng, link_id: &[u8; TRUNCATED_HASHLENGTH], req: &[u8]) {
+    let mut iv = [0u8; IV_LENGTH];
+    crate::fill_random(trng, &mut iv);
+    let raw = { plock(&shared.transport).make_out_link_context(link_id, CONTEXT_RESOURCE_REQ, req, &iv) };
+    if let Some(raw) = raw {
+        write_to_hub(shared, &raw);
     }
 }
 
@@ -1030,11 +1076,12 @@ pub(crate) fn write_to_hub(shared: &Arc<Shared>, raw: &[u8]) -> bool {
 
 /// LXMF `/get` request path; its hash selects the node's message-get handler.
 const SYNC_GET_PATH: &[u8] = b"/get";
-/// Per-transfer message size limit we advertise (KB). LXMF's default is 1000, but
-/// our Resource receiver is single-segment only (no hashmap updates): ~74 parts ≈
-/// 31 KB max. Advertise less than that so the node trims each batch to what we
-/// can actually receive — anything left over comes on the next sync.
-const SYNC_DELIVERY_LIMIT: i64 = 28;
+/// Per-transfer message size limit we advertise (KB). LXMF's default is 1000;
+/// our Resource receiver handles windowed transfers with hashmap updates up to
+/// its [`reticulum_core::resource::MAX_TRANSFER_BYTES`] device-memory budget
+/// (256 KB). Advertise half of that so the batch plus its envelope stays well
+/// inside the budget — anything left over comes on the next sync.
+const SYNC_DELIVERY_LIMIT: i64 = 128;
 /// Abort a sync that stalls past this many seconds.
 const SYNC_DEADLINE_SECS: u64 = 120;
 /// Retry cadence and bound while a requested sync waits for the propagation
@@ -1282,16 +1329,11 @@ fn sync_on_outlink_data(
             }
         }
         CONTEXT_RESOURCE_ADV => match ResourceReceiver::accept(&plaintext) {
-            Ok(rx) => {
-                let req = rx.request_data();
+            Ok(mut rx) => {
+                let req = rx.next_request();
                 plock(&shared.sync).receiver = Some(rx);
-                let mut iv = [0u8; IV_LENGTH];
-                crate::fill_random(trng, &mut iv);
-                // Bind first: don't hold the transport guard across the write.
-                let raw =
-                    { plock(&shared.transport).make_out_link_context(&link_id, CONTEXT_RESOURCE_REQ, &req, &iv) };
-                if let Some(raw) = raw {
-                    write_to_hub(shared, &raw);
+                if let Some(req) = req {
+                    send_out_link_request(shared, trng, &link_id, &req);
                 }
                 chat::cf_set_status_text_forced(chat_cid, "sync: downloading…");
             }
@@ -1300,17 +1342,47 @@ fn sync_on_outlink_data(
                 sync_finish(shared, chat_cid, "sync failed (unsupported resource)");
             }
         },
+        CONTEXT_RESOURCE_HMU => {
+            // Next page of part hashes for a transfer bigger than the
+            // advertisement could describe.
+            let next_req = {
+                let mut s = plock(&shared.sync);
+                match &mut s.receiver {
+                    Some(rx) => match rx.receive_hashmap_update(&plaintext) {
+                        Ok(()) => rx.next_request(),
+                        Err(e) => {
+                            log::warn!("sync: bad hashmap update: {e}");
+                            None
+                        }
+                    },
+                    None => None,
+                }
+            };
+            if let Some(req) = next_req {
+                send_out_link_request(shared, trng, &link_id, &req);
+            }
+        }
         CONTEXT_RESOURCE => {
-            let complete = {
+            // Ingest the part; request the next window when this one completes.
+            let (complete, next_req) = {
                 let mut s = plock(&shared.sync);
                 match &mut s.receiver {
                     Some(rx) => {
-                        rx.receive_part(&plaintext);
-                        rx.is_complete()
+                        let window_done = rx.receive_part(&plaintext);
+                        if rx.is_complete() {
+                            (true, None)
+                        } else if window_done {
+                            (false, rx.next_request())
+                        } else {
+                            (false, None)
+                        }
                     }
-                    None => false,
+                    None => (false, None),
                 }
             };
+            if let Some(req) = next_req {
+                send_out_link_request(shared, trng, &link_id, &req);
+            }
             if !complete {
                 return;
             }

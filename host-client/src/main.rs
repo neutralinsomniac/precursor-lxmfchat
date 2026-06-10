@@ -21,7 +21,8 @@ use lxmf::message::{self, Fields};
 use lxmf::msgpack::{self, Value};
 use rand_core::OsRng;
 use reticulum_core::constants::{
-    CONTEXT_REQUEST, CONTEXT_RESOURCE, CONTEXT_RESOURCE_ADV, CONTEXT_RESOURCE_REQ, CONTEXT_RESPONSE, KEY_HALF,
+    CONTEXT_REQUEST, CONTEXT_RESOURCE, CONTEXT_RESOURCE_ADV, CONTEXT_RESOURCE_HMU,
+    CONTEXT_RESOURCE_REQ, CONTEXT_RESPONSE, KEY_HALF,
 };
 use reticulum_core::crypto::{full_hash, truncated_hash};
 use reticulum_core::destination::single_destination_hash;
@@ -320,27 +321,44 @@ fn sync_handle_outlink(
             }
         }
         CONTEXT_RESOURCE_ADV => match ResourceReceiver::accept(&plaintext) {
-            Ok(r) => {
-                let req = r.request_data();
-                *rx = Some(r);
-                let mut iv = [0u8; 16];
-                rand_core::RngCore::fill_bytes(&mut OsRng, &mut iv);
-                if let Some(raw) = tp.make_out_link_context(link_id, CONTEXT_RESOURCE_REQ, &req, &iv) {
-                    writer.write_all(&frame(&raw)).ok();
-                    writer.flush().ok();
+            Ok(mut r) => {
+                if let Some(req) = r.next_request() {
+                    send_resource_req(writer, tp, link_id, &req, false);
                 }
+                *rx = Some(r);
                 println!("sync: receiving resource…");
             }
             Err(e) => println!("sync: resource advertisement rejected: {e}"),
         },
-        CONTEXT_RESOURCE => {
-            let complete = match rx.as_mut() {
-                Some(r) => {
-                    r.receive_part(&plaintext);
-                    r.is_complete()
+        CONTEXT_RESOURCE_HMU => {
+            if let Some(r) = rx.as_mut() {
+                match r.receive_hashmap_update(&plaintext) {
+                    Ok(()) => {
+                        if let Some(req) = r.next_request() {
+                            send_resource_req(writer, tp, link_id, &req, false);
+                        }
+                    }
+                    Err(e) => println!("sync: bad hashmap update: {e}"),
                 }
-                None => false,
+            }
+        }
+        CONTEXT_RESOURCE => {
+            let (complete, next_req) = match rx.as_mut() {
+                Some(r) => {
+                    let window_done = r.receive_part(&plaintext);
+                    if r.is_complete() {
+                        (true, None)
+                    } else if window_done {
+                        (false, r.next_request())
+                    } else {
+                        (false, None)
+                    }
+                }
+                None => (false, None),
             };
+            if let Some(req) = next_req {
+                send_resource_req(writer, tp, link_id, &req, false);
+            }
             if !complete {
                 return;
             }
@@ -389,27 +407,44 @@ fn inbound_resource(
 ) {
     match context {
         CONTEXT_RESOURCE_ADV => match ResourceReceiver::accept(&plaintext) {
-            Ok(r) => {
-                let req = r.request_data();
-                rxs.insert(*link_id, r);
-                let mut iv = [0u8; 16];
-                rand_core::RngCore::fill_bytes(&mut OsRng, &mut iv);
-                if let Some(raw) = tp.make_in_link_context(link_id, CONTEXT_RESOURCE_REQ, &req, &iv) {
-                    writer.write_all(&frame(&raw)).ok();
-                    writer.flush().ok();
+            Ok(mut r) => {
+                if let Some(req) = r.next_request() {
+                    send_resource_req(writer, tp, link_id, &req, true);
                 }
+                rxs.insert(*link_id, r);
                 println!("inbound resource on link {} — requesting parts…", reticulum_core::hex(link_id));
             }
             Err(e) => println!("inbound resource advertisement rejected: {e}"),
         },
-        CONTEXT_RESOURCE => {
-            let complete = match rxs.get_mut(link_id) {
-                Some(r) => {
-                    r.receive_part(&plaintext);
-                    r.is_complete()
+        CONTEXT_RESOURCE_HMU => {
+            if let Some(r) = rxs.get_mut(link_id) {
+                match r.receive_hashmap_update(&plaintext) {
+                    Ok(()) => {
+                        if let Some(req) = r.next_request() {
+                            send_resource_req(writer, tp, link_id, &req, true);
+                        }
+                    }
+                    Err(e) => println!("inbound resource: bad hashmap update: {e}"),
                 }
-                None => false,
+            }
+        }
+        CONTEXT_RESOURCE => {
+            let (complete, next_req) = match rxs.get_mut(link_id) {
+                Some(r) => {
+                    let window_done = r.receive_part(&plaintext);
+                    if r.is_complete() {
+                        (true, None)
+                    } else if window_done {
+                        (false, r.next_request())
+                    } else {
+                        (false, None)
+                    }
+                }
+                None => (false, None),
             };
+            if let Some(req) = next_req {
+                send_resource_req(writer, tp, link_id, &req, true);
+            }
             if !complete {
                 return;
             }
@@ -459,6 +494,22 @@ fn inbound_resource(
             }
         }
         _ => println!("inbound resource ctx=0x{context:02x} ignored"),
+    }
+}
+
+/// Send a `RESOURCE_REQ` on a link: `inbound` selects the responder-side
+/// (links a peer opened to us) vs initiator-side (links we opened) key table.
+fn send_resource_req(writer: &mut TcpStream, tp: &Transport, link_id: &[u8; 16], req: &[u8], inbound: bool) {
+    let mut iv = [0u8; 16];
+    rand_core::RngCore::fill_bytes(&mut OsRng, &mut iv);
+    let raw = if inbound {
+        tp.make_in_link_context(link_id, CONTEXT_RESOURCE_REQ, req, &iv)
+    } else {
+        tp.make_out_link_context(link_id, CONTEXT_RESOURCE_REQ, req, &iv)
+    };
+    if let Some(raw) = raw {
+        writer.write_all(&frame(&raw)).ok();
+        writer.flush().ok();
     }
 }
 

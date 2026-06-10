@@ -14,9 +14,11 @@ mod error;
 /// a 1 KB message — an instant OOM abort on the Precursor. Clamping here
 /// bounds every allocation in the decoder; blocks whose actual content
 /// exceeds the clamp fail with the decoder's existing "data exceeds block
-/// size" error instead of allocating. 64 KiB of content is far beyond any
-/// LXMF message the device can display, and caps the working array at 256 KiB.
-pub(crate) const MAX_SUPPORTED_BLOCKSIZE: u32 = 64 * 1024;
+/// size" error instead of allocating. Sized to the Resource receiver's
+/// 256 KiB transfer budget: a direct text message of up to ~128 KiB content
+/// per block decodes (the working array grows lazily, ≤ 512 KiB and only for
+/// genuinely huge texts; small messages stay tiny).
+pub(crate) const MAX_SUPPORTED_BLOCKSIZE: u32 = 128 * 1024;
 
 /// A bzip2 header
 #[derive(Clone)]

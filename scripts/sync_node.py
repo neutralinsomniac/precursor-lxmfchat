@@ -30,7 +30,12 @@ SENDER_SEED = bytes.fromhex(("b1" * 32) + ("b2" * 32))
 
 # Large enough that the /get message response exceeds the link MDU and RNS sends
 # it as a multi-part Resource (exercising our Resource receiver), not a packet.
-CONTENT = b"propagation node sync test - " + (b"the quick brown fox jumps over the lazy dog. " * 80)
+# SYNC_TEST_REPEAT=1500 makes it ~67 KB: more parts than one hashmap page,
+# exercising the windowed transfer with RESOURCE_HMU round-trips.
+import os as _os
+CONTENT = b"propagation node sync test - " + (
+    b"the quick brown fox jumps over the lazy dog. " * int(_os.environ.get("SYNC_TEST_REPEAT", "80"))
+)
 TITLE = b"synctest"
 
 
