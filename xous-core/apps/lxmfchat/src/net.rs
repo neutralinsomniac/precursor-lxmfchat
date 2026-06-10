@@ -11,7 +11,7 @@ use chat::{ChatOp, Post};
 use pddb::Pddb;
 use reticulum_core::constants::{
     CONTEXT_REQUEST, CONTEXT_RESOURCE, CONTEXT_RESOURCE_ADV, CONTEXT_RESOURCE_REQ, CONTEXT_RESPONSE,
-    IV_LENGTH, KEY_HALF, TRUNCATED_HASHLENGTH,
+    IV_LENGTH, KEY_HALF, SIG_LENGTH, TRUNCATED_HASHLENGTH,
 };
 use reticulum_core::crypto::{full_hash, truncated_hash};
 use reticulum_core::hdlc::{Deframer, frame};
@@ -85,6 +85,11 @@ pub struct OutboundMsg {
     /// Full packed LXMF message (`dest||source||sig||payload`), sent as link DATA
     /// for direct delivery and re-wrapped for propagation.
     pub packed: Vec<u8>,
+    /// Some(cost) while the recipient's required proof-of-work delivery stamp
+    /// is still unmined. The pump thread mines it (see
+    /// [`compute_pending_delivery_stamp`]) and appends it to `packed`; nothing
+    /// is sent until then. None = ready (no cost, ticket-stamped, or mined).
+    pub needs_stamp: Option<u32>,
     /// Currently attempting propagation-node delivery (vs direct).
     pub via_pn: bool,
     /// A propagation attempt has already been made (don't loop forever).
@@ -230,6 +235,12 @@ pub struct Shared {
     /// (author, timestamp, text) until the user opens that thread, then flushed
     /// into it. In-memory only (not yet persisted across an app restart).
     pub pending: Mutex<BTreeMap<[u8; TRUNCATED_HASHLENGTH], Vec<(String, u64, String)>>>,
+    /// Delivery stamp costs peers have announced (msgpack element 1 of an
+    /// lxmf.delivery announce). A message to one of these peers must carry a
+    /// stamp: a ticket-derived one if they trusted us, else mined
+    /// proof-of-work. In-memory: the route resolution before any send brings
+    /// us their announce (path response), so the cost is known by send time.
+    pub stamp_costs: Mutex<BTreeMap<[u8; TRUNCATED_HASHLENGTH], u32>>,
     /// Outbound tickets: dest hash -> (expiry unix seconds, 16-byte ticket). A
     /// peer that enforces a stamp cost can trust us by sending a ticket inside an
     /// inbound message's `FIELD_TICKET`; we store it here and stamp our replies
@@ -499,12 +510,28 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
             // contacts until you actually message them (or they message you).
             let name = crate::lxmf_display_name(&info.app_data).unwrap_or_else(|| hex(&destination_hash));
             plock(&shared.seen).insert(destination_hash, (name.clone(), now_secs()));
+            // Track the peer's announced delivery stamp cost: our replies must
+            // carry a (ticket or proof-of-work) stamp or they'll be dropped.
+            match crate::lxmf_stamp_cost(&info.app_data) {
+                Some(c) => {
+                    plock(&shared.stamp_costs).insert(destination_hash, c);
+                }
+                None => {
+                    plock(&shared.stamp_costs).remove(&destination_hash);
+                }
+            }
             // If this is already a saved contact (e.g. someone who messaged us
             // before we had their key — common on an access_point interface),
-            // upgrade their record now that we have the key + a display name.
-            let is_contact = plock(&shared.contacts).contains_key(&destination_hash);
-            if is_contact {
-                crate::save_contact(shared, pddb, &destination_hash, &name);
+            // refresh their record now that we have the key. The display name
+            // is only upgraded if the saved one is a placeholder (the bare
+            // address) — a real name, e.g. a manual rename, is sticky.
+            let existing = plock(&shared.contacts).get(&destination_hash).cloned();
+            if let Some(existing) = existing {
+                let addr_hex = hex(&destination_hash);
+                let is_placeholder =
+                    existing == addr_hex || existing == format!("{}…", &addr_hex[..8]);
+                let keep = if is_placeholder { name.clone() } else { existing };
+                crate::save_contact(shared, pddb, &destination_hash, &keep);
             }
             // Now that we have this peer's key, recover a ticket from any earlier
             // message we couldn't verify at the time (access-point interface).
@@ -1478,12 +1505,14 @@ pub fn enqueue_outbound(
     display_ts: u64,
     text: String,
     packed: Vec<u8>,
+    needs_stamp: Option<u32>,
 ) {
     plock(&shared.outbox).push(OutboundMsg {
         peer,
         display_ts,
         text,
         packed,
+        needs_stamp,
         via_pn: false,
         tried_pn: false,
         in_flight: None,
@@ -1517,12 +1546,88 @@ pub fn outbox_pump_thread(shared: Arc<Shared>, chat_cid: CID) {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(2));
         if !plock(&shared.outbox).is_empty() {
-            // Mine any pending propagation stamp first (slow, lock-free), so the
-            // blob is ready when pump_outbox reaches the PN-send step. Doing it
-            // here keeps the multi-second PoW off the net read loop.
+            // Mine any pending proof-of-work first (slow, lock-free), so the
+            // message/blob is ready when pump_outbox reaches its send step.
+            // Doing it here keeps the multi-second PoW off the net read loop.
+            compute_pending_delivery_stamp(&shared, chat_cid, &pddb);
             compute_pending_pn_blob(&shared, chat_cid, &trng);
             pump_outbox(&shared, chat_cid, &pddb, &trng);
         }
+    }
+}
+
+/// Upper bound on a peer's announced delivery stamp cost we're willing to
+/// mine. Expected attempts double per bit — 24 bits is already ~17M
+/// single-block compressions (many minutes on the device); past that, treat
+/// the announce as hostile and fail the message visibly instead of spinning
+/// the pump thread for hours.
+const MAX_DELIVERY_STAMP_COST: u32 = 24;
+
+/// Mine, **lock-free**, the proof-of-work delivery stamp for at most one
+/// outbox message whose recipient enforces a stamp cost (and has sent us no
+/// ticket). Mirrors [`compute_pending_pn_blob`]: snapshot the inputs under the
+/// outbox lock, release it, mine (seconds to minutes, depending on cost), then
+/// store the result by re-finding the entry. The stamp is appended to the
+/// packed message as the 5th payload element — the message id and signature
+/// cover only the 4-tuple, so they are unchanged. Runs only on the pump
+/// thread. Returns true if it stamped a message.
+fn compute_pending_delivery_stamp(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb) -> bool {
+    let job = {
+        let outbox = plock(&shared.outbox);
+        outbox.iter().find(|m| m.needs_stamp.is_some()).map(|m| {
+            (m.peer, m.display_ts, m.text.clone(), m.packed.clone(), m.needs_stamp.unwrap_or(0))
+        })
+    };
+    let (peer, display_ts, text, packed, cost) = match job {
+        Some(j) => j,
+        None => return false,
+    };
+    let label = peer_label(shared, &peer);
+
+    let fail = |why: String| {
+        plock(&shared.outbox).retain(|m| !(m.peer == peer && m.display_ts == display_ts));
+        update_mark(shared, chat_cid, pddb, &peer, display_ts, &text, STATUS_FAILED);
+        chat::cf_set_status_idle_text(chat_cid, &why);
+        chat::cf_set_status_text(chat_cid, &why);
+    };
+    if cost > MAX_DELIVERY_STAMP_COST {
+        fail(format!("× {label}: stamp cost {cost} is too high"));
+        return false;
+    }
+
+    chat::cf_set_status_text(chat_cid, &format!("computing stamp for {label} (cost {cost})…"));
+    // message_id = full_hash(dest || source || payload): the packed message
+    // minus its signature.
+    let mut hashed = Vec::with_capacity(packed.len() - SIG_LENGTH);
+    hashed.extend_from_slice(&packed[..2 * TRUNCATED_HASHLENGTH]);
+    hashed.extend_from_slice(&packed[2 * TRUNCATED_HASHLENGTH + SIG_LENGTH..]);
+    let message_id = full_hash(&hashed);
+    let stamp =
+        lxmf::stamp::generate_stamp(&message_id, cost, lxmf::stamp::WORKBLOCK_EXPAND_ROUNDS_DELIVERY);
+    let stamped = match lxmf::message::append_stamp(&packed, &stamp) {
+        Some(s) => s,
+        None => {
+            // Can't happen for our own pack() output; fail loudly if it does.
+            fail(format!("× {label}: could not stamp message"));
+            return false;
+        }
+    };
+
+    // Re-find the entry (it may have been cleared meanwhile) and arm it. The
+    // delivery clock starts NOW: mining time doesn't count against the
+    // delivery budget.
+    let mut outbox = plock(&shared.outbox);
+    match outbox.iter_mut().find(|m| m.peer == peer && m.display_ts == display_ts) {
+        Some(m) => {
+            m.packed = stamped;
+            m.needs_stamp = None;
+            m.created = now_secs();
+            m.deadline = now_secs() + DIRECT_DEADLINE;
+            drop(outbox);
+            chat::cf_set_status_text(chat_cid, &format!("stamp ready — sending to {label}…"));
+            true
+        }
+        None => false,
     }
 }
 
@@ -1721,7 +1826,15 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
         let mut outbox = plock(&shared.outbox);
         let mut i = 0;
         while i < outbox.len() {
-            // 0. The current phase's independent time budget is up.
+            // 0a. Still waiting for its proof-of-work delivery stamp (mined on
+            // this same pump thread, just before pump_outbox runs). Nothing —
+            // including the deadline — applies until the stamp is on; the cost
+            // cap in compute_pending_delivery_stamp bounds how long that takes.
+            if outbox[i].needs_stamp.is_some() {
+                i += 1;
+                continue;
+            }
+            // 0b. The current phase's independent time budget is up.
             if now > outbox[i].deadline {
                 let m = outbox.remove(i);
                 let why = if m.via_pn {

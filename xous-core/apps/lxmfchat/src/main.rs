@@ -59,6 +59,7 @@ fn wrapped_main() -> ! {
     };
     chat.menu_add(menu_item("Announces", MenuOp::Announces)).ok();
     chat.menu_add(menu_item("Contacts", MenuOp::Contacts)).ok();
+    chat.menu_add(menu_item("Rename contact", MenuOp::RenameContact)).ok();
     chat.menu_add(menu_item("Connect", MenuOp::Connect)).ok();
     chat.menu_add(menu_item("Announce", MenuOp::Announce)).ok();
     chat.menu_add(menu_item("My address", MenuOp::MyAddress)).ok();
@@ -93,6 +94,7 @@ fn wrapped_main() -> ! {
                     match FromPrimitive::from_usize(menu_code) {
                         Some(MenuOp::Announces) => app.show_announces_interactive(&modals),
                         Some(MenuOp::Contacts) => app.message_contact_interactive(&modals),
+                        Some(MenuOp::RenameContact) => app.rename_contact_interactive(&modals),
                         Some(MenuOp::Connect) => app.connect(),
                         Some(MenuOp::Announce) => app.announce(),
                         Some(MenuOp::MyAddress) => {

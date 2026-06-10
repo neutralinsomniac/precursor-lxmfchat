@@ -152,6 +152,28 @@ pub fn pack(
     PackedMessage { message_id, packed }
 }
 
+/// Append a delivery stamp to an already-packed message, as the 5th payload
+/// element (`LXMessage.pack` appends `self.stamp` after signing). The message
+/// id and signature cover only the 4-tuple, so stamping after packing changes
+/// neither — which lets the app pack (and echo) a message immediately and
+/// mine the proof-of-work stamp later, off the UI thread. Returns `None` if
+/// `packed` doesn't carry a plain 4-element payload (already stamped, or
+/// malformed).
+pub fn append_stamp(packed: &[u8], stamp: &[u8]) -> Option<Vec<u8>> {
+    if packed.len() <= 2 * DEST_LEN + SIG_LENGTH {
+        return None;
+    }
+    let (head, payload) = packed.split_at(2 * DEST_LEN + SIG_LENGTH);
+    let mut arr = match msgpack::decode(payload) {
+        Ok(Value::Array(a)) if a.len() == 4 => a,
+        _ => return None,
+    };
+    arr.push(Value::Bin(stamp.to_vec()));
+    let mut out = head.to_vec();
+    out.extend_from_slice(&msgpack::encode(&Value::Array(arr)));
+    Some(out)
+}
+
 /// Pack a message for **propagated** (store-and-forward) delivery to a propagation
 /// node. The node only stores the blob — it stays end-to-end encrypted to the
 /// recipient — so we encrypt exactly as for opportunistic delivery and wrap it in
@@ -188,7 +210,11 @@ pub fn pack_propagation(
         // Stamp covers the transient id (hash of lxmf_data *before* the stamp);
         // the stamp bytes are appended after it.
         let transient_id = full_hash(&lxmf_data);
-        let stamp = crate::stamp::generate_stamp(&transient_id, propagation_cost);
+        let stamp = crate::stamp::generate_stamp(
+            &transient_id,
+            propagation_cost,
+            crate::stamp::WORKBLOCK_EXPAND_ROUNDS_PN,
+        );
         lxmf_data.extend_from_slice(&stamp);
     }
 
@@ -391,5 +417,41 @@ mod tests {
         let no_ticket =
             pack(&source, &dest_hash, &source_hash, 1_700_000_000.0, b"", b"hi", &Fields::new(), None);
         assert_eq!(parsed.message_id, no_ticket.message_id);
+    }
+
+    #[test]
+    fn pow_stamp_appends_after_packing_and_roundtrips() {
+        let source = PrivateIdentity::from_bytes(&[0x0d; KEY_HALF], &[0x0e; KEY_HALF]);
+        let recipient = PrivateIdentity::from_bytes(&[0x0f; KEY_HALF], &[0x10; KEY_HALF]);
+        let dest_hash = single_destination_hash("lxmf", &["delivery"], &recipient.hash());
+        let source_hash = single_destination_hash("lxmf", &["delivery"], &source.hash());
+
+        // Pack unstamped (as post() does), then mine + append (as the pump does).
+        let msg = pack(
+            &source, &dest_hash, &source_hash, 1_700_000_000.0, b"", b"stamped hi", &Fields::new(),
+            None,
+        );
+        let stamp = crate::stamp::generate_stamp(
+            &msg.message_id,
+            4, // tiny cost: the test mines in microseconds
+            crate::stamp::WORKBLOCK_EXPAND_ROUNDS_DELIVERY,
+        );
+        let stamped = append_stamp(&msg.packed, &stamp).expect("append");
+
+        // 5th element carries the raw 32-byte stamp; id + signature unchanged.
+        let payload = &stamped[2 * DEST_LEN + SIG_LENGTH..];
+        let arr = match msgpack::decode(payload).unwrap() {
+            Value::Array(a) => a,
+            _ => panic!("payload is not an array"),
+        };
+        assert_eq!(arr.len(), 5);
+        assert_eq!(arr[4].as_bin().unwrap(), &stamp[..]);
+        let parsed = parse(&stamped, Some(source.public())).unwrap();
+        assert!(parsed.signature_validated);
+        assert_eq!(parsed.message_id, msg.message_id);
+        assert_eq!(parsed.content, b"stamped hi");
+
+        // A stamped (5-element) message must not be stamped twice.
+        assert!(append_stamp(&stamped, &stamp).is_none());
     }
 }

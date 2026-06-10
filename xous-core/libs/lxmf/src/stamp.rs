@@ -21,6 +21,11 @@ use crate::msgpack::{self, Value};
 /// workblock is exactly block-aligned (required for the midstate trick).
 pub const WORKBLOCK_EXPAND_ROUNDS_PN: usize = 1000;
 
+/// Rounds for a **delivery** stamp's workblock (LXStamper
+/// `WORKBLOCK_EXPAND_ROUNDS`) — the stamp a recipient with a `stamp_cost`
+/// demands on the message itself, mined over the message id.
+pub const WORKBLOCK_EXPAND_ROUNDS_DELIVERY: usize = 3000;
+
 /// Stamp length in bytes (RNS `HASHLENGTH`/8).
 pub const STAMP_SIZE: usize = 32;
 
@@ -104,25 +109,34 @@ pub fn stamp_workblock(material: &[u8], expand_rounds: usize) -> Vec<u8> {
     wb
 }
 
-/// Generate a propagation stamp of at least `cost` leading zero bits over the
-/// workblock derived from `material`. Returns the 32-byte stamp. Cost 13..16 is
-/// typically a few thousand to ~65k single-compression attempts after the
-/// one-time workblock build.
-pub fn generate_stamp(material: &[u8], cost: u32) -> [u8; STAMP_SIZE] {
-    let workblock = stamp_workblock(material, WORKBLOCK_EXPAND_ROUNDS_PN);
-
-    // Fold the (block-aligned) workblock into a reusable midstate.
+/// Generate a stamp of at least `cost` leading zero bits over the workblock
+/// derived from `material` with `expand_rounds` rounds (PN: transient id ×
+/// [`WORKBLOCK_EXPAND_ROUNDS_PN`]; delivery: message id ×
+/// [`WORKBLOCK_EXPAND_ROUNDS_DELIVERY`]). Returns the 32-byte stamp. Cost
+/// 8..16 is typically a few hundred to ~65k single-compression attempts after
+/// the one-time workblock pass.
+pub fn generate_stamp(material: &[u8], cost: u32, expand_rounds: usize) -> [u8; STAMP_SIZE] {
+    // Fold the workblock into the midstate AS IT IS GENERATED — 256 B per
+    // round, four 64-byte blocks — never materializing the whole thing
+    // (256 KB for a PN stamp, 768 KB for a delivery stamp: a real allocation
+    // hazard on the device).
     let mut midstate = H0;
     let mut block = [0u8; 64];
-    for chunk in workblock.chunks_exact(64) {
-        block.copy_from_slice(chunk);
-        compress(&mut midstate, &block);
+    for n in 0..expand_rounds {
+        let mut salt_input = Vec::with_capacity(material.len() + 5);
+        salt_input.extend_from_slice(material);
+        salt_input.extend_from_slice(&msgpack::encode(&Value::Int(n as i64)));
+        let salt = full_hash(&salt_input);
+        for chunk in hkdf(256, material, Some(&salt), None).chunks_exact(64) {
+            block.copy_from_slice(chunk);
+            compress(&mut midstate, &block);
+        }
     }
 
     // Final block: stamp(32) || 0x80 || zeros || bit-length(8, big-endian). The
     // stamp lands exactly at a block boundary (workblock is 64-aligned), so the
     // padded final block is one block.
-    let bit_len = ((workblock.len() + STAMP_SIZE) as u64) * 8;
+    let bit_len = ((expand_rounds * 256 + STAMP_SIZE) as u64) * 8;
     let mut last = [0u8; 64];
     last[STAMP_SIZE] = 0x80;
     last[56..].copy_from_slice(&bit_len.to_be_bytes());
@@ -171,7 +185,10 @@ mod tests {
         // interop test).
         let material = [0x42u8; 32];
         let cost = 8;
-        let stamp = generate_stamp(&material, cost);
+        // The streaming (never-materialized) midstate fold must agree with a
+        // hash of the materialized workblock — this asserts both the stamp
+        // and that equivalence.
+        let stamp = generate_stamp(&material, cost, WORKBLOCK_EXPAND_ROUNDS_PN);
         let workblock = stamp_workblock(&material, WORKBLOCK_EXPAND_ROUNDS_PN);
         let mut combined = workblock;
         combined.extend_from_slice(&stamp);

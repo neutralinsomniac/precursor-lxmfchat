@@ -23,6 +23,8 @@ pub enum MenuOp {
     Announces,
     /// Pick a peer to message from your saved contacts.
     Contacts,
+    /// Give a saved contact a new display name.
+    RenameContact,
     /// (Re)connect to the configured hub and announce our address
     Connect,
     /// Announce our lxmf.delivery destination on the connected hub

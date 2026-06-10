@@ -185,6 +185,7 @@ impl<'a> LxmfChat<'a> {
             last_ts: Mutex::new(0),
             sync: Mutex::new(net::SyncState::new()),
             in_resources: Mutex::new(BTreeMap::new()),
+            stamp_costs: Mutex::new(BTreeMap::new()),
             llio: llio::Llio::new(&xns),
             hub: Mutex::new(hub.clone()),
             unread: Mutex::new(unread_map),
@@ -339,6 +340,17 @@ impl<'a> LxmfChat<'a> {
             }
         };
 
+        // No ticket but the peer's announce demands a stamp cost? The message
+        // then needs a mined proof-of-work stamp. Mining takes seconds (or
+        // minutes for high costs) so it happens on the PUMP thread, never
+        // here on the UI thread — the message is enqueued unstamped and held
+        // until the stamp is appended (see net::compute_pending_delivery_stamp).
+        let needs_stamp = if ticket.is_some() {
+            None
+        } else {
+            plock(&self.shared.stamp_costs).get(&peer).copied()
+        };
+
         // Pack + sign the full LXMF message once. It's delivered as direct link
         // DATA (and re-wrapped for the propagation node if direct delivery fails).
         let packed = {
@@ -378,6 +390,7 @@ impl<'a> LxmfChat<'a> {
             display_ts,
             text.to_string(),
             packed,
+            needs_stamp,
         );
     }
 
@@ -500,6 +513,46 @@ impl<'a> LxmfChat<'a> {
         {
             self.activate_peer(&addr);
             self.chat.set_status_text(&format!("messaging {}", name));
+        }
+    }
+
+    /// Pick a saved contact and give it a new display name (shown in the
+    /// contact list, bubble headers, and the status bar). Address, key
+    /// material, ticket, and message history are untouched. A manually-set
+    /// name is sticky: the peer's announces no longer overwrite it (only
+    /// placeholder bare-address names get upgraded — see the Announce
+    /// handler in net.rs). Existing bubbles keep the author name they were
+    /// posted under; new messages use the new name.
+    pub fn rename_contact_interactive(&mut self, modals: &modals::Modals) {
+        let mut entries: Vec<_> =
+            { plock(&self.shared.contacts).iter().map(|(k, v)| (*k, v.clone())).collect() };
+        entries.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        let (addr, current) =
+            match self.pick_peer(modals, entries, "Rename who?", "No saved contacts yet.") {
+                Some(p) => p,
+                None => return,
+            };
+        match modals
+            .alert_builder(&format!("New name for {}", current))
+            .field(Some(current.clone()), None)
+            .build()
+        {
+            Ok(p) => {
+                let new_name = p.first().as_str().trim().to_string();
+                if new_name.is_empty() || new_name == current {
+                    return;
+                }
+                save_contact(&self.shared, &self.pddb, &addr, &new_name);
+                // If this peer's thread is the active one, refresh its label.
+                if *plock(&self.shared.current_peer) == Some(addr) {
+                    let label = format!("\u{25c9} {}", new_name);
+                    self.chat.set_status_idle_text(&label);
+                    self.chat.set_status_text(&label);
+                } else {
+                    self.chat.set_status_text(&format!("renamed to {}", new_name));
+                }
+            }
+            Err(_) => {}
         }
     }
 
@@ -982,6 +1035,27 @@ pub(crate) fn lxmf_display_name(app_data: &[u8]) -> Option<String> {
     };
     let trimmed = raw.replace('\u{0}', "").trim().to_string();
     if trimmed.is_empty() { None } else { Some(trimmed) }
+}
+
+/// The delivery stamp cost (leading-zero bits) a peer's announce demands, if
+/// any — element 1 of the v0.5+ msgpack announce app_data (mirrors
+/// `LXMF.stamp_cost_from_app_data`). None = no stamp required (including the
+/// pre-0.5 raw-name announce format, which can't carry a cost).
+pub(crate) fn lxmf_stamp_cost(app_data: &[u8]) -> Option<u32> {
+    if app_data.is_empty() {
+        return None;
+    }
+    let b0 = app_data[0];
+    if !((0x90..=0x9f).contains(&b0) || b0 == 0xdc) {
+        return None;
+    }
+    match lxmf::msgpack::decode(app_data) {
+        Ok(lxmf::msgpack::Value::Array(arr)) => match arr.get(1) {
+            Some(lxmf::msgpack::Value::Int(c)) if *c > 0 => Some(*c as u32),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Save a peer to the contact list. Always lists them (anyone who messages us

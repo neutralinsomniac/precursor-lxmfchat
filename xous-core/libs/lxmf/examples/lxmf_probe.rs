@@ -50,7 +50,7 @@ fn main() {
             // stamp <material_hex> <cost>  -> generate a propagation stamp.
             let material = unhex(&a[2]);
             let cost: u32 = a[3].parse().expect("cost");
-            let stamp = lxmf::stamp::generate_stamp(&material, cost);
+            let stamp = lxmf::stamp::generate_stamp(&material, cost, lxmf::stamp::WORKBLOCK_EXPAND_ROUNDS_PN);
             println!("material {}", reticulum_core::hex(&material));
             println!("cost {}", cost);
             println!("stamp {}", reticulum_core::hex(&stamp));
