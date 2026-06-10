@@ -1557,11 +1557,11 @@ pub fn outbox_pump_thread(shared: Arc<Shared>, chat_cid: CID) {
 }
 
 /// Upper bound on a peer's announced delivery stamp cost we're willing to
-/// mine. Expected attempts double per bit — 24 bits is already ~17M
-/// single-block compressions (many minutes on the device); past that, treat
-/// the announce as hostile and fail the message visibly instead of spinning
-/// the pump thread for hours.
-const MAX_DELIVERY_STAMP_COST: u32 = 24;
+/// mine. Expected attempts double per bit — 20 bits is ~1M single-block
+/// compressions (about a minute on the device, a few at unlucky variance);
+/// past that, treat the announce as hostile and fail the message visibly
+/// instead of pinning the pump thread for an hour. Real-world costs are 8–16.
+const MAX_DELIVERY_STAMP_COST: u32 = 20;
 
 /// Mine, **lock-free**, the proof-of-work delivery stamp for at most one
 /// outbox message whose recipient enforces a stamp cost (and has sent us no
