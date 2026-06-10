@@ -1895,10 +1895,12 @@ fn mark_delivered(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, packet_hash:
     };
     if let Some((peer, ts, text, status)) = done {
         let label = peer_label(shared, &peer);
+        // Use the bubble-mark consts: they're checked against the device fonts
+        // (a literal ⇪ here once rendered as tofu — see the MARK_* notes).
         let note = if status == STATUS_QUEUED {
-            format!("⇪ stored at propagation node for {label}")
+            format!("{MARK_QUEUED} stored at propagation node for {label}")
         } else {
-            format!("✓ delivered to {label}")
+            format!("{MARK_DELIVERED} delivered to {label}")
         };
         chat::cf_set_status_text(chat_cid, &note);
         update_mark(shared, chat_cid, pddb, &peer, ts, &text, status);
