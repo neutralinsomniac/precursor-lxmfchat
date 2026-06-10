@@ -12,8 +12,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
-use chat::{Chat, ChatOp, Post};
-use xous_ipc::Buffer;
+use chat::{Chat, ChatOp};
 use pddb::Pddb;
 use reticulum_core::constants::{KEY_HALF, KEYSIZE, NAME_HASH_LENGTH, RATCHET_SIZE, TRUNCATED_HASHLENGTH};
 use reticulum_core::destination::single_destination_hash;
@@ -199,15 +198,11 @@ impl<'a> LxmfChat<'a> {
         let initial_key = current_peer.map(|p| hex(&p)).unwrap_or_else(|| DIALOGUE_WELCOME.to_string());
         chat.dialogue_set(DIALOGUE_DICT, Some(&initial_key)).ok();
 
-        // One-shot on-device crypto self-test. The host baseline is
-        // "x25519:OK token:OK hkdf:08ed4e4cbcd2"; any divergence here means the
-        // hardware crypto backend differs from software and is why ECDH-derived
-        // link/opportunistic keys fail HMAC while announces still work.
+        // One-shot crypto self-test + sign/verify timing, LOG-ONLY (it posted a
+        // chat message to the welcome thread during the hardware-crypto
+        // debugging; the device baselines are recorded — x25519/token/hkdf OK,
+        // sign(sw) ~550 ms, verify(sw) ~1.1 s vs 3.2 s / ~30 s on the engine).
         let st = reticulum_core::self_test();
-        // Time one Ed25519 sign (hardware dalek) and one verify (vendored
-        // software): hardware VERIFY was measured at tens of seconds per call on
-        // this device (it stalled sync + sends behind the transport lock), which
-        // is why verify is software now. This line keeps both costs visible.
         let st = {
             let t0 = std::time::Instant::now();
             let sig = plock(&shared.transport).identity().sign(b"selftest timing");
@@ -219,17 +214,6 @@ impl<'a> LxmfChat<'a> {
             format!("{st} sign(sw):{sign_ms}ms verify(sw):{verify_ms}ms:{}", if ok { "OK" } else { "FAIL" })
         };
         log::info!("crypto self-test: {}", st);
-        let post = Post {
-            dialogue_id: initial_key.clone(),
-            author: "selftest".to_string(),
-            timestamp: now(),
-            text: st,
-            attach_url: None,
-        };
-        if let Ok(b) = Buffer::into_buf(post) {
-            b.send(chat_cid, ChatOp::PostAdd as u32).ok();
-        }
-        xous::send_message(chat_cid, xous::Message::new_scalar(ChatOp::DialogueSave as usize, 0, 0, 0, 0)).ok();
 
         log::info!("lxmf delivery address {}", hex(&our_dh));
         LxmfChat { chat, chat_cid, pddb, trng, shared, hub, manager_started: false }
