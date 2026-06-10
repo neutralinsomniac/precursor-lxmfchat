@@ -182,6 +182,8 @@ impl<'a> LxmfChat<'a> {
             sync_stage: core::sync::atomic::AtomicU32::new(0),
             beat_frames: core::sync::atomic::AtomicU32::new(0),
             frame_stage: core::sync::atomic::AtomicU32::new(0),
+            sync_stage_at: core::sync::atomic::AtomicU32::new(0),
+            beat_sync_done: core::sync::atomic::AtomicU32::new(0),
             beat_ka: core::sync::atomic::AtomicU32::new(0),
             tspan: core::sync::atomic::AtomicU32::new(0),
             our_dh,
@@ -312,9 +314,17 @@ impl<'a> LxmfChat<'a> {
         // identifies the wedged thread / exact blocking statement.
         use core::sync::atomic::Ordering;
         let s = self.shared.beat_sync.load(Ordering::SeqCst);
+        // s = passes started / completed: "s66/65" frozen with started ahead
+        // means the sync thread is blocked INSIDE a pass; both frozen means it
+        // isn't being scheduled at all.
+        let sd = self.shared.beat_sync_done.load(Ordering::SeqCst);
         let p = self.shared.beat_pump.load(Ordering::SeqCst);
         let r = self.shared.beat_read.load(Ordering::SeqCst);
         let g = self.shared.sync_stage.load(Ordering::SeqCst);
+        // Age of the current sync stage: "g16+43" = sitting at stage 16 for 43s,
+        // i.e. blocked in the statement right after that marker.
+        let ga = self.shared.sync_stage_at.load(Ordering::SeqCst);
+        let gage = if ga == 0 { 0 } else { (now() as u32).saturating_sub(ga) };
         let c = self.shared.connected.load(Ordering::SeqCst) as u32;
         // f = frames fully processed : where the in-flight frame is (net.rs
         // frame_stage; a frozen ":2" = stuck inside Transport::handle_frame —
@@ -330,8 +340,9 @@ impl<'a> LxmfChat<'a> {
         // t = seconds the LAST completed Transport::handle_frame took — a direct
         // measurement of hardware-crypto (Ed25519/SHA engine) speed per frame.
         let t = self.shared.tspan.load(Ordering::SeqCst);
-        self.chat
-            .set_status_text(&format!("sync requested… [s{s} p{p} r{r} f{f}:{fs} t{t} g{g} c{c} k{k} w{w}]"));
+        self.chat.set_status_text(&format!(
+            "sync requested… [s{s}/{sd} p{p} r{r} f{f}:{fs} t{t} g{g}+{gage} c{c} k{k} w{w}]"
+        ));
     }
 
     /// Send an opportunistic LXMF message to the current peer.

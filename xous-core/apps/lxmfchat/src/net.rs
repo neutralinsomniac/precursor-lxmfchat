@@ -219,6 +219,14 @@ pub struct Shared {
     /// held — which wedges sync, sends, everything.
     pub beat_frames: core::sync::atomic::AtomicU32,
     pub frame_stage: core::sync::atomic::AtomicU32,
+    /// Unix seconds (u32) when `sync_stage` was last stored — the bracket shows
+    /// the AGE of the current stage, so "g16+43" means the sync thread has sat
+    /// at stage 16 for 43 s and names the exact statement it's inside.
+    pub sync_stage_at: core::sync::atomic::AtomicU32,
+    /// maybe_auto_sync passes COMPLETED (vs `beat_sync` = passes started): if
+    /// started keeps leading completed by 1 for a long time, the thread is
+    /// blocked inside the pass; if both freeze, it isn't being scheduled.
+    pub beat_sync_done: core::sync::atomic::AtomicU32,
     /// Keepalive/watchdog thread heartbeat (+1 per 5 s tick): if this freezes,
     /// the stuck-write watchdog is itself wedged and can't break anything.
     pub beat_ka: core::sync::atomic::AtomicU32,
@@ -1406,6 +1414,7 @@ pub fn sync_thread(shared: Arc<Shared>, chat_cid: CID) {
         std::thread::sleep(std::time::Duration::from_secs(1));
         shared.beat_sync.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         maybe_auto_sync(&shared, chat_cid, &trng);
+        shared.beat_sync_done.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1425,6 +1434,7 @@ pub fn sync_thread(shared: Arc<Shared>, chat_cid: CID) {
 // 17 LINKREQUEST write returned
 fn stage(shared: &Arc<Shared>, s: u32) {
     shared.sync_stage.store(s, core::sync::atomic::Ordering::SeqCst);
+    shared.sync_stage_at.store(now_secs() as u32, core::sync::atomic::Ordering::SeqCst);
 }
 
 /// Kick off a one-time sync once the propagation node's route is known (after the
