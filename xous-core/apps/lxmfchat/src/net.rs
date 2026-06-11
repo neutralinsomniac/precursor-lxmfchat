@@ -1282,12 +1282,6 @@ fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, l
         }
     }
 
-    // A genuinely new inbound message — buzz the vibration motor as a notification
-    // (live receipt only; the sync path buzzes once per batch).
-    if notify {
-        shared.llio.vibe(llio::VibePattern::Long).ok();
-    }
-
     let author = shared
         .contacts
         .lock()
@@ -1388,6 +1382,14 @@ fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, l
         // announces the arrival.
         refresh_idle_status(shared, chat_cid);
         chat::cf_set_status_text(chat_cid, &format!("\u{2709} new message from {author}"));
+    }
+
+    // Buzz the vibration motor as a notification — LAST, once the bubble (or the
+    // unread status line) is on screen. The PDDB writes between decrypt and draw
+    // are slow enough that an early buzz leaves the user staring at an unchanged
+    // screen. Live receipt only; the sync path buzzes once per batch.
+    if notify {
+        shared.llio.vibe(llio::VibePattern::Long).ok();
     }
 }
 
