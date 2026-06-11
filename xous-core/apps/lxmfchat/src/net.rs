@@ -266,6 +266,10 @@ pub struct BrowserState {
     /// Whether the in-flight fetch should push the current page onto the back
     /// stack when it renders (true for following a link, false for back).
     pending_push: bool,
+    /// Whether the in-flight fetch is a back-navigation: its target is the TOP
+    /// back-stack entry, removed only when the page renders. Popping up front
+    /// lost the entry whenever the fetch failed (e.g. hub connection down).
+    pending_pop: bool,
     /// Pages to return to with the back key (newest last). Vars ride along so
     /// returning to e.g. a `g=mirrors` group page re-requests the same view.
     back: Vec<PageAddr>,
@@ -292,6 +296,7 @@ impl BrowserState {
             link_tries: 0,
             current: None,
             pending_push: false,
+            pending_pop: false,
             back: Vec::new(),
             links: Vec::new(),
             viewing: false,
@@ -1870,20 +1875,22 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
     // burning the request on writes that go nowhere. Atomic flag, NOT the writer
     // mutex — this check must never block behind a stuck write.
     if !shared.connected.load(core::sync::atomic::Ordering::SeqCst) {
-        let give_up = {
+        let (give_up, first_wait) = {
             let mut s = plock(&shared.sync);
             s.route_tries = s.route_tries.saturating_add(1);
             if s.route_tries <= SYNC_ROUTE_TRIES {
                 s.requested = true;
                 s.next_attempt = now + SYNC_ROUTE_RETRY_SECS;
-                false
+                (false, s.route_tries == 1)
             } else {
-                true
+                (true, false)
             }
         };
         if give_up {
             sync_finish(shared, chat_cid, "not connected to the hub");
-        } else {
+        } else if first_wait {
+            // Once, not every tick — see start_fetch: the connection manager's
+            // statuses must stay readable while we wait for it to reconnect.
             chat::cf_set_status_text_forced(chat_cid, "sync: waiting for hub connection…");
         }
         return;
@@ -2324,9 +2331,12 @@ fn parse_rns_response(payload: &[u8]) -> Option<Value> {
 pub const PAGE_PATH_DEFAULT: &str = "/page/index.mu";
 /// Abort a page fetch that stalls past this many seconds.
 const PAGE_DEADLINE_SECS: u64 = 60;
-/// Retry cadence/bound while a requested fetch waits for the node's key/route.
+/// Retry cadence/bound while a requested fetch waits for the node's key/route
+/// — or for the hub connection itself. 2 minutes: a full reconnect cycle (wifi
+/// re-associate + a 15 s dial timeout + up to 30 s backoff) can exceed the
+/// minute the route budget alone would allow.
 const BROWSER_ROUTE_RETRY_SECS: u64 = 3;
-const BROWSER_ROUTE_TRIES: u8 = 20;
+const BROWSER_ROUTE_TRIES: u8 = 40;
 /// Pages you can go ← back through (oldest dropped).
 const BACK_STACK_MAX: usize = 16;
 
@@ -2354,6 +2364,7 @@ fn browser_targets(shared: &Arc<Shared>, target: &[u8; TRUNCATED_HASHLENGTH]) ->
 /// Request a page, from the main thread (menu/keys): only flags the request —
 /// the browser thread does the link + hub writes. `push_back` records the
 /// currently shown page on the back stack once the new page actually renders.
+/// Returns false if a fetch was already in flight (request not taken).
 pub fn request_page(
     shared: &Arc<Shared>,
     chat_cid: CID,
@@ -2361,20 +2372,22 @@ pub fn request_page(
     path: &str,
     vars: Vec<(String, String)>,
     push_back: bool,
-) {
+) -> bool {
     {
         let mut b = plock(&shared.browser);
         if b.phase != BrowserPhase::Idle {
             drop(b);
             chat::cf_set_status_text(chat_cid, "page fetch already in progress…");
-            return;
+            return false;
         }
         b.requested = Some((node, path.to_string(), vars));
         b.pending_push = push_back;
+        b.pending_pop = false;
         b.next_attempt = 0;
         b.route_tries = 0;
     }
     chat::cf_set_status_text(chat_cid, &format!("page: fetching {}…", node_label(shared, &node)));
+    true
 }
 
 /// One lifetime thread driving the page browser (mirrors [`sync_thread`]):
@@ -2474,11 +2487,20 @@ fn start_fetch(
         }
     };
     if !shared.connected.load(core::sync::atomic::Ordering::SeqCst) {
-        let retrying = { rearm(&mut plock(&shared.browser)) };
-        if retrying {
-            chat::cf_set_status_text_forced(chat_cid, "page: waiting for hub connection…");
-        } else {
+        let (retrying, first_wait) = {
+            let mut b = plock(&shared.browser);
+            let ok = rearm(&mut b);
+            (ok, b.route_tries == 1)
+        };
+        if !retrying {
             browser_finish(shared, chat_cid, "not connected to the hub");
+        } else if first_wait {
+            // Say it ONCE. Repeating this every retry tick papered over the
+            // connection manager's own statuses (connecting…/connect failed…/
+            // link lost — why), which are exactly what diagnoses a reconnect
+            // that isn't completing. The fetch resumes by itself once the
+            // manager gets the connection back.
+            chat::cf_set_status_text_forced(chat_cid, "page: waiting for hub connection…");
         }
         return;
     }
@@ -2798,6 +2820,11 @@ fn page_received(shared: &Arc<Shared>, chat_cid: CID, resp: Value) {
             }
             b.pending_push = false;
         }
+        if b.pending_pop {
+            // A back-navigation rendered: NOW its entry leaves the stack.
+            b.back.pop();
+            b.pending_pop = false;
+        }
         b.current = Some((node, path.clone(), vars));
         b.links = doc.links;
         b.phase = BrowserPhase::Idle;
@@ -2832,6 +2859,7 @@ fn browser_finish(shared: &Arc<Shared>, chat_cid: CID, msg: &str) {
         b.receiver = None;
         b.requested = None;
         b.pending_push = false;
+        b.pending_pop = false;
         b.route_tries = 0;
         b.link_id.take()
     };
@@ -2892,10 +2920,15 @@ pub fn follow_selected_link(shared: &Arc<Shared>, chat_cid: CID) {
 /// Go back one page (F1 while browsing). Returns false when there was
 /// nothing to go back to (the caller tells the user; F3 is the exit).
 pub fn browser_back(shared: &Arc<Shared>, chat_cid: CID) -> bool {
-    let prev = { plock(&shared.browser).back.pop() };
+    // PEEK, don't pop: the entry comes off the stack only when the page
+    // renders (page_received). A pop here was lost for good when the fetch
+    // failed — e.g. hub connection down — silently eating history.
+    let prev = { plock(&shared.browser).back.last().cloned() };
     match prev {
         Some((node, path, vars)) => {
-            request_page(shared, chat_cid, node, &path, vars, false);
+            if request_page(shared, chat_cid, node, &path, vars, false) {
+                plock(&shared.browser).pending_pop = true;
+            }
             true
         }
         None => false,
@@ -2912,6 +2945,7 @@ pub fn browser_exit(shared: &Arc<Shared>, chat_cid: CID) {
         b.receiver = None;
         b.requested = None;
         b.pending_push = false;
+        b.pending_pop = false;
         b.route_tries = 0;
         b.current = None;
         b.back.clear();
