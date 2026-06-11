@@ -8,6 +8,11 @@ use xous_ipc::Buffer;
 
 use crate::*;
 
+/// Lists that include an item with this exact label get F3 = "choose it"
+/// (cancel-by-convention); F3 is ignored in lists without one, so dialogs
+/// that never offer a cancel item can't be misfired.
+pub const CANCEL_SENTINEL: &str = "[cancel]";
+
 #[derive(Debug)]
 pub struct RadioButtons {
     pub items: Vec<ItemName>,
@@ -48,6 +53,17 @@ impl RadioButtons {
     pub fn clear_items(&mut self) {
         self.items.clear();
         self.action_payload.clear();
+    }
+
+    /// Close the modal and return `action_payload` to the caller.
+    fn confirm(&mut self) {
+        // relinquish focus before returning the result
+        self.gam.relinquish_focus().unwrap();
+        xous::yield_slice();
+
+        let buf =
+            Buffer::into_buf(self.action_payload.clone()).expect("couldn't convert message to payload");
+        buf.send(self.action_conn, self.action_opcode).map(|_| ()).expect("couldn't send action message");
     }
 }
 impl ActionApi for RadioButtons {
@@ -190,15 +206,26 @@ impl ActionApi for RadioButtons {
                     }
                 } else {
                     // the OK button select
-                    // relinquish focus before returning the result
-                    self.gam.relinquish_focus().unwrap();
-                    xous::yield_slice();
-
-                    let buf = Buffer::into_buf(self.action_payload.clone())
-                        .expect("couldn't convert message to payload");
-                    buf.send(self.action_conn, self.action_opcode)
-                        .map(|_| ())
-                        .expect("couldn't send action message");
+                    self.confirm();
+                    return None;
+                }
+            }
+            '\u{12}' => {
+                // F2 = okay: pick the highlighted item and close, in ONE press —
+                // no scrolling down to the OK line. On the OK line it confirms
+                // the current selection, same as the menu key.
+                if self.select_index < self.items.len() as isize {
+                    self.action_payload =
+                        RadioButtonPayload::new(self.items[self.select_index as usize].as_str());
+                }
+                self.confirm();
+                return None;
+            }
+            '\u{13}' => {
+                // F3 = cancel, for lists that offer a CANCEL_SENTINEL item.
+                if self.items.iter().any(|i| i.as_str() == CANCEL_SENTINEL) {
+                    self.action_payload = RadioButtonPayload::new(CANCEL_SENTINEL);
+                    self.confirm();
                     return None;
                 }
             }

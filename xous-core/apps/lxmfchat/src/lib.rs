@@ -56,7 +56,9 @@ const DIALOGUE_WELCOME: &str = "welcome";
 /// Cap the Announces picker to a length the modal can comfortably show.
 const ANNOUNCE_LIST_MAX: usize = 32;
 /// First entry in peer pickers, lets the user back out without choosing.
-const CANCEL_LABEL: &str = "[cancel]";
+/// Matching the gam sentinel makes the F3 key choose it (radio modals treat
+/// F3 as "cancel" when an item carries exactly this label).
+const CANCEL_LABEL: &str = gam::modal::CANCEL_SENTINEL;
 
 /// Default Reticulum hub (`TCPClientInterface` target) used until one is set via
 /// the in-app "Set hub" menu (which persists to the PDDB and takes precedence).
