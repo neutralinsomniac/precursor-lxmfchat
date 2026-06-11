@@ -82,12 +82,16 @@ fn wrapped_main() -> ! {
         match FromPrimitive::from_usize(msg.body.id()) {
             Some(LxmfchatOp::Event) => {
                 xous::msg_scalar_unpack!(msg, event_code, _, _, _, {
-                    if let Some(Event::Focus) = FromPrimitive::from_usize(event_code) {
-                        if first_focus {
-                            first_focus = false;
-                            app.connect();
+                    match FromPrimitive::from_usize(event_code) {
+                        Some(Event::Focus) => {
+                            if first_focus {
+                                first_focus = false;
+                                app.connect();
+                            }
+                            app.redraw();
                         }
-                        app.redraw();
+                        Some(Event::F1) => app.jump_to_unread(),
+                        _ => {}
                     }
                 });
             }

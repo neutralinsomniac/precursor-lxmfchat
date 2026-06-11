@@ -210,6 +210,8 @@ impl<'a> LxmfChat<'a> {
         // Open the last conversation we were in (if any), else a welcome thread.
         let initial_key = current_peer.map(|p| hex(&p)).unwrap_or_else(|| DIALOGUE_WELCOME.to_string());
         chat.dialogue_set(DIALOGUE_DICT, Some(&initial_key)).ok();
+        // Unread badges restored from the PDDB: surface the F1 jump hint right away.
+        net::refresh_idle_status(&shared, chat_cid);
 
         // One-shot crypto self-test + sign/verify timing, LOG-ONLY (it posted a
         // chat message to the welcome thread during the hardware-crypto
@@ -486,10 +488,20 @@ impl<'a> LxmfChat<'a> {
         // it wasn't the active one — now that it's open, swap the bubbles.
         net::apply_delivery_updates(&self.shared, self.chat_cid, &self.pddb, addr);
         // Show who this conversation is with in the status bar (persists while
-        // idle), so it's always clear which thread you're in.
-        let label = format!("\u{25c9} {}", self.peer_name(addr));
-        self.chat.set_status_idle_text(&label);
-        self.chat.set_status_text(&label);
+        // idle, with the F1 next-unread hint), so it's always clear which
+        // thread you're in.
+        self.chat.set_status_text(&format!("\u{25c9} {}", self.peer_name(addr)));
+        net::refresh_idle_status(&self.shared, self.chat_cid);
+    }
+
+    /// F1: open the chat that's been waiting longest with unread messages.
+    /// Opening it clears its badge, so the next press moves on to the next
+    /// unread chat; the status bar always shows where F1 goes.
+    pub fn jump_to_unread(&self) {
+        match net::first_unread(&self.shared) {
+            Some((addr, _)) => self.activate_peer(&addr),
+            None => self.chat.set_status_text("no unread messages"),
+        }
     }
 
     /// Best human-readable name for a peer: a saved contact / announced display

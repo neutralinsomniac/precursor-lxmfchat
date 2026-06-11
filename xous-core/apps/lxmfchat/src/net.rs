@@ -330,6 +330,37 @@ fn peer_label(shared: &Arc<Shared>, peer: &[u8; TRUNCATED_HASHLENGTH]) -> String
         .unwrap_or_else(|| hex(&peer[..4]))
 }
 
+/// The next conversation to catch up on: the unread chat whose oldest held
+/// message arrived earliest, so repeated F1 presses walk the unread chats in
+/// the order the messages came in. Returns its address and unread count.
+pub fn first_unread(shared: &Arc<Shared>) -> Option<([u8; TRUNCATED_HASHLENGTH], u32)> {
+    // Snapshot, then consult `pending` — never hold both locks at once.
+    let unread: Vec<_> =
+        plock(&shared.unread).iter().filter(|(_, n)| **n > 0).map(|(h, n)| (*h, *n)).collect();
+    let pending = plock(&shared.pending);
+    unread.into_iter().min_by_key(|(h, _)| {
+        pending.get(h).and_then(|l| l.first()).map(|(_, ts, _)| *ts).unwrap_or(u64::MAX)
+    })
+}
+
+/// Recompose the persistent status line: who the active conversation is with,
+/// plus — when other chats have unread messages — where F1 jumps next and how
+/// many are waiting there, e.g. "◉ alice  ✉ F1: bob [2]". Call whenever either
+/// half changes (peer switch, message held, unread flushed).
+pub fn refresh_idle_status(shared: &Arc<Shared>, chat_cid: CID) {
+    let mut line = match *plock(&shared.current_peer) {
+        Some(p) => format!("\u{25c9} {}", peer_label(shared, &p)),
+        None => String::new(),
+    };
+    if let Some((peer, n)) = first_unread(shared) {
+        if !line.is_empty() {
+            line.push_str("  ");
+        }
+        line.push_str(&format!("\u{2709} F1: {} [{n}]", peer_label(shared, &peer)));
+    }
+    chat::cf_set_status_idle_text(chat_cid, &line);
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -1276,7 +1307,7 @@ fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, l
             let mut lt = plock(&shared.last_ts);
             *lt = (*lt).max(ts);
         }
-        chat::cf_set_status_idle_text(chat_cid, &format!("\u{25c9} {author}"));
+        refresh_idle_status(shared, chat_cid);
         post_to_chat(shared, chat_cid, &author, ts, &text);
     } else {
         // A different contact: do NOT disturb the active conversation. Hold the
@@ -1290,6 +1321,9 @@ fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, l
             crate::persist_pending(pddb, &src_hash, list);
         }
         *plock(&shared.unread).entry(src_hash).or_default() += 1;
+        // The persistent line picks up the F1 jump hint; the transient one
+        // announces the arrival.
+        refresh_idle_status(shared, chat_cid);
         chat::cf_set_status_text(chat_cid, &format!("\u{2709} new message from {author}"));
     }
 }
