@@ -551,27 +551,40 @@ pub fn server(
                         }
                         '↑' => {
                             log::info!("click ↑ : previous post");
-                            ui.set_menu_mode(true); // ← & → activate menus
-                            ui.post_select(POST_SELECTED_PREV);
-                            ui.redraw().expect("failed to redraw chat");
+                            if ui.doc_active() {
+                                // document mode: move the cursor/scroll up
+                                ui.doc_cursor(false);
+                                ui.redraw().expect("failed to redraw document");
+                            } else {
+                                ui.set_menu_mode(true); // ← & → activate menus
+                                ui.post_select(POST_SELECTED_PREV);
+                                ui.redraw().expect("failed to redraw chat");
+                            }
                             ui.event(Event::Up);
                         }
                         '↓' => {
                             log::info!("click ↓ : next post");
-                            ui.post_select(POST_SELECTED_NEXT);
-                            ui.redraw().expect("failed to redraw chat");
+                            if ui.doc_active() {
+                                ui.doc_cursor(true);
+                                ui.redraw().expect("failed to redraw document");
+                            } else {
+                                ui.post_select(POST_SELECTED_NEXT);
+                                ui.redraw().expect("failed to redraw chat");
+                            }
                             ui.event(Event::Down);
                         }
                         '←' => {
                             log::info!("click ← : raise app menu");
-                            if ui.get_menu_mode() {
+                            // document mode: ← is the app's "back" (Event::Left), never the menu
+                            if !ui.doc_active() && ui.get_menu_mode() {
                                 ui.raise_app_menu();
                             }
                             ui.event(Event::Left);
                         }
                         '→' => {
                             log::info!("click → : raise msg menu : pull request welcome!");
-                            if ui.get_menu_mode() {
+                            // document mode: → is the app's "open link" (Event::Right)
+                            if !ui.doc_active() && ui.get_menu_mode() {
                                 ui.raise_msg_menu();
                             }
                             ui.event(Event::Right);
@@ -661,6 +674,35 @@ pub fn server(
                 } else {
                     log::warn!("failed to deserialize MenuItem");
                 }
+            }
+            Some(ChatOp::DocumentBegin) => {
+                let buffer = unsafe { Buffer::from_memory_message(msg.body.memory_message().unwrap()) };
+                let meta = buffer.to_original::<DocMeta, _>().unwrap();
+                ui.doc_begin(meta.title.as_str());
+            }
+            Some(ChatOp::DocumentLines) => {
+                let buffer = unsafe { Buffer::from_memory_message(msg.body.memory_message().unwrap()) };
+                let batch = buffer.to_original::<DocLines, _>().unwrap();
+                ui.doc_append(batch.lines);
+            }
+            Some(ChatOp::DocumentShow) => {
+                ui.doc_show();
+                if allow_redraw {
+                    ui.redraw().expect("CHAT couldn't redraw");
+                }
+            }
+            Some(ChatOp::DocumentClear) => {
+                ui.doc_clear();
+                if allow_redraw {
+                    ui.redraw().expect("CHAT couldn't redraw");
+                }
+            }
+            Some(ChatOp::DocumentGetSelected) => {
+                xous::msg_blocking_scalar_unpack!(msg, _, _, _, _, {
+                    // encoded as link_id+1 so 0 can mean "not on a link"
+                    let val = ui.doc_selected_link().map(|id| id as usize + 1).unwrap_or(0);
+                    xous::return_scalar(msg.sender, val).expect("couldn't return selected link");
+                })
             }
             Some(ChatOp::Quit) => {
                 log::error!("got Quit");
@@ -869,6 +911,47 @@ pub fn cf_set_status_idle_text(chat_cid: xous::CID, msg: &str) {
 /// Posts authored under this name are rendered right-aligned (the local user's
 /// own messages), to visually distinguish them from received messages.
 pub const SELF_AUTHOR: &str = "me";
+
+/// Start staging a document-mode page (see [`ChatOp::DocumentBegin`]). The
+/// current view keeps rendering until [`cf_document_show`] swaps it in. All
+/// document ops use blocking lends so begin→lines→show can't reorder.
+pub fn cf_document_begin(chat_cid: xous::CID, title: &str) {
+    let meta = DocMeta { title: title.to_string() };
+    if let Ok(buf) = Buffer::into_buf(meta) {
+        buf.lend(chat_cid, ChatOp::DocumentBegin as u32).ok();
+    }
+}
+
+/// Append lines to the staged document, in modest IPC-sized batches.
+pub fn cf_document_lines(chat_cid: xous::CID, lines: &[DocLine]) {
+    for chunk in lines.chunks(32) {
+        let batch = DocLines { lines: chunk.to_vec() };
+        if let Ok(buf) = Buffer::into_buf(batch) {
+            buf.lend(chat_cid, ChatOp::DocumentLines as u32).ok();
+        }
+    }
+}
+
+/// Display the staged document (enters document mode).
+pub fn cf_document_show(chat_cid: xous::CID) {
+    xous::send_message(chat_cid, xous::Message::new_scalar(ChatOp::DocumentShow as usize, 0, 0, 0, 0)).ok();
+}
+
+/// Leave document mode and return to the chat dialogue.
+pub fn cf_document_clear(chat_cid: xous::CID) {
+    xous::send_message(chat_cid, xous::Message::new_scalar(ChatOp::DocumentClear as usize, 0, 0, 0, 0)).ok();
+}
+
+/// The link id under the document cursor, if the cursor is on a link line.
+pub fn cf_document_selected(chat_cid: xous::CID) -> Option<u16> {
+    match xous::send_message(
+        chat_cid,
+        xous::Message::new_blocking_scalar(ChatOp::DocumentGetSelected as usize, 0, 0, 0, 0),
+    ) {
+        Ok(xous::Result::Scalar1(val)) if val > 0 => Some((val - 1) as u16),
+        _ => None,
+    }
+}
 
 pub fn cf_set_busy_state(chat_cid: xous::CID, run: bool) {
     xous::send_message(

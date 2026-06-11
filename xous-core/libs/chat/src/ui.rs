@@ -85,8 +85,32 @@ pub(crate) struct Ui {
     /// the F1-F4 helper-label tray (rendered by the IMEF's prediction area)
     icontray: Icontray,
 
+    /// Document mode (e.g. the NomadNet page browser): when `document` is
+    /// Some, redraws render it instead of the chat dialogue. `doc_staging`
+    /// accumulates an incoming page so the current view stays up until
+    /// DocumentShow swaps it in. Chat-only apps never set either.
+    document: Option<DocState>,
+    doc_staging: Option<DocState>,
+
     // our security token for making changes to our record on the GAM
     token: [u32; 4],
+}
+
+/// Hard bound on stored document lines (a parser-side cap should hit first).
+const DOC_MAX_LINES: usize = 2048;
+/// Vertical space taken by a divider line, total.
+const DOC_DIVIDER_HEIGHT: u32 = 12;
+
+pub(crate) struct DocState {
+    #[allow(dead_code)]
+    title: String,
+    lines: Vec<DocLine>,
+    /// lazily-computed line heights (same trick as Post::bounding_box)
+    heights: Vec<Option<u32>>,
+    /// first visible line index
+    top: usize,
+    /// cursor line; when it is a link line it renders highlighted
+    cursor: usize,
 }
 
 #[allow(dead_code)]
@@ -180,6 +204,8 @@ impl Ui {
             app_menu: app_menu.to_owned(),
             menu_mgr,
             icontray,
+            document: None,
+            doc_staging: None,
             token,
             status_idle_text: t!("chat.status.initial", locales::LANG).to_string(),
         }
@@ -569,7 +595,10 @@ impl Ui {
     /// * ensuring the selected post is fully visible, and
     /// * best use of the screen is achieved
     pub(crate) fn redraw(&mut self) -> Result<(), xous::Error> {
-        if self.dialogue.is_some() {
+        if self.doc_active() {
+            self.layout_document();
+            self.status_last_update_ms = self.tt.elapsed_ms();
+        } else if self.dialogue.is_some() {
             self.layout().expect("layout failed to execute");
             self.status_last_update_ms = self.tt.elapsed_ms();
         } else {
@@ -578,6 +607,222 @@ impl Ui {
         log::trace!("chat app redraw##");
         self.gam.redraw().expect("couldn't redraw screen");
         Ok(())
+    }
+
+    // ------------------------- document mode -------------------------
+
+    pub(crate) fn doc_active(&self) -> bool { self.document.is_some() }
+
+    /// Start staging a new document. The current view (chat or a previous
+    /// document) keeps rendering until `doc_show` swaps the staged one in.
+    pub(crate) fn doc_begin(&mut self, title: &str) {
+        self.doc_staging = Some(DocState {
+            title: title.to_owned(),
+            lines: Vec::new(),
+            heights: Vec::new(),
+            top: 0,
+            cursor: 0,
+        });
+    }
+
+    pub(crate) fn doc_append(&mut self, lines: Vec<DocLine>) {
+        if let Some(doc) = self.doc_staging.as_mut() {
+            let room = DOC_MAX_LINES.saturating_sub(doc.lines.len());
+            for line in lines.into_iter().take(room) {
+                doc.lines.push(line);
+                doc.heights.push(None);
+            }
+        }
+    }
+
+    /// Swap the staged document in and show it from the top.
+    pub(crate) fn doc_show(&mut self) {
+        if let Some(doc) = self.doc_staging.take() {
+            self.document = Some(doc);
+        }
+    }
+
+    /// Leave document mode; the next redraw renders the chat dialogue again.
+    pub(crate) fn doc_clear(&mut self) {
+        self.document = None;
+        self.doc_staging = None;
+    }
+
+    /// Move the document cursor one line and keep it visible.
+    pub(crate) fn doc_cursor(&mut self, next: bool) {
+        let Some(doc) = self.document.as_ref() else { return };
+        if doc.lines.is_empty() {
+            return;
+        }
+        let last = doc.lines.len() - 1;
+        let cursor = doc.cursor;
+        let cursor = if next { (cursor + 1).min(last) } else { cursor.saturating_sub(1) };
+        if let Some(doc) = self.document.as_mut() {
+            doc.cursor = cursor;
+        }
+    }
+
+    /// The link under the cursor, if the cursor line is a link line.
+    pub(crate) fn doc_selected_link(&self) -> Option<u16> {
+        let doc = self.document.as_ref()?;
+        let line = doc.lines.get(doc.cursor)?;
+        if line.kind == DOC_KIND_LINK { Some(line.link_id) } else { None }
+    }
+
+    /// Build the TextView for one document line at vertical position `y`.
+    /// Must be constructed identically when measuring and when drawing, or
+    /// the cached heights go stale (same rule as chat bubbles).
+    fn doc_textview(&self, line: &DocLine, y: isize, highlight: bool) -> TextView {
+        let width = (self.vp.layout_screensize.x - 2 * self.vp.margin.x) as u16;
+        let bounds = match line.align {
+            DOC_ALIGN_CENTER => TextBounds::CenteredTop(Rectangle::new(
+                Point::new(self.vp.margin.x, y),
+                Point::new(self.vp.layout_screensize.x - self.vp.margin.x, self.vp.total_screensize.y),
+            )),
+            DOC_ALIGN_RIGHT => TextBounds::GrowableFromTr(
+                Point::new(self.vp.layout_screensize.x - self.vp.margin.x, y),
+                width,
+            ),
+            _ => TextBounds::GrowableFromTl(Point::new(self.vp.margin.x, y), width),
+        };
+        let mut tv = TextView::new(self.vp.canvas, bounds);
+        tv.style = match line.style {
+            DOC_STYLE_BOLD => GlyphStyle::Bold,
+            DOC_STYLE_MONO => GlyphStyle::Monospace,
+            DOC_STYLE_LARGE => GlyphStyle::Large,
+            _ => GlyphStyle::Regular,
+        };
+        tv.clip_rect = Some(Rectangle::new(
+            Point::new(0, self.vp.status_height as isize),
+            self.vp.total_screensize,
+        ));
+        tv.draw_border = highlight;
+        tv.border_width = 3;
+        tv.rounded_border = if highlight { Some(self.vp.bubble_radius) } else { None };
+        tv.clear_area = false;
+        tv.ellipsis = false;
+        tv.insertion = None;
+        tv.margin = Point::new(0, 0);
+        write!(tv.text, "{}", line.text).ok();
+        tv
+    }
+
+    /// Height of document line `i`, measured lazily and cached.
+    fn doc_line_height(&mut self, i: usize) -> u32 {
+        let Some(doc) = self.document.as_ref() else { return 0 };
+        let Some(line) = doc.lines.get(i) else { return 0 };
+        if let Some(h) = doc.heights[i] {
+            return h;
+        }
+        let h = if line.kind == DOC_KIND_DIVIDER || line.text.is_empty() {
+            DOC_DIVIDER_HEIGHT
+        } else {
+            let mut tv = self.doc_textview(line, self.vp.status_height as isize, false);
+            match self.gam.bounds_compute_textview(&mut tv) {
+                Ok(_) => tv.bounds_computed.map(|r| r.height()).unwrap_or(DOC_DIVIDER_HEIGHT),
+                Err(_) => DOC_DIVIDER_HEIGHT,
+            }
+        };
+        if let Some(doc) = self.document.as_mut() {
+            doc.heights[i] = Some(h);
+        }
+        h
+    }
+
+    /// Lines [top..] that fit on screen, by cached heights (no drawing).
+    fn doc_visible_count(&mut self, top: usize) -> usize {
+        let total = self.document.as_ref().map(|d| d.lines.len()).unwrap_or(0);
+        let budget = self.vp.layout_screensize.y as u32;
+        let mut used = 0u32;
+        let mut n = 0;
+        for i in top..total {
+            let h = self.doc_line_height(i) + self.vp.bubble_space as u32;
+            if used + h > budget && n > 0 {
+                break;
+            }
+            used += h;
+            n += 1;
+        }
+        n.max(1)
+    }
+
+    /// Render the document: scroll `top` to keep the cursor on screen, then
+    /// draw the visible lines (links bordered, cursor-link highlighted) and
+    /// the status bar, mirroring `layout()` for chat.
+    fn layout_document(&mut self) {
+        let (cursor, total) = match self.document.as_ref() {
+            Some(d) => (d.cursor, d.lines.len()),
+            None => return,
+        };
+        // Keep the cursor visible: pull `top` up to it, or walk down until
+        // the visible window (computed from cached heights) reaches it.
+        let mut top = self.document.as_ref().map(|d| d.top).unwrap_or(0).min(total.saturating_sub(1));
+        if cursor < top {
+            top = cursor;
+        }
+        while top + 1 < total && cursor >= top + self.doc_visible_count(top) {
+            top += 1;
+        }
+        if let Some(doc) = self.document.as_mut() {
+            doc.top = top;
+        }
+
+        // Clear everything (status bar included; it is redrawn below).
+        self.gam
+            .draw_rectangle(
+                self.vp.canvas,
+                Rectangle::new_with_style(
+                    Point::new(0, 0),
+                    self.vp.total_screensize,
+                    DrawStyle { fill_color: Some(PixelColor::Light), stroke_color: None, stroke_width: 0 },
+                ),
+            )
+            .expect("can't clear canvas area");
+
+        let bottom = self.vp.status_height as isize + self.vp.layout_screensize.y;
+        let mut y = self.vp.status_height as isize + self.vp.margin.y;
+        for i in top..total {
+            if y >= bottom {
+                break;
+            }
+            let line = match self.document.as_ref().and_then(|d| d.lines.get(i)) {
+                Some(l) => l.clone(),
+                None => break,
+            };
+            let drawn_h = if line.kind == DOC_KIND_DIVIDER {
+                let mid = y + (DOC_DIVIDER_HEIGHT / 2) as isize;
+                let rule = Line::new(
+                    Point::new(self.vp.margin.x, mid),
+                    Point::new(self.vp.layout_screensize.x - self.vp.margin.x, mid),
+                );
+                self.gam.draw_line(self.vp.canvas, rule).ok();
+                DOC_DIVIDER_HEIGHT
+            } else if line.text.is_empty() {
+                DOC_DIVIDER_HEIGHT
+            } else {
+                let highlight = i == cursor && line.kind == DOC_KIND_LINK;
+                let mut tv = self.doc_textview(&line, y, highlight);
+                match self.gam.post_textview(&mut tv) {
+                    Ok(_) => {
+                        let h = tv.bounds_computed.map(|r| r.height()).unwrap_or(DOC_DIVIDER_HEIGHT);
+                        if let Some(doc) = self.document.as_mut() {
+                            doc.heights[i] = Some(h);
+                        }
+                        h
+                    }
+                    Err(_) => DOC_DIVIDER_HEIGHT,
+                }
+            };
+            y += drawn_h as isize + self.vp.bubble_space;
+        }
+
+        // Status bar on top, exactly like the chat layout.
+        self.gam.post_textview(&mut self.status_tv).expect("couldn't render status bar");
+        let status_border = Line::new(
+            Point::new(0, self.vp.status_height as isize),
+            Point::new(self.vp.total_screensize.x, self.vp.status_height as isize),
+        );
+        self.gam.draw_line(self.vp.canvas, status_border).expect("couldn't draw status lower border");
     }
 
     /// Update the busy state. Does not touch any other aspect of the screen layout.

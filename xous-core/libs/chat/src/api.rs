@@ -55,6 +55,20 @@ pub enum ChatOp {
     UpdateBusyForced,
     /// exit the application
     Quit,
+    /// Document mode: reset the staging document + set its title (Buffer<DocMeta>).
+    /// The displayed view (chat or a previous document) is untouched until
+    /// DocumentShow, so a page being fetched never blanks the screen.
+    DocumentBegin,
+    /// Document mode: append a batch of lines to the staging document
+    /// (Buffer<DocLines>; send in modest batches, not one giant buffer)
+    DocumentLines,
+    /// Document mode: display the staged document (scalar)
+    DocumentShow,
+    /// Document mode: leave, returning to the chat dialogue (scalar)
+    DocumentClear,
+    /// Document mode: blocking scalar query of the cursor's link;
+    /// returns link_id+1, or 0 when the cursor is not on a link
+    DocumentGetSelected,
 }
 
 #[derive(Debug, num_derive::FromPrimitive, num_derive::ToPrimitive)]
@@ -155,4 +169,42 @@ pub enum AuthorFlag {
 #[derive(Archive, Serialize, Deserialize, Debug)]
 pub struct BusyMessage {
     pub busy_msg: String,
+}
+
+// One GlyphStyle per TextView means one style per document line; the app
+// flattens richer markup (e.g. micron) down to these.
+pub const DOC_STYLE_REGULAR: u8 = 0;
+pub const DOC_STYLE_BOLD: u8 = 1;
+pub const DOC_STYLE_MONO: u8 = 2;
+pub const DOC_STYLE_LARGE: u8 = 3;
+
+pub const DOC_ALIGN_LEFT: u8 = 0;
+pub const DOC_ALIGN_CENTER: u8 = 1;
+pub const DOC_ALIGN_RIGHT: u8 = 2;
+
+pub const DOC_KIND_TEXT: u8 = 0;
+pub const DOC_KIND_DIVIDER: u8 = 1;
+/// A selectable link line; `link_id` identifies it to the app.
+pub const DOC_KIND_LINK: u8 = 2;
+
+/// One line of a document-mode page (see DOC_STYLE/ALIGN/KIND constants).
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+pub struct DocLine {
+    pub text: String,
+    pub style: u8,
+    pub align: u8,
+    pub kind: u8,
+    pub link_id: u16,
+}
+
+/// Request for [`ChatOp::DocumentBegin`].
+#[derive(Archive, Serialize, Deserialize, Debug)]
+pub struct DocMeta {
+    pub title: String,
+}
+
+/// Request for [`ChatOp::DocumentLines`]: a batch of lines to append.
+#[derive(Archive, Serialize, Deserialize, Debug)]
+pub struct DocLines {
+    pub lines: Vec<DocLine>,
 }
