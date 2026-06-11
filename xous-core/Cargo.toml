@@ -100,6 +100,7 @@ members = [
   "libs/chat",
   "libs/reticulum-core",
   "libs/lxmf",
+  "libs/micron",
   "libs/flatipc",
   "libs/flatipc-derive",
   "libs/perflib",

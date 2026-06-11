@@ -11,6 +11,7 @@ description = "Host (std) Reticulum/LXMF client used to interop-test the portabl
 [dependencies]
 reticulum-core = { path = "../xous-core/libs/reticulum-core" }
 lxmf = { path = "../xous-core/libs/lxmf" }
+micron = { path = "../xous-core/libs/micron" }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 log = "0.4"
 env_logger = "0.11"

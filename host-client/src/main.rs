@@ -8,6 +8,7 @@
 //! Usage:
 //!   reticulum-host-client listen <host:port> [seconds]
 //!   reticulum-host-client send   <host:port> <recipient_dest_hash_hex> <text> [seconds]
+//!   reticulum-host-client fetch  <host:port> <node_dest_hash_hex> [page_path] [seconds]
 //!
 //! The identity is fixed (x25519=0x05*32, ed25519=0x06*32) so its address is
 //! stable across runs; pass RUST_LOG=info for detail.
@@ -89,13 +90,19 @@ fn main() {
     let is_send = mode == "send" || mode == "send-direct";
     // `sync <host:port> <pn_propagation_dest_hex> [seconds]` downloads stored
     // messages from a propagation node (validates the Resource receiver + sync).
-    let needs_target = is_send || mode == "sync";
+    // `fetch <host:port> <node_dest_hex> [path] [seconds]` requests a micron
+    // page from a NomadNet node, anonymously (no identify), and dumps the
+    // parsed result (validates the page-browser protocol path).
+    let needs_target = is_send || mode == "sync" || mode == "fetch";
     let listen_secs: u64 = match mode {
         "listen" => args.get(3).and_then(|s| s.parse().ok()).unwrap_or(30),
         "sync" => args.get(4).and_then(|s| s.parse().ok()).unwrap_or(30),
+        "fetch" => args.get(5).and_then(|s| s.parse().ok()).unwrap_or(30),
         _ if is_send => args.get(5).and_then(|s| s.parse().ok()).unwrap_or(30),
         _ => 30,
     };
+    let fetch_path: String =
+        args.get(4).cloned().unwrap_or_else(|| "/page/index.mu".to_string());
 
     let mut sync_phase: u8 = 0; // 0 idle, 1 list requested, 2 messages requested
     let mut sync_rx: Option<ResourceReceiver> = None;
@@ -112,6 +119,7 @@ fn main() {
     };
     let text = if is_send { args[4].clone() } else { String::new() };
     let mut sent = false;
+    let mut fetch_done = false;
     // listen mode: a backchannel reply waiting for the peer's LINKIDENTIFY
     // (LXMF identifies lazily — often after the first data packet).
     let mut pending_bc: Option<([u8; 16], [u8; 16])> = None; // (link_id, peer dest)
@@ -129,7 +137,7 @@ fn main() {
     }
 
     let deadline = Instant::now() + Duration::from_secs(listen_secs);
-    while Instant::now() < deadline {
+    while Instant::now() < deadline && !fetch_done {
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(raw) => {
                 let mut gen = || {
@@ -212,7 +220,7 @@ fn main() {
                         // If we're sending and just learned the target, send now.
                         if let Some(t) = target {
                             if destination_hash == t && !sent {
-                                if mode == "send-direct" || mode == "sync" {
+                                if mode == "send-direct" || mode == "sync" || mode == "fetch" {
                                     // Initiate a link; we deliver / sync once it's up.
                                     let known = tp.known(&t).expect("target known").clone();
                                     let mut ex = [0u8; 32];
@@ -253,6 +261,11 @@ fn main() {
                             sync_send_get(&mut writer, &tp, &link_id, Value::Array(vec![Value::Nil, Value::Nil]));
                             sync_phase = 1;
                             println!("sync: requested message list");
+                        } else if mode == "fetch" {
+                            // Anonymous page request: deliberately NO identify
+                            // (node page handlers are ALLOW_ALL).
+                            send_request(&mut writer, &tp, &link_id, fetch_path.as_bytes(), Value::Nil);
+                            println!("fetch: requested {}", fetch_path);
                         } else {
                             // Identify on the link so the peer's LXMRouter registers
                             // a backchannel — large replies then arrive here as
@@ -345,6 +358,15 @@ fn main() {
                         }
                         if mode == "sync" {
                             sync_handle_outlink(&mut writer, &tp, &mut sync_phase, &mut sync_rx, &link_id, context, plaintext);
+                        } else if mode == "fetch" {
+                            if let Some(payload) =
+                                outlink_response(&mut writer, &tp, &mut sync_rx, &link_id, context, plaintext)
+                            {
+                                if let Some(resp) = parse_resp(&payload) {
+                                    fetch_response(resp);
+                                    fetch_done = true;
+                                }
+                            }
                         } else {
                             // A Resource arriving on a link WE opened: the peer's
                             // LXMRouter is replying over the backchannel.
@@ -378,7 +400,14 @@ fn main() {
 // ---- propagation-node sync (validates the Resource receiver + /get exchange) ---
 
 fn sync_send_get(writer: &mut TcpStream, tp: &Transport, link_id: &[u8; 16], data: Value) {
-    let path_hash = truncated_hash(b"/get");
+    send_request(writer, tp, link_id, b"/get", data);
+}
+
+/// Send an RNS request on an out-link: msgpack([now, truncated_hash(path), data])
+/// as a DATA packet with context REQUEST. The node replies with
+/// msgpack([request_id, response]) as a RESPONSE packet or a Resource.
+fn send_request(writer: &mut TcpStream, tp: &Transport, link_id: &[u8; 16], path: &[u8], data: Value) {
+    let path_hash = truncated_hash(path);
     let req = Value::Array(vec![Value::F64(now() as f64), Value::Bin(path_hash.to_vec()), data]);
     let packed = msgpack::encode(&req);
     let mut iv = [0u8; 16];
@@ -407,22 +436,40 @@ fn sync_handle_outlink(
     context: u8,
     plaintext: Vec<u8>,
 ) {
-    match context {
-        CONTEXT_RESPONSE => {
-            if let Some(resp) = parse_resp(&plaintext) {
-                sync_response(writer, tp, phase, link_id, resp);
-            }
+    if let Some(payload) = outlink_response(writer, tp, rx, link_id, context, plaintext) {
+        if let Some(resp) = parse_resp(&payload) {
+            sync_response(writer, tp, phase, link_id, resp);
         }
-        CONTEXT_RESOURCE_ADV => match ResourceReceiver::accept(&plaintext) {
-            Ok(mut r) => {
-                if let Some(req) = r.next_request() {
-                    send_resource_req(writer, tp, link_id, &req, false);
+    }
+}
+
+/// Drive one out-link frame of an RNS request/response exchange. Returns the
+/// complete msgpack([request_id, response]) payload once available — directly
+/// for a RESPONSE packet, or after downloading + decrypting + proving a
+/// response Resource (ADV/HMU/parts pumped via `rx`).
+fn outlink_response(
+    writer: &mut TcpStream,
+    tp: &Transport,
+    rx: &mut Option<ResourceReceiver>,
+    link_id: &[u8; 16],
+    context: u8,
+    plaintext: Vec<u8>,
+) -> Option<Vec<u8>> {
+    match context {
+        CONTEXT_RESPONSE => Some(plaintext),
+        CONTEXT_RESOURCE_ADV => {
+            match ResourceReceiver::accept(&plaintext) {
+                Ok(mut r) => {
+                    if let Some(req) = r.next_request() {
+                        send_resource_req(writer, tp, link_id, &req, false);
+                    }
+                    *rx = Some(r);
+                    println!("receiving resource response…");
                 }
-                *rx = Some(r);
-                println!("sync: receiving resource…");
+                Err(e) => println!("resource advertisement rejected: {e}"),
             }
-            Err(e) => println!("sync: resource advertisement rejected: {e}"),
-        },
+            None
+        }
         CONTEXT_RESOURCE_HMU => {
             if let Some(r) = rx.as_mut() {
                 match r.receive_hashmap_update(&plaintext) {
@@ -431,9 +478,10 @@ fn sync_handle_outlink(
                             send_resource_req(writer, tp, link_id, &req, false);
                         }
                     }
-                    Err(e) => println!("sync: bad hashmap update: {e}"),
+                    Err(e) => println!("bad hashmap update: {e}"),
                 }
             }
+            None
         }
         CONTEXT_RESOURCE => {
             let (complete, next_req) = match rx.as_mut() {
@@ -453,16 +501,16 @@ fn sync_handle_outlink(
                 send_resource_req(writer, tp, link_id, &req, false);
             }
             if !complete {
-                return;
+                return None;
             }
-            let r = rx.as_ref().unwrap();
+            let r = rx.take().unwrap();
             let stream = r.concat();
             let plain = if r.encrypted() {
                 match tp.decrypt_out_link(link_id, &stream) {
                     Some(p) => p,
                     None => {
-                        println!("sync: resource stream decrypt failed");
-                        return;
+                        println!("resource stream decrypt failed");
+                        return None;
                     }
                 }
             } else {
@@ -474,16 +522,59 @@ fn sync_handle_outlink(
                         writer.write_all(&frame(&p)).ok();
                         writer.flush().ok();
                     }
-                    *rx = None;
-                    if let Some(resp) = parse_resp(&payload) {
-                        sync_response(writer, tp, phase, link_id, resp);
-                    }
+                    Some(payload)
                 }
-                Err(e) => println!("sync: resource finish failed: {e}"),
+                Err(e) => {
+                    println!("resource finish failed: {e}");
+                    None
+                }
             }
         }
-        _ => {}
+        _ => None,
     }
+}
+
+/// Print a fetched page: the raw micron source, then the parsed line/link dump.
+fn fetch_response(resp: Value) {
+    let bytes: Vec<u8> = match &resp {
+        Value::Int(code) => {
+            println!("fetch: node returned error code {code}");
+            return;
+        }
+        Value::Bin(b) => b.clone(),
+        Value::Str(s) => s.as_bytes().to_vec(),
+        other => {
+            println!("fetch: unexpected response shape: {other:?}");
+            return;
+        }
+    };
+    let src = String::from_utf8_lossy(&bytes);
+    println!("=== PAGE SOURCE ({} bytes) ===", bytes.len());
+    println!("{src}");
+    let doc = micron::parse(&src);
+    println!("=== PARSED ({} lines, {} links) ===", doc.lines.len(), doc.links.len());
+    for l in &doc.lines {
+        let style = match l.style {
+            micron::Style::Regular => "reg ",
+            micron::Style::Bold => "bold",
+            micron::Style::Mono => "mono",
+            micron::Style::Heading(n) => match n {
+                1 => "h1  ",
+                2 => "h2  ",
+                _ => "h3  ",
+            },
+        };
+        let kind = match l.kind {
+            micron::Kind::Divider => "—".to_string(),
+            micron::Kind::Link(id) => format!("link#{id} {}", l.text),
+            micron::Kind::Text => l.text.clone(),
+        };
+        println!("[{style}] {kind}");
+    }
+    for (i, link) in doc.links.iter().enumerate() {
+        println!("link[{i}] {:?} -> {:?} ({:?})", link.label, link.url, micron::resolve_link(&link.url));
+    }
+    println!(">>> PAGE OK ({} lines, {} links)", doc.lines.len(), doc.links.len());
 }
 
 /// Receive a Resource on a link — a peer sending us a direct message too

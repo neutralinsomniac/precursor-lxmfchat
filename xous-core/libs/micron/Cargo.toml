@@ -1,0 +1,8 @@
+[package]
+name = "micron"
+version = "0.1.0"
+authors = ["precursor-reticulum"]
+edition = "2021"
+description = "Micron (NomadNet .mu page markup) parser for Xous/Precursor"
+
+[dependencies]
