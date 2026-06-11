@@ -38,6 +38,8 @@ const TICKETS_DICT: &str = "lxmf.tickets";
 /// Held delivery-mark updates (✓/⇪/✗) for threads not yet opened. One key per
 /// contact (hex dest hash); value is length-prefixed `(ts, status, text)` records.
 const DELIVERY_DICT: &str = "lxmf.delivery";
+/// Saved NomadNet nodes for the page browser: key = hex dest hash, value = name.
+const NODES_DICT: &str = "lxmf.nodes";
 const KEY_IDENTITY: &str = "identity";
 const KEY_HUB: &str = "hub";
 const KEY_PEER: &str = "peer";
@@ -174,6 +176,10 @@ impl<'a> LxmfChat<'a> {
         let mut delivery_map = BTreeMap::new();
         load_delivery_updates(&pddb, &mut delivery_map);
 
+        // Restore the saved NomadNet nodes for the page browser.
+        let mut saved_nodes_map = BTreeMap::new();
+        load_nodes(&pddb, &mut saved_nodes_map);
+
         let hub = read_string(&pddb, KEY_HUB).unwrap_or_else(|| DEFAULT_HUB.to_string());
         let current_peer = read_string(&pddb, KEY_PEER).and_then(|s| parse_addr(&s));
         let display_name =
@@ -197,6 +203,9 @@ impl<'a> LxmfChat<'a> {
             recent_msg_ids: Mutex::new(Vec::new()),
             last_ts: Mutex::new(0),
             sync: Mutex::new(net::SyncState::new()),
+            nodes_seen: Mutex::new(BTreeMap::new()),
+            saved_nodes: Mutex::new(saved_nodes_map),
+            browser: Mutex::new(net::BrowserState::new()),
             in_resources: Mutex::new(BTreeMap::new()),
             stamp_costs: Mutex::new(BTreeMap::new()),
             found_addrs: Mutex::new(load_found_addrs(&pddb)),
@@ -272,6 +281,10 @@ impl<'a> LxmfChat<'a> {
             let synct = self.shared.clone();
             let sync_cid = self.chat_cid;
             std::thread::spawn(move || net::sync_thread(synct, sync_cid));
+            // And one for the node page browser, for the same reason.
+            let browse = self.shared.clone();
+            let browse_cid = self.chat_cid;
+            std::thread::spawn(move || net::browser_thread(browse, browse_cid));
             return;
         }
         // Manager already running: force the connection down so it reconnects
@@ -329,6 +342,12 @@ impl<'a> LxmfChat<'a> {
 
     /// Send an opportunistic LXMF message to the current peer.
     pub fn post(&mut self, text: &str) {
+        // The input line still works while a page is on screen, but a "send"
+        // there is almost certainly a mistake — the conversation isn't visible.
+        if self.browsing() {
+            self.chat.set_status_text("exit the browser first (F3) to send messages");
+            return;
+        }
         let peer = match *plock(&self.shared.current_peer) {
             Some(p) => p,
             None => {
@@ -750,6 +769,81 @@ impl<'a> LxmfChat<'a> {
             Err(_) => {}
         }
     }
+
+    /// Whether the page browser's document view is on screen — the F-keys and
+    /// arrow events switch to browser bindings while it is.
+    pub fn browsing(&self) -> bool { plock(&self.shared.browser).viewing }
+
+    /// Browse a NomadNet node: pick from saved nodes + announces seen this
+    /// session (saved first, then most recently announced), fetch its index page.
+    pub fn browse_node_interactive(&mut self, modals: &modals::Modals) {
+        let mut entries: Vec<([u8; TRUNCATED_HASHLENGTH], String)> =
+            { plock(&self.shared.saved_nodes).iter().map(|(k, v)| (*k, v.clone())).collect() };
+        let mut announced: Vec<([u8; TRUNCATED_HASHLENGTH], String, u64)> = {
+            plock(&self.shared.nodes_seen)
+                .iter()
+                .filter(|(k, _)| !entries.iter().any(|(e, _)| e == *k))
+                .map(|(k, (n, t))| (*k, n.clone(), *t))
+                .collect()
+        };
+        announced.sort_by(|a, b| b.2.cmp(&a.2));
+        entries.extend(announced.into_iter().map(|(h, n, _)| (h, n)));
+        entries.truncate(ANNOUNCE_LIST_MAX);
+        if let Some((addr, name)) = self.pick_peer(
+            modals,
+            entries,
+            "Browse which node?",
+            "No nodes known yet — wait for an announce, or use Browse address.",
+        ) {
+            self.start_browse(&addr, &name);
+        }
+    }
+
+    /// Browse a node by its 32-hex destination hash (for nodes that haven't
+    /// announced where we can hear them).
+    pub fn browse_address_interactive(&mut self, modals: &modals::Modals) {
+        match modals.alert_builder("Node address (32 hex)").field(None, None).build() {
+            Ok(p) => {
+                let s = p.first().as_str().trim().to_string();
+                match parse_addr(&s) {
+                    Some(addr) => {
+                        let name = plock(&self.shared.nodes_seen)
+                            .get(&addr)
+                            .map(|(n, _)| n.clone())
+                            .unwrap_or_else(|| format!("{}…", &s[..8]));
+                        self.start_browse(&addr, &name);
+                    }
+                    None => self.chat.set_status_text("invalid address (need 32 hex chars)"),
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Save the node and kick off the index-page fetch (the browser thread does
+    /// the network work; the document view appears when the page arrives).
+    fn start_browse(&mut self, addr: &[u8; TRUNCATED_HASHLENGTH], name: &str) {
+        plock(&self.shared.saved_nodes).insert(*addr, name.to_string());
+        persist_node(&self.pddb, addr, name);
+        net::request_page(&self.shared, self.chat_cid, *addr, net::PAGE_PATH_DEFAULT, false);
+    }
+
+    /// → / F2 while browsing: follow the link under the document cursor.
+    pub fn follow_link(&self) {
+        if self.browsing() {
+            net::follow_selected_link(&self.shared, self.chat_cid);
+        }
+    }
+
+    /// ← while browsing: go back one page, or exit on an empty stack.
+    pub fn browser_back(&self) {
+        if self.browsing() && !net::browser_back(&self.shared, self.chat_cid) {
+            self.browser_exit();
+        }
+    }
+
+    /// F3 while browsing: leave the browser and return to the conversation.
+    pub fn browser_exit(&self) { net::browser_exit(&self.shared, self.chat_cid); }
 
     /// Prompt for and store the hub address. Host and port are taken as two
     /// separate fields so no `:` needs to be typed (some keyboard layouts can't
@@ -1206,6 +1300,48 @@ fn load_delivery_updates(
 /// down to messageable LXMF peers (vs propagation nodes / other apps).
 pub(crate) fn lxmf_delivery_name_hash() -> [u8; NAME_HASH_LENGTH] {
     reticulum_core::destination::name_hash("lxmf", &["delivery"])
+}
+
+/// The 10-byte name hash of the NomadNet node aspect — announces matching it
+/// are page-serving nodes for the browser (app_data = node name, raw utf-8).
+pub(crate) fn nomad_node_name_hash() -> [u8; NAME_HASH_LENGTH] {
+    reticulum_core::destination::name_hash("nomadnetwork", &["node"])
+}
+
+/// Persist a browsed node (value = name only; the node's key/route are session
+/// state re-learned via path request, like keyless contacts).
+pub(crate) fn persist_node(pddb: &Pddb, dest_hash: &[u8; TRUNCATED_HASHLENGTH], name: &str) {
+    let key = reticulum_core::hex(dest_hash);
+    pddb.delete_key(NODES_DICT, &key, None).ok(); // delete-then-write: no stale tail
+    if let Ok(mut k) = pddb.get(NODES_DICT, &key, None, true, true, Some(name.len()), None::<fn()>) {
+        k.write_all(name.as_bytes()).ok();
+    }
+}
+
+/// Load the saved-nodes list at startup.
+fn load_nodes(pddb: &Pddb, nodes: &mut BTreeMap<[u8; TRUNCATED_HASHLENGTH], String>) {
+    let keys = match pddb.list_keys(NODES_DICT, None) {
+        Ok(k) => k,
+        Err(_) => return, // dict may not exist yet
+    };
+    for key in keys {
+        let dh = match parse_addr(&key) {
+            Some(d) => d,
+            None => continue,
+        };
+        let mut buf = Vec::new();
+        match pddb.get(NODES_DICT, &key, None, false, false, None, None::<fn()>) {
+            Ok(mut k) => {
+                if k.read_to_end(&mut buf).is_err() {
+                    continue;
+                }
+            }
+            Err(_) => continue,
+        }
+        let name = String::from_utf8_lossy(&buf).trim().to_string();
+        let name = if name.is_empty() { key } else { name };
+        nodes.insert(dh, name);
+    }
 }
 
 /// Extract a peer's display name from an LXMF delivery announce's app_data.

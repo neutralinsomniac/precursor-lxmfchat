@@ -28,6 +28,7 @@ chat = { path = "../../libs/chat" }
 # portable protocol crates
 reticulum-core = { path = "../../libs/reticulum-core" }
 lxmf = { path = "../../libs/lxmf" }
+micron = { path = "../../libs/micron" }
 
 [features]
 default = []

@@ -68,6 +68,8 @@ fn wrapped_main() -> ! {
     chat.menu_add(menu_item("Set peer", MenuOp::SetPeer)).ok();
     chat.menu_add(menu_item("Set hub", MenuOp::SetHub)).ok();
     chat.menu_add(menu_item("Sync messages", MenuOp::Sync)).ok();
+    chat.menu_add(menu_item("Browse node", MenuOp::Browse)).ok();
+    chat.menu_add(menu_item("Browse address", MenuOp::BrowseAddress)).ok();
     chat.menu_add(menu_item("Clear history", MenuOp::ClearHistory)).ok();
     chat.menu_add(menu_item("Close", MenuOp::Noop)).ok();
 
@@ -90,9 +92,32 @@ fn wrapped_main() -> ! {
                             }
                             app.redraw();
                         }
-                        Some(Event::F1) => app.jump_to_unread(),
-                        Some(Event::F2) => app.jump_back(),
-                        Some(Event::F3) => app.sync_now(),
+                        // While the page browser is on screen the keys rebind:
+                        // F2/→ open the selected link, ← goes back, F3 exits
+                        // (the icontray hints say so). Otherwise the chat
+                        // bindings apply; Left/Right are no-ops there (the chat
+                        // lib already handled menus before forwarding them).
+                        Some(Event::F1) => {
+                            if !app.browsing() {
+                                app.jump_to_unread()
+                            }
+                        }
+                        Some(Event::F2) => {
+                            if app.browsing() {
+                                app.follow_link()
+                            } else {
+                                app.jump_back()
+                            }
+                        }
+                        Some(Event::F3) => {
+                            if app.browsing() {
+                                app.browser_exit()
+                            } else {
+                                app.sync_now()
+                            }
+                        }
+                        Some(Event::Left) => app.browser_back(),
+                        Some(Event::Right) => app.follow_link(),
                         // F4 left unbound: that key doubles as the power key.
                         _ => {}
                     }
@@ -117,6 +142,8 @@ fn wrapped_main() -> ! {
                         Some(MenuOp::SetHub) => app.set_hub_interactive(&modals),
                         Some(MenuOp::ClearHistory) => app.clear_history_interactive(&modals),
                         Some(MenuOp::Sync) => app.sync_now(),
+                        Some(MenuOp::Browse) => app.browse_node_interactive(&modals),
+                        Some(MenuOp::BrowseAddress) => app.browse_address_interactive(&modals),
                         Some(MenuOp::Noop) | None => {}
                     }
                 });

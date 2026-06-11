@@ -221,6 +221,76 @@ impl SyncState {
     }
 }
 
+/// Stage of a NomadNet page fetch (the node browser). One at a time.
+#[derive(Clone, Copy, PartialEq)]
+enum BrowserPhase {
+    Idle,
+    /// Waiting for the link to the node to come up.
+    Linking,
+    /// Request sent; awaiting the RESPONSE packet or response Resource.
+    Fetching,
+}
+
+/// State of the node page browser: the in-flight fetch (mirrors [`SyncState`]'s
+/// proven lifecycle) plus the navigation state of the shown page.
+pub struct BrowserState {
+    phase: BrowserPhase,
+    /// The node the in-flight fetch targets.
+    node: Option<[u8; TRUNCATED_HASHLENGTH]>,
+    /// The page path being fetched (e.g. "/page/index.mu").
+    path: String,
+    /// The established outbound link id to the node.
+    link_id: Option<[u8; TRUNCATED_HASHLENGTH]>,
+    /// In-progress Resource download of a large page.
+    receiver: Option<ResourceReceiver>,
+    /// Wall-clock deadline; the fetch aborts if it stalls past this.
+    deadline: u64,
+    /// Set by [`request_page`] (the menu / a key, on the main thread) and
+    /// consumed by the browser thread — no hub I/O ever runs on the UI thread.
+    requested: Option<([u8; TRUNCATED_HASHLENGTH], String)>,
+    /// Earliest time the browser thread should act on `requested` (the retry
+    /// backoff while the node's key/route resolves).
+    next_attempt: u64,
+    /// Times a requested fetch was deferred for want of the node's key/route.
+    route_tries: u8,
+    /// LINKREQUESTs sent for this fetch.
+    link_tries: u8,
+    /// The page currently displayed, for relative links and the back stack.
+    current: Option<([u8; TRUNCATED_HASHLENGTH], String)>,
+    /// Whether the in-flight fetch should push the current page onto the back
+    /// stack when it renders (true for following a link, false for ← back).
+    pending_push: bool,
+    /// Pages to return to with ← (newest last).
+    back: Vec<([u8; TRUNCATED_HASHLENGTH], String)>,
+    /// Links of the displayed page, indexed by the DocLine link id.
+    pub links: Vec<micron::Link>,
+    /// Whether the document view is currently shown (the app's key handling
+    /// switches to browser bindings while true).
+    pub viewing: bool,
+}
+
+impl BrowserState {
+    pub fn new() -> BrowserState {
+        BrowserState {
+            phase: BrowserPhase::Idle,
+            node: None,
+            path: String::new(),
+            link_id: None,
+            receiver: None,
+            deadline: 0,
+            requested: None,
+            next_attempt: 0,
+            route_tries: 0,
+            link_tries: 0,
+            current: None,
+            pending_push: false,
+            back: Vec::new(),
+            links: Vec::new(),
+            viewing: false,
+        }
+    }
+}
+
 /// State shared between the app's main thread and the network RX thread.
 pub struct Shared {
     pub transport: Mutex<Transport>,
@@ -330,6 +400,13 @@ pub struct Shared {
     pub last_ts: Mutex<u64>,
     /// Propagation-node message sync state machine (download stored messages).
     pub sync: Mutex<SyncState>,
+    /// Live directory of NomadNet node announces seen this session:
+    /// node dest hash -> (node name, last-seen unix seconds). In-memory only.
+    pub nodes_seen: Mutex<BTreeMap<[u8; TRUNCATED_HASHLENGTH], (String, u64)>>,
+    /// Nodes the user has browsed: dest hash -> name. Persisted (lxmf.nodes).
+    pub saved_nodes: Mutex<BTreeMap<[u8; TRUNCATED_HASHLENGTH], String>>,
+    /// Node page browser state machine (fetch + navigation).
+    pub browser: Mutex<BrowserState>,
     /// In-progress inbound Resource downloads — direct messages too large for a
     /// single link packet, arriving on links peers opened to us — keyed by link
     /// id. Bounded by [`MAX_IN_RESOURCES`]; cleared on reconnect (the links die
@@ -541,6 +618,13 @@ pub fn connection_manager(shared: Arc<Shared>, chat_cid: CID) {
                         if sync_active {
                             sync_finish(&shared, chat_cid, "connection lost — try again");
                         }
+                        let browse_active = { plock(&shared.browser).phase != BrowserPhase::Idle };
+                        if browse_active {
+                            browser_finish(&shared, chat_cid, "connection lost — try again");
+                        } else {
+                            // Any kept page link died with the session.
+                            plock(&shared.browser).link_id = None;
+                        }
                         chat::cf_set_status_text(chat_cid, "hub connection lost — reconnecting…");
                     }
                     Err(e) => {
@@ -647,6 +731,15 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
             // probe. Reading it already proved the link alive; we're not a peer.
             if destination_hash == shared.our_dh {
                 log::info!("hub liveness probe answered");
+                return;
+            }
+            // NomadNet nodes go in their own directory for the page browser
+            // (app_data is the node name as raw utf-8) — never the peer lists,
+            // and none of the LXMF contact/stamp/ticket handling below applies.
+            if info.name_hash == crate::nomad_node_name_hash() {
+                let name = String::from_utf8_lossy(&info.app_data).trim().to_string();
+                let name = if name.is_empty() { hex(&destination_hash) } else { name };
+                plock(&shared.nodes_seen).insert(destination_hash, (name, now_secs()));
                 return;
             }
             // Only list LXMF *delivery* destinations — skip propagation-node and
@@ -825,8 +918,10 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
             }
             // Identify ourselves on links to PEERS (the PN flow identifies
             // during sync) so their replies can ride this link back — the
-            // provider half of the LXMF backchannel.
-            if crate::propagation_node() != Some(target) {
+            // provider half of the LXMF backchannel. NEVER on a link the page
+            // browser opened: node pages are served ALLOW_ALL and browsing
+            // stays anonymous.
+            if crate::propagation_node() != Some(target) && !browser_targets(shared, &target) {
                 let mut iiv = [0u8; IV_LENGTH];
                 crate::fill_random(trng, &mut iiv);
                 let idp = { plock(&shared.transport).make_out_link_identify(&link_id, &iiv) };
@@ -835,6 +930,7 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
                 }
             }
             sync_on_link_up(shared, chat_cid, trng, link_id, target);
+            browser_on_link_up(shared, chat_cid, trng, link_id, target);
             pump_outbox(shared, chat_cid, pddb, trng);
         }
         // A packet proof confirmed one of our sent messages reached its target.
@@ -859,12 +955,17 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
                     return;
                 }
             }
-            // Sync traffic goes to the sync state machine; anything else on a
-            // link WE opened is the peer using the backchannel — including a
-            // LARGE reply arriving as a Resource on our own link.
+            // Sync traffic goes to the sync state machine and page traffic to
+            // the browser's (BEFORE the resource fallback, or a page Resource
+            // would be fed to deliver_lxmf); anything else on a link WE opened
+            // is the peer using the backchannel — including a LARGE reply
+            // arriving as a Resource on our own link.
             let is_sync_link = { plock(&shared.sync).link_id == Some(link_id) };
+            let is_browser_link = { plock(&shared.browser).link_id == Some(link_id) };
             if is_sync_link {
                 sync_on_outlink_data(shared, chat_cid, pddb, trng, link_id, context, plaintext);
+            } else if is_browser_link {
+                browser_on_outlink_data(shared, chat_cid, trng, link_id, context, plaintext);
             } else {
                 outlink_resource(shared, chat_cid, pddb, trng, link_id, context, plaintext);
             }
@@ -880,6 +981,20 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
             };
             if sync_was_on_it {
                 sync_finish(shared, chat_cid, "node closed the link — try again");
+            }
+            let browse_was_on_it = {
+                let b = plock(&shared.browser);
+                b.link_id == Some(link_id)
+            };
+            if browse_was_on_it {
+                let mid_fetch = { plock(&shared.browser).phase != BrowserPhase::Idle };
+                if mid_fetch {
+                    browser_finish(shared, chat_cid, "node closed the link — try again");
+                } else {
+                    // Idle on a kept link: just forget it; the next fetch
+                    // establishes a fresh one.
+                    plock(&shared.browser).link_id = None;
+                }
             }
         }
         Event::DataUndecryptable { destination_hash, reason } => {
@@ -2104,6 +2219,591 @@ fn parse_rns_response(payload: &[u8]) -> Option<Value> {
         return None;
     }
     Some(arr[1].clone())
+}
+
+// ---- Node page browser ----------------------------------------------------
+//
+// Fetch micron pages from NomadNet nodes: link to the node's nomadnetwork.node
+// destination (ANONYMOUSLY — no LINKIDENTIFY; page handlers are ALLOW_ALL),
+// send an RNS request for the page path, and render the response through the
+// chat lib's document mode. The fetch lifecycle is a clone of the sync state
+// machine above (same route acquisition, link reuse, retry budgets, watchdog);
+// wire behavior validated live against real RNS by scripts/page_test.sh.
+
+/// The default page served by a node.
+pub const PAGE_PATH_DEFAULT: &str = "/page/index.mu";
+/// Abort a page fetch that stalls past this many seconds.
+const PAGE_DEADLINE_SECS: u64 = 60;
+/// Retry cadence/bound while a requested fetch waits for the node's key/route.
+const BROWSER_ROUTE_RETRY_SECS: u64 = 3;
+const BROWSER_ROUTE_TRIES: u8 = 20;
+/// Pages you can go ← back through (oldest dropped).
+const BACK_STACK_MAX: usize = 16;
+
+/// Short human label for a node (saved/announced name, else a hex prefix).
+fn node_label(shared: &Arc<Shared>, node: &[u8; TRUNCATED_HASHLENGTH]) -> String {
+    plock(&shared.saved_nodes)
+        .get(node)
+        .cloned()
+        .or_else(|| plock(&shared.nodes_seen).get(node).map(|(n, _)| n.clone()))
+        .unwrap_or_else(|| hex(&node[..4]))
+}
+
+/// True while the browser is mid-fetch to `target` (gates LINKIDENTIFY off
+/// the browser's links so page requests stay anonymous).
+fn browser_targets(shared: &Arc<Shared>, target: &[u8; TRUNCATED_HASHLENGTH]) -> bool {
+    let b = plock(&shared.browser);
+    b.phase != BrowserPhase::Idle && b.node == Some(*target)
+}
+
+/// Request a page, from the main thread (menu/keys): only flags the request —
+/// the browser thread does the link + hub writes. `push_back` records the
+/// currently shown page on the back stack once the new page actually renders.
+pub fn request_page(
+    shared: &Arc<Shared>,
+    chat_cid: CID,
+    node: [u8; TRUNCATED_HASHLENGTH],
+    path: &str,
+    push_back: bool,
+) {
+    {
+        let mut b = plock(&shared.browser);
+        if b.phase != BrowserPhase::Idle {
+            drop(b);
+            chat::cf_set_status_text(chat_cid, "page fetch already in progress…");
+            return;
+        }
+        b.requested = Some((node, path.to_string()));
+        b.pending_push = push_back;
+        b.next_attempt = 0;
+        b.route_tries = 0;
+    }
+    chat::cf_set_status_text(chat_cid, &format!("page: fetching {}…", node_label(shared, &node)));
+}
+
+/// One lifetime thread driving the page browser (mirrors [`sync_thread`]):
+/// watchdog, link retries, and consuming requests off the UI thread.
+pub fn browser_thread(shared: Arc<Shared>, chat_cid: CID) {
+    wait_for_time_server();
+    let trng = match XousNames::new().ok().and_then(|xns| Trng::new(&xns).ok()) {
+        Some(t) => t,
+        None => {
+            log::error!("browser thread: TRNG init failed");
+            chat::cf_set_status_text_forced(chat_cid, "browser unavailable (init failed — restart app)");
+            return;
+        }
+    };
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        browser_tick(&shared, chat_cid, &trng);
+    }
+}
+
+fn browser_tick(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
+    let now = now_secs();
+    // Time out a stuck fetch.
+    let stalled = {
+        let b = plock(&shared.browser);
+        b.phase != BrowserPhase::Idle && now > b.deadline
+    };
+    if stalled {
+        browser_finish(shared, chat_cid, "timed out");
+        return;
+    }
+    // Mid-fetch, still waiting for the link: re-send a lost LINKREQUEST
+    // (no-ops while one is still pending — same recovery as the sync path).
+    let linking = {
+        let b = plock(&shared.browser);
+        if b.phase == BrowserPhase::Linking { b.node } else { None }
+    };
+    if let Some(node) = linking {
+        let known = { plock(&shared.transport).known(&node).cloned() };
+        if let Some(k) = known {
+            match send_link_request(shared, trng, &node, &k.identity, now) {
+                LinkReqOutcome::Sent => {
+                    let tries = {
+                        let mut b = plock(&shared.browser);
+                        b.link_tries = b.link_tries.saturating_add(1);
+                        b.link_tries
+                    };
+                    chat::cf_set_status_text_forced(
+                        chat_cid,
+                        &format!("page: contacting node (try {tries})…"),
+                    );
+                }
+                LinkReqOutcome::WriteFailed => {
+                    browser_finish(shared, chat_cid, "hub write failed — try again");
+                }
+                LinkReqOutcome::Pending => {}
+            }
+        }
+        return;
+    }
+    // A requested fetch (from the menu / a key) executes HERE.
+    let job = {
+        let mut b = plock(&shared.browser);
+        if b.phase == BrowserPhase::Idle && b.requested.is_some() && now >= b.next_attempt {
+            b.requested.take()
+        } else {
+            None
+        }
+    };
+    if let Some((node, path)) = job {
+        start_fetch(shared, chat_cid, trng, node, path);
+    }
+}
+
+/// Begin a page fetch: ensure connection + the node's key/route (bounded
+/// retries via the request flag), then reuse or open the link and send the
+/// request. Structure mirrors [`start_sync`] — including its lock discipline.
+fn start_fetch(
+    shared: &Arc<Shared>,
+    chat_cid: CID,
+    trng: &Trng,
+    node: [u8; TRUNCATED_HASHLENGTH],
+    path: String,
+) {
+    let now = now_secs();
+    // Re-arm the request (bounded) while there is no connection or no route —
+    // mirrors start_sync's wait-for-resources loop.
+    let rearm = |b: &mut BrowserState| -> bool {
+        b.route_tries = b.route_tries.saturating_add(1);
+        if b.route_tries <= BROWSER_ROUTE_TRIES {
+            b.requested = Some((node, path.clone()));
+            b.next_attempt = now + BROWSER_ROUTE_RETRY_SECS;
+            true
+        } else {
+            false
+        }
+    };
+    if !shared.connected.load(core::sync::atomic::Ordering::SeqCst) {
+        let retrying = { rearm(&mut plock(&shared.browser)) };
+        if retrying {
+            chat::cf_set_status_text_forced(chat_cid, "page: waiting for hub connection…");
+        } else {
+            browser_finish(shared, chat_cid, "not connected to the hub");
+        }
+        return;
+    }
+    let (known, have_path) = {
+        let tp = plock(&shared.transport);
+        (tp.known(&node).cloned(), tp.has_path(&node))
+    };
+    let known = match (known, have_path) {
+        (Some(k), true) => k,
+        _ => {
+            let retrying = { rearm(&mut plock(&shared.browser)) };
+            if !retrying {
+                browser_finish(shared, chat_cid, "no route to the node");
+                return;
+            }
+            chat::cf_set_status_text_forced(chat_cid, "page: finding the node…");
+            request_peer_key(shared, trng, &node);
+            return;
+        }
+    };
+    {
+        let mut b = plock(&shared.browser);
+        b.phase = BrowserPhase::Linking;
+        b.node = Some(node);
+        b.path = path;
+        b.receiver = None;
+        b.deadline = now + PAGE_DEADLINE_SECS;
+        b.link_id = None;
+        b.route_tries = 0;
+        b.next_attempt = 0;
+        b.link_tries = 0;
+    }
+    // Bind before matching — a guard in a match scrutinee outlives the arms
+    // (the sync self-deadlock lesson; see start_sync).
+    let existing_link = { plock(&shared.transport).outbound_link_for(&node, now) };
+    match existing_link {
+        Some(lid) => {
+            plock(&shared.browser).link_id = Some(lid);
+            browser_send_request(shared, chat_cid, trng, lid);
+        }
+        None => {
+            chat::cf_set_status_text_forced(chat_cid, "page: contacting node (try 1)…");
+            match send_link_request(shared, trng, &node, &known.identity, now) {
+                LinkReqOutcome::WriteFailed => {
+                    browser_finish(shared, chat_cid, "hub write failed — try again");
+                }
+                LinkReqOutcome::Sent | LinkReqOutcome::Pending => {
+                    plock(&shared.browser).link_tries = 1;
+                }
+            }
+        }
+    }
+}
+
+/// Continue a pending fetch once the link to the node comes up. No-op unless
+/// the browser is mid-Linking to this node.
+fn browser_on_link_up(
+    shared: &Arc<Shared>,
+    chat_cid: CID,
+    trng: &Trng,
+    link_id: [u8; TRUNCATED_HASHLENGTH],
+    target: [u8; TRUNCATED_HASHLENGTH],
+) {
+    let go = {
+        let mut b = plock(&shared.browser);
+        if b.phase == BrowserPhase::Linking && b.node == Some(target) {
+            b.link_id = Some(link_id);
+            true
+        } else {
+            false
+        }
+    };
+    if go {
+        browser_send_request(shared, chat_cid, trng, link_id);
+    }
+}
+
+/// Send the page request on the established link: an anonymous RNS request,
+/// msgpack `[now, truncated_hash(path), Nil]` with context REQUEST.
+fn browser_send_request(
+    shared: &Arc<Shared>,
+    chat_cid: CID,
+    trng: &Trng,
+    link_id: [u8; TRUNCATED_HASHLENGTH],
+) {
+    let path = {
+        let mut b = plock(&shared.browser);
+        b.phase = BrowserPhase::Fetching;
+        b.path.clone()
+    };
+    chat::cf_set_status_text_forced(chat_cid, &format!("page: requesting {path}…"));
+    let path_hash = truncated_hash(path.as_bytes());
+    let req =
+        Value::Array(vec![Value::F64(now_secs() as f64), Value::Bin(path_hash.to_vec()), Value::Nil]);
+    let packed = msgpack::encode(&req);
+    let mut iv = [0u8; IV_LENGTH];
+    crate::fill_random(trng, &mut iv);
+    // Bind before testing (scrutinee guards outlive the body).
+    let raw = { plock(&shared.transport).make_out_link_context(&link_id, CONTEXT_REQUEST, &packed, &iv) };
+    match raw {
+        Some(raw) => {
+            if !write_to_hub(shared, &raw) {
+                browser_finish(shared, chat_cid, "hub write failed — try again");
+            }
+        }
+        // The link vanished between establishment and the request.
+        None => browser_finish(shared, chat_cid, "link lost — try again"),
+    }
+}
+
+/// Dispatch decrypted out-link data for the active fetch (RESPONSE packet, or
+/// a RESOURCE advertisement / parts carrying a large page). Structural clone
+/// of [`sync_on_outlink_data`] over the browser's receiver.
+fn browser_on_outlink_data(
+    shared: &Arc<Shared>,
+    chat_cid: CID,
+    trng: &Trng,
+    link_id: [u8; TRUNCATED_HASHLENGTH],
+    context: u8,
+    plaintext: Vec<u8>,
+) {
+    {
+        let b = plock(&shared.browser);
+        if b.link_id != Some(link_id) || b.phase != BrowserPhase::Fetching {
+            return;
+        }
+    }
+    match context {
+        CONTEXT_RESPONSE => {
+            if let Some(resp) = parse_rns_response(&plaintext) {
+                page_received(shared, chat_cid, resp);
+            }
+        }
+        CONTEXT_RESOURCE_ADV => match ResourceReceiver::accept(&plaintext) {
+            Ok(mut rx) => {
+                let req = rx.next_request();
+                plock(&shared.browser).receiver = Some(rx);
+                if let Some(req) = req {
+                    send_out_link_request(shared, trng, &link_id, &req);
+                }
+                chat::cf_set_status_text_forced(chat_cid, "page: downloading…");
+            }
+            Err(e) => {
+                log::warn!("page resource advertisement rejected: {e}");
+                browser_finish(shared, chat_cid, "page too large / unsupported");
+            }
+        },
+        CONTEXT_RESOURCE_HMU => {
+            let next_req = {
+                let mut b = plock(&shared.browser);
+                match &mut b.receiver {
+                    Some(rx) => match rx.receive_hashmap_update(&plaintext) {
+                        Ok(()) => rx.next_request(),
+                        Err(e) => {
+                            log::warn!("page: bad hashmap update: {e}");
+                            None
+                        }
+                    },
+                    None => None,
+                }
+            };
+            if let Some(req) = next_req {
+                send_out_link_request(shared, trng, &link_id, &req);
+            }
+        }
+        CONTEXT_RESOURCE => {
+            let (complete, next_req) = {
+                let mut b = plock(&shared.browser);
+                match &mut b.receiver {
+                    Some(rx) => {
+                        let window_done = rx.receive_part(&plaintext);
+                        if rx.is_complete() {
+                            (true, None)
+                        } else if window_done {
+                            (false, rx.next_request())
+                        } else {
+                            (false, None)
+                        }
+                    }
+                    None => (false, None),
+                }
+            };
+            if let Some(req) = next_req {
+                send_out_link_request(shared, trng, &link_id, &req);
+            }
+            if !complete {
+                return;
+            }
+            // The receiver can vanish under the watchdog — never unwrap it.
+            let (stream, encrypted) = {
+                let b = plock(&shared.browser);
+                match b.receiver.as_ref() {
+                    Some(rx) => (rx.concat(), rx.encrypted()),
+                    None => return,
+                }
+            };
+            let plain = if encrypted {
+                // Bind first: the None arm re-locks the transport (browser_finish).
+                let decrypted = { plock(&shared.transport).decrypt_out_link(&link_id, &stream) };
+                match decrypted {
+                    Some(p) => p,
+                    None => {
+                        browser_finish(shared, chat_cid, "page failed (decrypt)");
+                        return;
+                    }
+                }
+            } else {
+                stream
+            };
+            let finished = {
+                let b = plock(&shared.browser);
+                match b.receiver.as_ref() {
+                    Some(rx) => rx.finish(&plain),
+                    None => return,
+                }
+            };
+            match finished {
+                Ok((payload, proof)) => {
+                    let raw = { plock(&shared.transport).make_out_link_resource_proof(&link_id, &proof) };
+                    if let Some(raw) = raw {
+                        write_to_hub(shared, &raw);
+                    }
+                    plock(&shared.browser).receiver = None;
+                    if let Some(resp) = parse_rns_response(&payload) {
+                        page_received(shared, chat_cid, resp);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("page resource invalid: {e}");
+                    browser_finish(shared, chat_cid, "page failed (resource)");
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A page response arrived: parse the micron source, hand the styled lines to
+/// the chat lib's document view, and update the navigation state. The link is
+/// KEPT for follow-up fetches (page browsing is bursty; `outbound_link_for`
+/// reuses it, and stale links self-heal via LINKCLOSE / connection resets).
+fn page_received(shared: &Arc<Shared>, chat_cid: CID, resp: Value) {
+    let bytes: Vec<u8> = match &resp {
+        Value::Int(code) => {
+            let why = match *code {
+                240 => "node needs identification",
+                241 => "node denied access",
+                _ => "node error",
+            };
+            browser_finish(shared, chat_cid, why);
+            return;
+        }
+        Value::Bin(b) => b.clone(),
+        Value::Str(s) => s.as_bytes().to_vec(),
+        _ => {
+            browser_finish(shared, chat_cid, "unexpected response");
+            return;
+        }
+    };
+    let src = String::from_utf8_lossy(&bytes);
+    let doc = micron::parse(&src);
+
+    // Map parser output onto chat-lib document lines.
+    let mut lines: Vec<chat::DocLine> = Vec::with_capacity(doc.lines.len());
+    for l in &doc.lines {
+        let style = match l.style {
+            micron::Style::Heading(1) => chat::DOC_STYLE_LARGE,
+            micron::Style::Heading(_) | micron::Style::Bold => chat::DOC_STYLE_BOLD,
+            micron::Style::Mono => chat::DOC_STYLE_MONO,
+            micron::Style::Regular => chat::DOC_STYLE_REGULAR,
+        };
+        let align = match l.align {
+            micron::Align::Center => chat::DOC_ALIGN_CENTER,
+            micron::Align::Right => chat::DOC_ALIGN_RIGHT,
+            micron::Align::Left => chat::DOC_ALIGN_LEFT,
+        };
+        let (kind, link_id) = match l.kind {
+            micron::Kind::Divider => (chat::DOC_KIND_DIVIDER, 0),
+            micron::Kind::Link(id) => (chat::DOC_KIND_LINK, id),
+            micron::Kind::Text => (chat::DOC_KIND_TEXT, 0),
+        };
+        lines.push(chat::DocLine { text: l.text.clone(), style, align, kind, link_id });
+    }
+
+    // Update the navigation state and pull out what the render needs.
+    let (node, path, entering) = {
+        let mut b = plock(&shared.browser);
+        let node = match b.node {
+            Some(n) => n,
+            None => return, // finished/aborted concurrently
+        };
+        let path = core::mem::take(&mut b.path);
+        if b.pending_push {
+            if let Some(prev) = b.current.take() {
+                b.back.push(prev);
+                if b.back.len() > BACK_STACK_MAX {
+                    b.back.remove(0);
+                }
+            }
+            b.pending_push = false;
+        }
+        b.current = Some((node, path.clone()));
+        b.links = doc.links;
+        b.phase = BrowserPhase::Idle;
+        b.node = None;
+        b.receiver = None;
+        let entering = !b.viewing;
+        b.viewing = true;
+        (node, path, entering)
+    };
+
+    let label = node_label(shared, &node);
+    let title = format!("{label}{path}");
+    chat::cf_document_begin(chat_cid, &title);
+    chat::cf_document_lines(chat_cid, &lines);
+    chat::cf_document_show(chat_cid);
+    if entering {
+        // Browser key hints; restored by browser_exit.
+        chat::cf_icontray_set(chat_cid, 0, "");
+        chat::cf_icontray_set(chat_cid, 1, "open");
+        chat::cf_icontray_set(chat_cid, 2, "exit");
+    }
+    let line = format!("\u{25a3} {title}");
+    chat::cf_set_status_idle_text(chat_cid, &line);
+    chat::cf_set_status_text_forced(chat_cid, &line);
+}
+
+/// End a FAILED fetch and reset the fetch machine (the displayed page, back
+/// stack and viewing state are untouched — only the in-flight fetch dies).
+/// The link is dropped: a fetch failure usually means it's suspect.
+fn browser_finish(shared: &Arc<Shared>, chat_cid: CID, msg: &str) {
+    let link = {
+        let mut b = plock(&shared.browser);
+        b.phase = BrowserPhase::Idle;
+        b.node = None;
+        b.receiver = None;
+        b.requested = None;
+        b.pending_push = false;
+        b.route_tries = 0;
+        b.link_id.take()
+    };
+    if let Some(lid) = link {
+        plock(&shared.transport).drop_out_link(&lid);
+    }
+    let line = format!("page: {msg}");
+    chat::cf_set_status_idle_text(chat_cid, &line);
+    chat::cf_set_status_text_forced(chat_cid, &line);
+}
+
+/// Follow the link under the document cursor (→ / F2 while browsing).
+pub fn follow_selected_link(shared: &Arc<Shared>, chat_cid: CID) {
+    let id = match chat::cf_document_selected(chat_cid) {
+        Some(id) => id as usize,
+        None => {
+            chat::cf_set_status_text(chat_cid, "move the cursor onto a link first (↑/↓)");
+            return;
+        }
+    };
+    let (url, current) = {
+        let b = plock(&shared.browser);
+        match b.links.get(id) {
+            Some(l) => (l.url.clone(), b.current.clone()),
+            None => return,
+        }
+    };
+    match micron::resolve_link(&url) {
+        micron::LinkTarget::SameNode(path) => {
+            if let Some((node, _)) = current {
+                request_page(shared, chat_cid, node, &path, true);
+            }
+        }
+        micron::LinkTarget::OtherNode(node, path) => {
+            request_page(shared, chat_cid, node, &path, true);
+        }
+        micron::LinkTarget::NodeIndex(node) => {
+            request_page(shared, chat_cid, node, PAGE_PATH_DEFAULT, true);
+        }
+        micron::LinkTarget::Lxmf(_) => {
+            chat::cf_set_status_text(chat_cid, "messaging links not supported yet");
+        }
+        micron::LinkTarget::Anchor | micron::LinkTarget::Unsupported => {
+            chat::cf_set_status_text(chat_cid, "link not supported");
+        }
+    }
+}
+
+/// Go back one page (← while browsing); exits the browser when the stack is
+/// empty. Returns false when there was nothing to go back to.
+pub fn browser_back(shared: &Arc<Shared>, chat_cid: CID) -> bool {
+    let prev = { plock(&shared.browser).back.pop() };
+    match prev {
+        Some((node, path)) => {
+            request_page(shared, chat_cid, node, &path, false);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Leave the browser: abort any in-flight fetch, drop the page link, clear the
+/// navigation state, and return the UI to the chat dialogue.
+pub fn browser_exit(shared: &Arc<Shared>, chat_cid: CID) {
+    let link = {
+        let mut b = plock(&shared.browser);
+        b.phase = BrowserPhase::Idle;
+        b.node = None;
+        b.receiver = None;
+        b.requested = None;
+        b.pending_push = false;
+        b.route_tries = 0;
+        b.current = None;
+        b.back.clear();
+        b.links.clear();
+        b.viewing = false;
+        b.link_id.take()
+    };
+    if let Some(lid) = link {
+        plock(&shared.transport).drop_out_link(&lid);
+    }
+    chat::cf_document_clear(chat_cid);
+    chat::cf_icontray_set(chat_cid, 2, "sync");
+    refresh_idle_status(shared, chat_cid);
 }
 
 fn post_to_chat(shared: &Arc<Shared>, chat_cid: CID, author: &str, timestamp: u64, text: &str) {

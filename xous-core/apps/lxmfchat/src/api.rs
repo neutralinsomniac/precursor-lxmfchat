@@ -44,6 +44,10 @@ pub enum MenuOp {
     ClearHistory,
     /// Download messages stored for us at the propagation node (store-and-forward).
     Sync,
+    /// Browse a NomadNet node's pages (pick from saved/announced nodes).
+    Browse,
+    /// Browse a node by its 32-hex destination hash.
+    BrowseAddress,
     /// no-op (close menu)
     Noop,
 }
