@@ -19,7 +19,7 @@ fn main() -> ! {
     log::trace!("registered with NS -- {:?}", ime_sh_sid);
     let tts = TtsFrontend::new(&xns).unwrap();
 
-    let mytriggers = PredictionTriggers { newline: true, punctuation: true, whitespace: true };
+    let mytriggers = PredictionTriggers { newline: true, punctuation: true, whitespace: true, immutable: false };
 
     log::trace!("ready to accept requests");
     let mut api_token: Option<[u32; 4]> = None;

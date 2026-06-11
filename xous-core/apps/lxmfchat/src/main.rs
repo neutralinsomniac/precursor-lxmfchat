@@ -91,6 +91,9 @@ fn wrapped_main() -> ! {
                             app.redraw();
                         }
                         Some(Event::F1) => app.jump_to_unread(),
+                        Some(Event::F2) => app.jump_back(),
+                        Some(Event::F3) => app.sync_now(),
+                        // F4 left unbound: that key doubles as the power key.
                         _ => {}
                     }
                 });

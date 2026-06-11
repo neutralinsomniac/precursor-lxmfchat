@@ -15,7 +15,7 @@ pub(crate) fn icontray_server(conn_to_main: xous::CID) {
 
     let ime_sh_sid = xns.register_name(SERVER_NAME_ICONTRAY, None).expect("can't register server");
 
-    let mytriggers = PredictionTriggers { newline: false, punctuation: false, whitespace: false };
+    let mytriggers = PredictionTriggers { newline: false, punctuation: false, whitespace: false, immutable: false };
 
     let mut api_token: Option<[u32; 4]> = None;
     loop {

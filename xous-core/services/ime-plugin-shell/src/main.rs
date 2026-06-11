@@ -38,7 +38,7 @@ fn main() -> ! {
         history.push(test3);
     */
 
-    let mytriggers = PredictionTriggers { newline: true, punctuation: false, whitespace: false };
+    let mytriggers = PredictionTriggers { newline: true, punctuation: false, whitespace: false, immutable: false };
 
     loop {
         let mut msg = xous::receive_message(ime_sh_sid).unwrap();

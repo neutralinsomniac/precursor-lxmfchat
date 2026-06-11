@@ -106,6 +106,10 @@ impl InputTracker {
             .expect("couldn't set predictor API token");
     }
 
+    /// An icontray-style predictor serves fixed F-key labels, not text: never
+    /// insert its slots into the input line; pass the F-key through instead.
+    fn pred_immutable(&self) -> bool { self.pred_triggers.map(|t| t.immutable).unwrap_or(false) }
+
     pub fn set_predictor(&mut self, predictor: Option<PredictionPlugin>) {
         self.predictor = predictor;
         if let Some(pred) = predictor {
@@ -357,7 +361,7 @@ impl InputTracker {
                     }
                     '\u{0011}' => {
                         // F1
-                        if !self.menu_mode {
+                        if !self.menu_mode && !self.pred_immutable() {
                             self.insert_prediction(0);
                             do_redraw = true;
                         } else {
@@ -367,7 +371,7 @@ impl InputTracker {
                     }
                     '\u{0012}' => {
                         // F2
-                        if !self.menu_mode {
+                        if !self.menu_mode && !self.pred_immutable() {
                             self.insert_prediction(1);
                             do_redraw = true;
                         } else {
@@ -377,7 +381,7 @@ impl InputTracker {
                     }
                     '\u{0013}' => {
                         // F3
-                        if !self.menu_mode {
+                        if !self.menu_mode && !self.pred_immutable() {
                             self.insert_prediction(2);
                             do_redraw = true;
                         } else {
@@ -387,7 +391,7 @@ impl InputTracker {
                     }
                     '\u{0014}' => {
                         // F4
-                        if !self.menu_mode {
+                        if !self.menu_mode && !self.pred_immutable() {
                             self.insert_prediction(3);
                             do_redraw = true;
                         } else {

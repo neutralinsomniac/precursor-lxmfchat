@@ -190,6 +190,7 @@ impl<'a> LxmfChat<'a> {
             seen: Mutex::new(BTreeMap::new()),
             contacts: Mutex::new(contacts_map),
             current_peer: Mutex::new(current_peer),
+            prev_peer: Mutex::new(None),
             recent_msg_ids: Mutex::new(Vec::new()),
             last_ts: Mutex::new(0),
             sync: Mutex::new(net::SyncState::new()),
@@ -210,7 +211,10 @@ impl<'a> LxmfChat<'a> {
         // Open the last conversation we were in (if any), else a welcome thread.
         let initial_key = current_peer.map(|p| hex(&p)).unwrap_or_else(|| DIALOGUE_WELCOME.to_string());
         chat.dialogue_set(DIALOGUE_DICT, Some(&initial_key)).ok();
-        // Unread badges restored from the PDDB: surface the F1 jump hint right away.
+        // F3 is a fixed action; F1/F2 labels are kept current by
+        // refresh_idle_status. Unread badges were restored from the PDDB, so
+        // surface the F1 jump hint right away.
+        chat::cf_icontray_set(chat_cid, 2, "sync");
         net::refresh_idle_status(&shared, chat_cid);
 
         // One-shot crypto self-test + sign/verify timing, LOG-ONLY (it posted a
@@ -461,7 +465,15 @@ impl<'a> LxmfChat<'a> {
     /// Make `addr` the active conversation: set it as the send target, persist
     /// it as the "last peer", and switch the chat UI to that peer's own thread.
     fn activate_peer(&self, addr: &[u8; TRUNCATED_HASHLENGTH]) {
-        *plock(&self.shared.current_peer) = Some(*addr);
+        {
+            let mut cur = plock(&self.shared.current_peer);
+            if *cur != Some(*addr) {
+                // Remember where we came from, so F2 can jump back (and a
+                // second F2 returns — this records the swap each time).
+                *plock(&self.shared.prev_peer) = *cur;
+            }
+            *cur = Some(*addr);
+        }
         write_string(&self.pddb, KEY_PEER, &hex(addr));
         self.chat.dialogue_set(DIALOGUE_DICT, Some(&hex(addr))).ok();
         // Flush messages that arrived for this peer while we were viewing someone
@@ -501,6 +513,16 @@ impl<'a> LxmfChat<'a> {
         match net::first_unread(&self.shared) {
             Some((addr, _)) => self.activate_peer(&addr),
             None => self.chat.set_status_text("no unread messages"),
+        }
+    }
+
+    /// F2: jump back to the conversation you were in before this one.
+    /// Pressing it again returns — activate_peer records each swap.
+    pub fn jump_back(&self) {
+        let prev = *plock(&self.shared.prev_peer);
+        match prev {
+            Some(p) if *plock(&self.shared.current_peer) != Some(p) => self.activate_peer(&p),
+            _ => self.chat.set_status_text("no previous conversation"),
         }
     }
 

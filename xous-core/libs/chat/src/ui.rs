@@ -82,6 +82,8 @@ pub(crate) struct Ui {
     menu_mode: bool,
     app_menu: String,
     menu_mgr: MenuMatic,
+    /// the F1-F4 helper-label tray (rendered by the IMEF's prediction area)
+    icontray: Icontray,
 
     // our security token for making changes to our record on the GAM
     token: [u32; 4],
@@ -118,8 +120,9 @@ impl Ui {
         let modals = Modals::new(&xns).unwrap();
         let canvas = gam.request_content_canvas(token).expect("couldn't get content canvas");
         let screensize = gam.get_canvas_bounds(canvas).expect("couldn't get dimensions of content canvas");
-        // TODO this is a stub - implement F1-4 actions and autocompletes
-        let _icontray = Icontray::new(Some(xous::connect(sid).unwrap()), ["F1", "F2", "F3", "F4"]);
+        // The F1-F4 helper tray: blank until the app labels the keys it
+        // handles (ChatOp::IcontraySet / cf_icontray_set).
+        let icontray = Icontray::new(["", "", "", ""]);
         let menu_mgr = menu_matic(Vec::<MenuItem>::new(), app_menu, Some(xous::create_server().unwrap()))
             .expect("couldn't create MenuMatic manager");
         let pddb = pddb::Pddb::new();
@@ -176,6 +179,7 @@ impl Ui {
             menu_mode: true,
             app_menu: app_menu.to_owned(),
             menu_mgr,
+            icontray,
             token,
             status_idle_text: t!("chat.status.initial", locales::LANG).to_string(),
         }
@@ -371,6 +375,13 @@ impl Ui {
     ///
     /// * `item` - an item action not handled by the Chat UI
     pub fn menu_add(&self, item: MenuItem) { self.menu_mgr.add_item(item); }
+
+    /// Relabel one F1-F4 helper-tray slot and repaint the tray, so a
+    /// background change (e.g. a new unread badge) shows without a keypress.
+    pub fn icontray_set(&self, index: usize, label: &str) {
+        self.icontray.set_slot(index, label);
+        self.gam.request_ime_redraw().ok();
+    }
 
     /// Add a new Post to the current Dialogue
     ///

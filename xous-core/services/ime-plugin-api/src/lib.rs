@@ -32,6 +32,10 @@ pub struct PredictionTriggers {
     pub punctuation: bool,
     /// trigger word predictions on whitespace
     pub whitespace: bool,
+    /// the candidates are fixed labels for the function keys (an "icontray"),
+    /// not text: the IMEF must pass F-key presses through to the app instead
+    /// of inserting the slot's string into the input line
+    pub immutable: bool,
 }
 impl From<PredictionTriggers> for usize {
     fn from(pt: PredictionTriggers) -> usize {
@@ -45,6 +49,9 @@ impl From<PredictionTriggers> for usize {
         if pt.whitespace {
             ret |= 0x4;
         }
+        if pt.immutable {
+            ret |= 0x8;
+        }
         ret
     }
 }
@@ -54,6 +61,7 @@ impl From<usize> for PredictionTriggers {
             newline: (code & 0x1) != 0,
             punctuation: (code & 0x2) != 0,
             whitespace: (code & 0x4) != 0,
+            immutable: (code & 0x8) != 0,
         }
     }
 }

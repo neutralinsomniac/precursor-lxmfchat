@@ -250,6 +250,9 @@ pub struct Shared {
     /// The peer we are currently messaging (set by a picker, or auto-set to the
     /// sender of an inbound message when none is selected).
     pub current_peer: Mutex<Option<[u8; TRUNCATED_HASHLENGTH]>>,
+    /// The conversation we were in before the current one — F2 jumps back to
+    /// it (and `activate_peer` records the swap, so F2 toggles between two).
+    pub prev_peer: Mutex<Option<[u8; TRUNCATED_HASHLENGTH]>>,
     /// Recently delivered LXMF message ids, to drop duplicate retransmissions.
     pub recent_msg_ids: Mutex<Vec<[u8; 32]>>,
     /// Per-contact count of messages received while their thread was NOT the
@@ -343,22 +346,33 @@ pub fn first_unread(shared: &Arc<Shared>) -> Option<([u8; TRUNCATED_HASHLENGTH],
     })
 }
 
-/// Recompose the persistent status line: who the active conversation is with,
-/// plus — when other chats have unread messages — where F1 jumps next and how
-/// many are waiting there, e.g. "◉ alice  ✉ F1: bob [2]". Call whenever either
-/// half changes (peer switch, message held, unread flushed).
+/// A peer name short enough for an F-key helper slot (a quarter screen wide,
+/// ~11 narrow glyphs); `max` leaves room for whatever shares the slot.
+fn slot_label(shared: &Arc<Shared>, peer: &[u8; TRUNCATED_HASHLENGTH], max: usize) -> String {
+    peer_label(shared, peer).chars().take(max).collect()
+}
+
+/// Recompose the persistent status line ("◉ <who you're talking to>") and the
+/// F-key helper tray: F1 shows the next unread chat and its count ("✉bob 2"),
+/// F2 the conversation it jumps back to ("↩alice"); blank when idle. Call
+/// whenever any of that changes (peer switch, message held, unread flushed).
 pub fn refresh_idle_status(shared: &Arc<Shared>, chat_cid: CID) {
-    let mut line = match *plock(&shared.current_peer) {
+    let current = *plock(&shared.current_peer);
+    let line = match current {
         Some(p) => format!("\u{25c9} {}", peer_label(shared, &p)),
         None => String::new(),
     };
-    if let Some((peer, n)) = first_unread(shared) {
-        if !line.is_empty() {
-            line.push_str("  ");
-        }
-        line.push_str(&format!("\u{2709} F1: {} [{n}]", peer_label(shared, &peer)));
-    }
     chat::cf_set_status_idle_text(chat_cid, &line);
+    let f1 = match first_unread(shared) {
+        Some((peer, n)) => format!("\u{2709}{} {n}", slot_label(shared, &peer, 8)),
+        None => String::new(),
+    };
+    chat::cf_icontray_set(chat_cid, 0, &f1);
+    let f2 = match *plock(&shared.prev_peer) {
+        Some(p) if current != Some(p) => format!("\u{21a9}{}", slot_label(shared, &p, 10)),
+        _ => String::new(),
+    };
+    chat::cf_icontray_set(chat_cid, 1, &f2);
 }
 
 fn now_secs() -> u64 {

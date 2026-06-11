@@ -46,6 +46,8 @@ pub enum ChatOp {
     SetBusyAnimationState,
     /// Set the status idle text (to be shown when exiting all busy states)
     SetStatusIdleText,
+    /// Set one F1-F4 helper-tray label (and repaint the tray)
+    IcontraySet,
     /// Update just the state of the busy animation, if any. Internal opcode.
     /// Will skip the update if called too often.
     UpdateBusy,
@@ -87,6 +89,15 @@ pub struct PostUpdate {
     pub timestamp: u64,
     pub text: String,
     pub found: bool,
+}
+
+/// Request for [`ChatOp::IcontraySet`]: relabel the F-key helper-tray slot
+/// `index` (0..=3 → F1..F4). Keep labels short — each slot is a quarter of the
+/// screen width.
+#[derive(Archive, Serialize, Deserialize, Debug)]
+pub struct IcontraySet {
+    pub index: u32,
+    pub label: String,
 }
 
 #[derive(Archive, Serialize, Deserialize, Debug)]

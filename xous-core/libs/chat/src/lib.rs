@@ -443,6 +443,11 @@ pub fn server(
                 let s = buffer.to_original::<BusyMessage, _>().unwrap();
                 ui.set_status_idle_text(s.busy_msg.as_str());
             }
+            Some(ChatOp::IcontraySet) => {
+                let buffer = unsafe { Buffer::from_memory_message(msg.body.memory_message().unwrap()) };
+                let req = buffer.to_original::<IcontraySet, _>().unwrap();
+                ui.icontray_set(req.index as usize, req.label.as_str());
+            }
             Some(ChatOp::SetBusyAnimationState) => msg_scalar_unpack!(msg, state, _, _, _, {
                 if state != 0 {
                     ui.set_busy_state(true);
@@ -835,6 +840,15 @@ pub fn cf_post_update(chat_cid: xous::CID, author: &str, timestamp: u64, text: &
         return false;
     }
     buf.to_original::<PostUpdate, _>().map(|p| p.found).unwrap_or(false)
+}
+
+/// Relabel one F1-F4 helper-tray slot (0..=3 → F1..F4) from any thread holding
+/// a chat connection. Keep labels short — each slot is a quarter screen wide.
+pub fn cf_icontray_set(chat_cid: xous::CID, index: usize, label: &str) {
+    let req = IcontraySet { index: index as u32, label: label.to_string() };
+    if let Ok(buf) = Buffer::into_buf(req) {
+        buf.send(chat_cid, ChatOp::IcontraySet as u32).ok();
+    }
 }
 
 /// "context-free" variant of [`Chat::set_status_idle_text`], for callers (e.g. a
