@@ -696,13 +696,18 @@ impl Ui {
             Point::new(0, self.vp.status_height as isize),
             self.vp.total_screensize,
         ));
-        tv.draw_border = highlight;
-        tv.border_width = 3;
-        tv.rounded_border = if highlight { Some(self.vp.bubble_radius) } else { None };
+        // Links read as "buttons": always boxed, and fat-bordered under the
+        // cursor. (True video-inverse selection isn't available here — the GAM
+        // only honors TextView.invert for token-validated system canvases.)
+        let is_link = line.kind == DOC_KIND_LINK;
+        tv.draw_border = is_link;
+        tv.border_width = if highlight { 3 } else { 1 };
+        tv.rounded_border = if is_link { Some(self.vp.bubble_radius) } else { None };
         tv.clear_area = false;
         tv.ellipsis = false;
         tv.insertion = None;
-        tv.margin = Point::new(0, 0);
+        // Borders need breathing room or they overstrike the glyphs.
+        tv.margin = if is_link { Point::new(3, 3) } else { Point::new(0, 0) };
         write!(tv.text, "{}", line.text).ok();
         tv
     }
@@ -813,6 +818,26 @@ impl Ui {
                     Err(_) => DOC_DIVIDER_HEIGHT,
                 }
             };
+            if i == cursor {
+                // The cursor bar: a solid strip at the left edge of the cursor
+                // line, so your place on the page is visible even when the
+                // cursor isn't on a link (the text anchors at margin.x, so the
+                // bar never overstrikes glyphs).
+                self.gam
+                    .draw_rectangle(
+                        self.vp.canvas,
+                        Rectangle::new_with_style(
+                            Point::new(0, y),
+                            Point::new(3, y + drawn_h as isize),
+                            DrawStyle {
+                                fill_color: Some(PixelColor::Dark),
+                                stroke_color: None,
+                                stroke_width: 0,
+                            },
+                        ),
+                    )
+                    .ok();
+            }
             y += drawn_h as isize + self.vp.bubble_space;
         }
 
