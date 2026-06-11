@@ -844,10 +844,15 @@ pub fn cf_post_update(chat_cid: xous::CID, author: &str, timestamp: u64, text: &
 
 /// Relabel one F1-F4 helper-tray slot (0..=3 → F1..F4) from any thread holding
 /// a chat connection. Keep labels short — each slot is a quarter screen wide.
+///
+/// Blocks until the chat server has processed the relabel (and queued the IME
+/// repaint at the GAM). Callers rely on that: a label set just before raising
+/// a modal must reach the GAM ahead of the modal, because the GAM skips IME
+/// repaints while a predictor-less context (menu/modal) holds focus.
 pub fn cf_icontray_set(chat_cid: xous::CID, index: usize, label: &str) {
     let req = IcontraySet { index: index as u32, label: label.to_string() };
     if let Ok(buf) = Buffer::into_buf(req) {
-        buf.send(chat_cid, ChatOp::IcontraySet as u32).ok();
+        buf.lend(chat_cid, ChatOp::IcontraySet as u32).ok();
     }
 }
 
