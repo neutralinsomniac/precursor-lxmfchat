@@ -2462,7 +2462,15 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                 let why = if m.via_pn {
                     "propagation node unconfirmed"
                 } else if m.attempts == 0 && !m.tried_pn {
-                    "no route found"
+                    // Nothing was ever sent. Two distinct stories: we never got
+                    // a route at all, or the route was fine but our link
+                    // requests went unanswered (peer offline at the other end
+                    // of a working path).
+                    if plock(&shared.transport).has_path(&m.peer) {
+                        "link could not be established"
+                    } else {
+                        "no route found"
+                    }
                 } else {
                     "no acknowledgement"
                 };
@@ -2801,7 +2809,11 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
 
     for (peer, ts, text, why) in failures {
         let label = peer_label(shared, &peer);
-        chat::cf_set_status_idle_text(chat_cid, &format!("\u{00d7} {label}: {why}"));
+        let note = format!("\u{00d7} {label}: {why}");
+        // Both lines: transient so the failure is announced NOW (delivery ✓/⇪
+        // does the same), idle so it's still readable after the banner expires.
+        chat::cf_set_status_text(chat_cid, &note);
+        chat::cf_set_status_idle_text(chat_cid, &note);
         update_mark(shared, chat_cid, pddb, &peer, ts, &text, STATUS_FAILED);
     }
 }
