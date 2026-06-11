@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use chat::{Chat, ChatOp};
 use pddb::Pddb;
 use reticulum_core::constants::{KEY_HALF, KEYSIZE, NAME_HASH_LENGTH, RATCHET_SIZE, TRUNCATED_HASHLENGTH};
+use reticulum_core::crypto::truncated_hash;
 use reticulum_core::destination::single_destination_hash;
 use reticulum_core::identity::{PrivateIdentity, PublicIdentity};
 use reticulum_core::transport::{KnownDest, Transport};
@@ -40,6 +41,9 @@ const TICKETS_DICT: &str = "lxmf.tickets";
 const DELIVERY_DICT: &str = "lxmf.delivery";
 /// Saved NomadNet nodes for the page browser: key = hex dest hash, value = name.
 const NODES_DICT: &str = "lxmf.nodes";
+/// Page bookmarks: key = hex(truncated_hash(node||path||vars)), value =
+/// label\0node_hex\0path\0vars ("k=v|k2=v2", may be empty).
+const BOOKMARKS_DICT: &str = "lxmf.bookmarks";
 const KEY_IDENTITY: &str = "identity";
 const KEY_HUB: &str = "hub";
 const KEY_PEER: &str = "peer";
@@ -489,12 +493,40 @@ impl<'a> LxmfChat<'a> {
         chat::cf_icontray_set(self.chat_cid, 0, "");
         chat::cf_icontray_set(self.chat_cid, 1, "okay");
         chat::cf_icontray_set(self.chat_cid, 2, "cancel");
+        chat::cf_icontray_set(self.chat_cid, 3, "");
     }
 
-    /// Put the chat-view F-key labels back once a modal has closed.
+    /// Put the view's F-key labels back once a modal has closed — the browser
+    /// hints if a page is showing, else the chat hints.
     fn restore_fkey_hints(&self) {
-        chat::cf_icontray_set(self.chat_cid, 2, "sync");
-        net::refresh_idle_status(&self.shared, self.chat_cid);
+        if self.browsing() {
+            net::browser_fkey_hints(self.chat_cid);
+        } else {
+            chat::cf_icontray_set(self.chat_cid, 2, "sync");
+            chat::cf_icontray_set(self.chat_cid, 3, "");
+            net::refresh_idle_status(&self.shared, self.chat_cid);
+        }
+    }
+
+    /// Present arbitrary labels as a radio list; returns the chosen index.
+    /// Same cancel-sentinel + F-key-hint conventions as `pick_peer`.
+    fn pick_from_list(&self, modals: &modals::Modals, items: &[String], prompt: &str) -> Option<usize> {
+        if items.is_empty() {
+            return None;
+        }
+        let mut labels: Vec<String> = Vec::with_capacity(items.len() + 1);
+        labels.push(String::from(CANCEL_LABEL));
+        labels.extend(items.iter().cloned());
+        modals.add_list(labels.iter().map(|s| s.as_str()).collect()).ok();
+        self.show_picker_fkey_hints();
+        let choice = modals.get_radiobutton(prompt);
+        self.restore_fkey_hints();
+        match choice {
+            Ok(choice) if choice != CANCEL_LABEL => {
+                labels.iter().position(|l| *l == choice).filter(|&i| i > 0).map(|i| i - 1)
+            }
+            _ => None,
+        }
     }
 
     /// Make `addr` the active conversation: set it as the send target, persist
@@ -828,23 +860,116 @@ impl<'a> LxmfChat<'a> {
         net::request_page(&self.shared, self.chat_cid, *addr, net::PAGE_PATH_DEFAULT, Vec::new(), false);
     }
 
-    /// F2 while browsing: follow the link under the document cursor.
+    /// → while browsing: follow the link under the document cursor.
     pub fn follow_link(&self) {
         if self.browsing() {
             net::follow_selected_link(&self.shared, self.chat_cid);
         }
     }
 
-    /// F1 while browsing: go back one page. With a dedicated exit key (F3),
+    /// ← while browsing: go back one page. With a dedicated exit key (F4),
     /// an empty stack just says so instead of surprise-exiting the browser.
     pub fn browser_back(&self) {
         if self.browsing() && !net::browser_back(&self.shared, self.chat_cid) {
-            self.chat.set_status_text("no page to go back to (F3 exits)");
+            self.chat.set_status_text("no page to go back to (F4 exits)");
         }
     }
 
-    /// F3 while browsing: leave the browser and return to the conversation.
+    /// F2/F3 while browsing: scroll the page a screenful at a time.
+    pub fn browser_page(&self, down: bool) {
+        if self.browsing() {
+            chat::cf_document_page(self.chat_cid, down);
+        }
+    }
+
+    /// F4 while browsing: leave the browser and return to the conversation.
     pub fn browser_exit(&self) { net::browser_exit(&self.shared, self.chat_cid); }
+
+    /// F1 while browsing: the browser menu — bookmarks and page actions.
+    pub fn browser_menu(&mut self, modals: &modals::Modals) {
+        if !self.browsing() {
+            return;
+        }
+        let items: Vec<String> =
+            ["Bookmarks", "Bookmark this page", "Remove bookmark", "Reload page", "Node index"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        match self.pick_from_list(modals, &items, "Browser menu") {
+            Some(0) => self.open_bookmark_interactive(modals),
+            Some(1) => self.bookmark_current_page(),
+            Some(2) => self.remove_bookmark_interactive(modals),
+            Some(3) => {
+                // Reload: re-fetch the current page in place (no back push).
+                if let Some((node, path, vars)) = net::current_page(&self.shared) {
+                    net::request_page(&self.shared, self.chat_cid, node, &path, vars, false);
+                }
+            }
+            Some(4) => {
+                // Jump to the current node's front page.
+                if let Some((node, _, _)) = net::current_page(&self.shared) {
+                    net::request_page(
+                        &self.shared,
+                        self.chat_cid,
+                        node,
+                        net::PAGE_PATH_DEFAULT,
+                        Vec::new(),
+                        true,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A bookmark's display label: node name + path (+ vars when present).
+    fn page_label(&self, addr: &net::PageAddr) -> String {
+        let (node, path, vars) = addr;
+        let mut label = format!("{} {}", net::node_label(&self.shared, node), path);
+        if !vars.is_empty() {
+            label.push(' ');
+            label.push_str(&vars_string(vars));
+        }
+        label.truncate(60);
+        label
+    }
+
+    fn bookmark_current_page(&self) {
+        match net::current_page(&self.shared) {
+            Some(addr) => {
+                let label = self.page_label(&addr);
+                persist_bookmark(&self.pddb, &label, &addr);
+                self.chat.set_status_text(&format!("bookmarked: {label}"));
+            }
+            None => self.chat.set_status_text("no page to bookmark"),
+        }
+    }
+
+    fn open_bookmark_interactive(&mut self, modals: &modals::Modals) {
+        let bookmarks = load_bookmarks(&self.pddb);
+        if bookmarks.is_empty() {
+            modals.show_notification("No bookmarks yet — menu → Bookmark this page.", None).ok();
+            return;
+        }
+        let labels: Vec<String> = bookmarks.iter().map(|(_, l, _)| l.clone()).collect();
+        if let Some(i) = self.pick_from_list(modals, &labels, "Open bookmark") {
+            let (_, _, (node, path, vars)) = bookmarks[i].clone();
+            net::request_page(&self.shared, self.chat_cid, node, &path, vars, true);
+        }
+    }
+
+    fn remove_bookmark_interactive(&mut self, modals: &modals::Modals) {
+        let bookmarks = load_bookmarks(&self.pddb);
+        if bookmarks.is_empty() {
+            modals.show_notification("No bookmarks to remove.", None).ok();
+            return;
+        }
+        let labels: Vec<String> = bookmarks.iter().map(|(_, l, _)| l.clone()).collect();
+        if let Some(i) = self.pick_from_list(modals, &labels, "Remove which bookmark?") {
+            self.pddb.delete_key(BOOKMARKS_DICT, &bookmarks[i].0, None).ok();
+            self.chat.set_status_text(&format!("removed: {}", bookmarks[i].1));
+        }
+    }
 
     /// Prompt for and store the hub address. Host and port are taken as two
     /// separate fields so no `:` needs to be typed (some keyboard layouts can't
@@ -1307,6 +1432,65 @@ pub(crate) fn lxmf_delivery_name_hash() -> [u8; NAME_HASH_LENGTH] {
 /// are page-serving nodes for the browser (app_data = node name, raw utf-8).
 pub(crate) fn nomad_node_name_hash() -> [u8; NAME_HASH_LENGTH] {
     reticulum_core::destination::name_hash("nomadnetwork", &["node"])
+}
+
+fn vars_string(vars: &[(String, String)]) -> String {
+    vars.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("|")
+}
+
+fn parse_vars(s: &str) -> Vec<(String, String)> {
+    s.split('|')
+        .filter_map(|e| e.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+/// Persist a page bookmark (delete-then-write; keyed by a hash of the full
+/// page address so re-bookmarking the same view is idempotent).
+pub(crate) fn persist_bookmark(pddb: &Pddb, label: &str, addr: &net::PageAddr) {
+    let (node, path, vars) = addr;
+    let vs = vars_string(vars);
+    let mut material = node.to_vec();
+    material.extend_from_slice(path.as_bytes());
+    material.extend_from_slice(vs.as_bytes());
+    let key = hex(&truncated_hash(&material));
+    let val = format!("{label}\u{0}{}\u{0}{path}\u{0}{vs}", hex(node));
+    pddb.delete_key(BOOKMARKS_DICT, &key, None).ok();
+    if let Ok(mut k) = pddb.get(BOOKMARKS_DICT, &key, None, true, true, Some(val.len()), None::<fn()>) {
+        k.write_all(val.as_bytes()).ok();
+    }
+}
+
+/// All saved bookmarks: (pddb key, display label, page address).
+fn load_bookmarks(pddb: &Pddb) -> Vec<(String, String, net::PageAddr)> {
+    let keys = match pddb.list_keys(BOOKMARKS_DICT, None) {
+        Ok(k) => k,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for key in keys {
+        let mut buf = Vec::new();
+        match pddb.get(BOOKMARKS_DICT, &key, None, false, false, None, None::<fn()>) {
+            Ok(mut k) => {
+                if k.read_to_end(&mut buf).is_err() {
+                    continue;
+                }
+            }
+            Err(_) => continue,
+        }
+        let s = String::from_utf8_lossy(&buf).into_owned();
+        let mut parts = s.split('\u{0}');
+        let label = parts.next().unwrap_or("").to_string();
+        let node = match parts.next().and_then(parse_addr) {
+            Some(n) => n,
+            None => continue,
+        };
+        let path = parts.next().unwrap_or(net::PAGE_PATH_DEFAULT).to_string();
+        let vars = parse_vars(parts.next().unwrap_or(""));
+        out.push((key, label, (node, path, vars)));
+    }
+    out.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+    out
 }
 
 /// Persist a browsed node (value = name only; the node's key/route are session

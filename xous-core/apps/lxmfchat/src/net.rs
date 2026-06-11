@@ -222,7 +222,7 @@ impl SyncState {
 }
 
 /// A fully-specified page location: node, path, and URL variables.
-type PageAddr = ([u8; TRUNCATED_HASHLENGTH], String, Vec<(String, String)>);
+pub type PageAddr = ([u8; TRUNCATED_HASHLENGTH], String, Vec<(String, String)>);
 
 /// Stage of a NomadNet page fetch (the node browser). One at a time.
 #[derive(Clone, Copy, PartialEq)]
@@ -2254,8 +2254,13 @@ const BROWSER_ROUTE_TRIES: u8 = 20;
 /// Pages you can go ← back through (oldest dropped).
 const BACK_STACK_MAX: usize = 16;
 
+/// The page currently shown in the browser, if any.
+pub fn current_page(shared: &Arc<Shared>) -> Option<PageAddr> {
+    plock(&shared.browser).current.clone()
+}
+
 /// Short human label for a node (saved/announced name, else a hex prefix).
-fn node_label(shared: &Arc<Shared>, node: &[u8; TRUNCATED_HASHLENGTH]) -> String {
+pub(crate) fn node_label(shared: &Arc<Shared>, node: &[u8; TRUNCATED_HASHLENGTH]) -> String {
     plock(&shared.saved_nodes)
         .get(node)
         .cloned()
@@ -2733,10 +2738,7 @@ fn page_received(shared: &Arc<Shared>, chat_cid: CID, resp: Value) {
     chat::cf_document_lines(chat_cid, &lines);
     chat::cf_document_show(chat_cid);
     if entering {
-        // Browser key hints; restored by browser_exit.
-        chat::cf_icontray_set(chat_cid, 0, "back");
-        chat::cf_icontray_set(chat_cid, 1, "open");
-        chat::cf_icontray_set(chat_cid, 2, "exit");
+        browser_fkey_hints(chat_cid);
     }
     let line = format!("\u{25a3} {title}");
     chat::cf_set_status_idle_text(chat_cid, &line);
@@ -2765,7 +2767,16 @@ fn browser_finish(shared: &Arc<Shared>, chat_cid: CID, msg: &str) {
     chat::cf_set_status_text_forced(chat_cid, &line);
 }
 
-/// Follow the link under the document cursor (F2 while browsing).
+/// The browser's F-key tray labels (←/→ are back/follow, undisplayable here).
+/// Set when a page first shows and re-asserted after any modal.
+pub fn browser_fkey_hints(chat_cid: CID) {
+    chat::cf_icontray_set(chat_cid, 0, "menu");
+    chat::cf_icontray_set(chat_cid, 1, "pg up");
+    chat::cf_icontray_set(chat_cid, 2, "pg dn");
+    chat::cf_icontray_set(chat_cid, 3, "exit");
+}
+
+/// Follow the link under the document cursor (→ while browsing).
 pub fn follow_selected_link(shared: &Arc<Shared>, chat_cid: CID) {
     let id = match chat::cf_document_selected(chat_cid) {
         Some(id) => id as usize,
@@ -2837,6 +2848,7 @@ pub fn browser_exit(shared: &Arc<Shared>, chat_cid: CID) {
     }
     chat::cf_document_clear(chat_cid);
     chat::cf_icontray_set(chat_cid, 2, "sync");
+    chat::cf_icontray_set(chat_cid, 3, ""); // F4 is unbound outside the browser
     refresh_idle_status(shared, chat_cid);
 }
 

@@ -705,6 +705,14 @@ pub fn server(
                     xous::return_scalar(msg.sender, val).expect("couldn't return selected link");
                 })
             }
+            Some(ChatOp::DocumentPage) => {
+                xous::msg_scalar_unpack!(msg, down, _, _, _, {
+                    ui.doc_page(down != 0);
+                    if allow_redraw {
+                        ui.redraw().expect("CHAT couldn't redraw");
+                    }
+                })
+            }
             Some(ChatOp::Quit) => {
                 log::error!("got Quit");
                 break;
@@ -941,6 +949,15 @@ pub fn cf_document_show(chat_cid: xous::CID) {
 /// Leave document mode and return to the chat dialogue.
 pub fn cf_document_clear(chat_cid: xous::CID) {
     xous::send_message(chat_cid, xous::Message::new_scalar(ChatOp::DocumentClear as usize, 0, 0, 0, 0)).ok();
+}
+
+/// Scroll the document view by one screenful (document mode only).
+pub fn cf_document_page(chat_cid: xous::CID, down: bool) {
+    xous::send_message(
+        chat_cid,
+        xous::Message::new_scalar(ChatOp::DocumentPage as usize, if down { 1 } else { 0 }, 0, 0, 0),
+    )
+    .ok();
 }
 
 /// The link id under the document cursor, if the cursor is on a link line.

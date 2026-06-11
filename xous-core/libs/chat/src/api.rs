@@ -69,6 +69,8 @@ pub enum ChatOp {
     /// Document mode: blocking scalar query of the cursor's link;
     /// returns link_id+1, or 0 when the cursor is not on a link
     DocumentGetSelected,
+    /// Document mode: scroll a screenful (scalar arg: 0 = up, 1 = down)
+    DocumentPage,
 }
 
 #[derive(Debug, num_derive::FromPrimitive, num_derive::ToPrimitive)]

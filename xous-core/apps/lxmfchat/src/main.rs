@@ -92,33 +92,41 @@ fn wrapped_main() -> ! {
                             }
                             app.redraw();
                         }
-                        // While the page browser is on screen the F-keys rebind
-                        // (the icontray hints say so): F1 back, F2 open the
-                        // selected link, F3 exit. The arrow keys stay dedicated
-                        // to the cursor — Left/Right are forwarded but unbound,
-                        // reserved for horizontal scrolling someday.
+                        // While the page browser is on screen the keys rebind
+                        // (the icontray hints say so): ← back, → follow the
+                        // selected link, F1 browser menu, F2/F3 page up/down,
+                        // F4 exit. Otherwise the chat bindings apply, where
+                        // Left/Right are no-ops (the chat lib already handled
+                        // menus before forwarding them) and F4 stays unbound
+                        // (it doubles as the power key).
                         Some(Event::F1) => {
                             if app.browsing() {
-                                app.browser_back()
+                                app.browser_menu(&modals)
                             } else {
                                 app.jump_to_unread()
                             }
                         }
                         Some(Event::F2) => {
                             if app.browsing() {
-                                app.follow_link()
+                                app.browser_page(false)
                             } else {
                                 app.jump_back()
                             }
                         }
                         Some(Event::F3) => {
                             if app.browsing() {
-                                app.browser_exit()
+                                app.browser_page(true)
                             } else {
                                 app.sync_now()
                             }
                         }
-                        // F4 left unbound: that key doubles as the power key.
+                        Some(Event::F4) => {
+                            if app.browsing() {
+                                app.browser_exit()
+                            }
+                        }
+                        Some(Event::Left) => app.browser_back(),
+                        Some(Event::Right) => app.follow_link(),
                         _ => {}
                     }
                 });

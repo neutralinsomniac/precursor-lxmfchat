@@ -662,6 +662,37 @@ impl Ui {
         }
     }
 
+    /// Scroll the document by one screenful, parking the cursor on the new
+    /// top line (so paging and line-stepping compose predictably).
+    pub(crate) fn doc_page(&mut self, down: bool) {
+        let (top, total) = match self.document.as_ref() {
+            Some(d) if !d.lines.is_empty() => (d.top, d.lines.len()),
+            _ => return,
+        };
+        let new_top = if down {
+            (top + self.doc_visible_count(top)).min(total - 1)
+        } else {
+            // Walk backward until another screenful of (cached) heights is
+            // behind the old top.
+            let budget = self.vp.layout_screensize.y as u32;
+            let mut used = 0u32;
+            let mut i = top;
+            while i > 0 {
+                let h = self.doc_line_height(i - 1) + self.vp.bubble_space as u32;
+                if used + h > budget {
+                    break;
+                }
+                used += h;
+                i -= 1;
+            }
+            i
+        };
+        if let Some(doc) = self.document.as_mut() {
+            doc.top = new_top;
+            doc.cursor = new_top;
+        }
+    }
+
     /// The link under the cursor, if the cursor line is a link line.
     pub(crate) fn doc_selected_link(&self) -> Option<u16> {
         let doc = self.document.as_ref()?;
