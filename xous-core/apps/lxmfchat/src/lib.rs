@@ -450,13 +450,32 @@ impl<'a> LxmfChat<'a> {
         labels.push(String::from(CANCEL_LABEL));
         labels.extend(entries.iter().map(|(h, n)| format!("{} ({})", n, hex(&h[..4]))));
         modals.add_list(labels.iter().map(|s| s.as_str()).collect()).ok();
-        match modals.get_radiobutton(prompt) {
+        self.show_picker_fkey_hints();
+        let choice = modals.get_radiobutton(prompt);
+        self.restore_fkey_hints();
+        match choice {
             Ok(choice) if choice != CANCEL_LABEL => {
                 // index 0 is cancel, so entries are offset by one
                 labels.iter().position(|l| *l == choice).filter(|&i| i > 0).map(|i| entries[i - 1].clone())
             }
             _ => None,
         }
+    }
+
+    /// Relabel the F-key tray with what the keys do inside a radio-list modal
+    /// (F2 picks the highlighted item, F3 cancels; F1 does nothing there).
+    /// Must run BEFORE the modal is raised: the tray only repaints while the
+    /// chat context still has focus. Pair with `restore_fkey_hints`.
+    fn show_picker_fkey_hints(&self) {
+        chat::cf_icontray_set(self.chat_cid, 0, "");
+        chat::cf_icontray_set(self.chat_cid, 1, "okay");
+        chat::cf_icontray_set(self.chat_cid, 2, "cancel");
+    }
+
+    /// Put the chat-view F-key labels back once a modal has closed.
+    fn restore_fkey_hints(&self) {
+        chat::cf_icontray_set(self.chat_cid, 2, "sync");
+        net::refresh_idle_status(&self.shared, self.chat_cid);
     }
 
     /// Make `addr` the active conversation: set it as the send target, persist
@@ -682,10 +701,10 @@ impl<'a> LxmfChat<'a> {
         modals
             .add_list(vec![CANCEL_LABEL, "Clear history"])
             .ok();
-        let confirmed = matches!(
-            modals.get_radiobutton(&format!("Wipe all messages with {}?", label)),
-            Ok(choice) if choice == "Clear history"
-        );
+        self.show_picker_fkey_hints();
+        let choice = modals.get_radiobutton(&format!("Wipe all messages with {}?", label));
+        self.restore_fkey_hints();
+        let confirmed = matches!(choice, Ok(choice) if choice == "Clear history");
         if !confirmed {
             return;
         }
