@@ -56,6 +56,10 @@ pub enum Kind {
 pub struct Link {
     pub label: String,
     pub url: String,
+    /// URL variables from the link's trailing component(s): `` `[label`url`g=mirrors|s=x] ``
+    /// → `[("g","mirrors"),("s","x")]`. NomadNet sends these in the request
+    /// data dict as `{"var_<name>": value}`.
+    pub fields: Vec<(String, String)>,
 }
 
 /// Where a link URL points. NomadNet conventions:
@@ -262,34 +266,41 @@ fn scan_inline(body: &str, heading: u8, st: &mut ScanState, doc: &mut Document) 
                         }
                         i = (i + 1).min(chars.len());
                     }
+                    '[' => {
+                        // A link: `[label`URL] / `[URL] (`fields ignored).
+                        // NOTE the leading backtick — real micron links are
+                        // backtick-bracket (a bare [ is literal text), which a
+                        // live rngit page demonstrated after our own test pages
+                        // (wrongly bare-bracketed) hid it.
+                        match try_parse_link(&chars[i..]) {
+                            Some((link, consumed)) => {
+                                if heading > 0 {
+                                    // No selectable lines inside headings; keep the label.
+                                    for ch in link.label.chars() {
+                                        push_seg_char!(ch);
+                                    }
+                                } else {
+                                    flush_seg!();
+                                    if doc.links.len() < u16::MAX as usize {
+                                        let id = doc.links.len() as u16;
+                                        let text = format!("\u{00bb} {}", link.label);
+                                        doc.links.push(link);
+                                        push_line(doc, text, Style::Regular, st.align, Kind::Link(id));
+                                        emitted = true;
+                                    }
+                                }
+                                i += consumed;
+                            }
+                            // Unclosed on this line: keep it visible as text.
+                            None => {
+                                push_seg_char!('[');
+                                i += 1;
+                            }
+                        }
+                    }
                     '=' => i += 1, // mid-line literal toggle: only line-form supported
                     '\u{0}' => {}  // trailing lone backtick: dropped
                     _ => i += 1,   // unknown tag: skip it
-                }
-            }
-            '[' => {
-                // Possible link [label`URL] / [URL] (`fields ignored). Only a
-                // bracket pair on this line counts; otherwise it's literal.
-                if let Some((link, consumed)) = try_parse_link(&chars[i..]) {
-                    if heading > 0 {
-                        // No selectable lines inside headings; keep the label.
-                        for ch in link.label.chars() {
-                            push_seg_char!(ch);
-                        }
-                    } else {
-                        flush_seg!();
-                        if doc.links.len() < u16::MAX as usize {
-                            let id = doc.links.len() as u16;
-                            let text = format!("\u{00bb} {}", link.label);
-                            doc.links.push(link);
-                            push_line(doc, text, Style::Regular, st.align, Kind::Link(id));
-                            emitted = true;
-                        }
-                    }
-                    i += consumed;
-                } else {
-                    push_seg_char!(c);
-                    i += 1;
                 }
             }
             _ => {
@@ -304,29 +315,38 @@ fn scan_inline(body: &str, heading: u8, st: &mut ScanState, doc: &mut Document) 
     }
 }
 
-/// Parse a `[...]` link starting at `chars[0] == '['`. Returns the link and
-/// how many chars (including brackets) were consumed.
+/// Parse the bracket body of a `` `[...] `` link, starting at `chars[0] == '['`
+/// (the backtick is already consumed). Returns the link and how many chars
+/// (including the brackets) were consumed. The backtick marker makes the
+/// single-component `` `[URL] `` form unambiguous, so any non-empty body is a
+/// link; the URL may still resolve as Unsupported at follow time.
 fn try_parse_link(chars: &[char]) -> Option<(Link, usize)> {
     let close = chars.iter().position(|&c| c == ']')?;
     if close < 2 {
-        return None; // "[]" or "[x]" with nothing useful
+        return None; // `[] — nothing useful
     }
     let inner: String = chars[1..close].iter().collect();
-    // label`URL`field|... — extra parts are form data we don't support.
+    // label`URL`vars — the trailing component(s) are |-separated k=v URL
+    // variables the node receives as request data (mirrors NomadNet's
+    // retrieve_url: each "k=v" → request_data["var_k"] = "v").
     let mut parts = inner.split('`');
     let first = parts.next().unwrap_or("");
-    let (label, url) = match parts.next() {
-        Some(url) => (first, url),
-        // [URL] form: label is the URL — but only if it actually looks like
-        // one, so prose brackets like "array[0]" stay literal.
-        None if resolve_link(first) != LinkTarget::Unsupported => (first, first),
-        None => return None,
-    };
+    let url = parts.next().unwrap_or(first); // `[URL] form: label is the URL
     if url.is_empty() {
         return None;
     }
+    let mut fields = Vec::new();
+    for varstr in parts {
+        for e in varstr.split('|') {
+            if let Some((k, v)) = e.split_once('=') {
+                if !k.is_empty() {
+                    fields.push((k.to_string(), v.to_string()));
+                }
+            }
+        }
+    }
     Some((
-        Link { label: label.to_string(), url: url.to_string() },
+        Link { label: first.to_string(), url: url.to_string(), fields },
         close + 1,
     ))
 }
@@ -475,18 +495,21 @@ mod tests {
 
     #[test]
     fn links_become_their_own_lines() {
-        let doc = parse("Before [Home`:/page/index.mu] after\n");
+        let doc = parse("Before `[Home`:/page/index.mu] after\n");
         assert_eq!(doc.lines.len(), 3);
         assert_eq!(doc.lines[0].text, "Before ");
         assert_eq!(doc.lines[1].kind, Kind::Link(0));
         assert_eq!(doc.lines[1].text, "\u{00bb} Home");
         assert_eq!(doc.lines[2].text, " after");
-        assert_eq!(doc.links[0], Link { label: "Home".into(), url: ":/page/index.mu".into() });
+        assert_eq!(
+            doc.links[0],
+            Link { label: "Home".into(), url: ":/page/index.mu".into(), fields: vec![] }
+        );
     }
 
     #[test]
     fn bare_url_link_and_extra_fields() {
-        let doc = parse("[:/page/a.mu]\n[Send`:/page/b.mu`field_x|1]\n");
+        let doc = parse("`[:/page/a.mu]\n`[Send`:/page/b.mu`field_x|1]\n");
         assert_eq!(doc.links[0].label, ":/page/a.mu");
         assert_eq!(doc.links[0].url, ":/page/a.mu");
         assert_eq!(doc.links[1].label, "Send");
@@ -494,10 +517,37 @@ mod tests {
     }
 
     #[test]
-    fn unmatched_bracket_is_literal() {
-        let doc = parse("array[0] = 1\nlone [ bracket\n");
+    fn real_rngit_page_links_extract() {
+        // Cut down from a live rngit index page — the page that exposed the
+        // bare-vs-backtick bracket bug (we extracted 0 links from it).
+        let doc = parse(
+            "#!c=0\n#!bg=1a1d1f\n>Aleph Git\n\
+             `!`[Node`:/page/index.mu]`! /\n\
+             `!`[  • mirrors`:/page/group.mu`g=mirrors]`! (14 repositories)\n\
+             `a`F666`[Served by rngit 1.3.5`:/page/index.mu] - Generated in 0s`f\n",
+        );
+        assert_eq!(doc.links.len(), 3);
+        assert_eq!(
+            doc.links[0],
+            Link { label: "Node".into(), url: ":/page/index.mu".into(), fields: vec![] }
+        );
+        assert_eq!(doc.links[1].label, "  • mirrors");
+        assert_eq!(doc.links[1].url, ":/page/group.mu");
+        assert_eq!(doc.links[1].fields, vec![("g".to_string(), "mirrors".to_string())]);
+        assert_eq!(doc.links[2].label, "Served by rngit 1.3.5");
+        let link_lines = doc.lines.iter().filter(|l| matches!(l.kind, Kind::Link(_))).count();
+        assert_eq!(link_lines, 3);
+    }
+
+    #[test]
+    fn bare_brackets_are_literal() {
+        // Real micron links are backtick-bracket; a plain [ is just text.
+        let doc = parse("array[0] = 1\n[Home`:/page/index.mu]\nlone [ bracket\n`[unclosed\n");
         assert_eq!(doc.lines[0].text, "array[0] = 1");
-        assert_eq!(doc.lines[1].text, "lone [ bracket");
+        // The stray ` reads as an unknown tag and eats the ':' — no link either way.
+        assert_eq!(doc.lines[1].text, "[Home/page/index.mu]");
+        assert_eq!(doc.lines[2].text, "lone [ bracket");
+        assert_eq!(doc.lines[3].text, "[unclosed");
         assert!(doc.links.is_empty());
     }
 

@@ -221,6 +221,9 @@ impl SyncState {
     }
 }
 
+/// A fully-specified page location: node, path, and URL variables.
+type PageAddr = ([u8; TRUNCATED_HASHLENGTH], String, Vec<(String, String)>);
+
 /// Stage of a NomadNet page fetch (the node browser). One at a time.
 #[derive(Clone, Copy, PartialEq)]
 enum BrowserPhase {
@@ -239,6 +242,9 @@ pub struct BrowserState {
     node: Option<[u8; TRUNCATED_HASHLENGTH]>,
     /// The page path being fetched (e.g. "/page/index.mu").
     path: String,
+    /// URL variables of the in-flight fetch (sent as `{"var_<k>": v}` request
+    /// data, like NomadNet).
+    vars: Vec<(String, String)>,
     /// The established outbound link id to the node.
     link_id: Option<[u8; TRUNCATED_HASHLENGTH]>,
     /// In-progress Resource download of a large page.
@@ -247,7 +253,7 @@ pub struct BrowserState {
     deadline: u64,
     /// Set by [`request_page`] (the menu / a key, on the main thread) and
     /// consumed by the browser thread — no hub I/O ever runs on the UI thread.
-    requested: Option<([u8; TRUNCATED_HASHLENGTH], String)>,
+    requested: Option<PageAddr>,
     /// Earliest time the browser thread should act on `requested` (the retry
     /// backoff while the node's key/route resolves).
     next_attempt: u64,
@@ -256,12 +262,13 @@ pub struct BrowserState {
     /// LINKREQUESTs sent for this fetch.
     link_tries: u8,
     /// The page currently displayed, for relative links and the back stack.
-    current: Option<([u8; TRUNCATED_HASHLENGTH], String)>,
+    current: Option<PageAddr>,
     /// Whether the in-flight fetch should push the current page onto the back
-    /// stack when it renders (true for following a link, false for ← back).
+    /// stack when it renders (true for following a link, false for back).
     pending_push: bool,
-    /// Pages to return to with ← (newest last).
-    back: Vec<([u8; TRUNCATED_HASHLENGTH], String)>,
+    /// Pages to return to with the back key (newest last). Vars ride along so
+    /// returning to e.g. a `g=mirrors` group page re-requests the same view.
+    back: Vec<PageAddr>,
     /// Links of the displayed page, indexed by the DocLine link id.
     pub links: Vec<micron::Link>,
     /// Whether the document view is currently shown (the app's key handling
@@ -275,6 +282,7 @@ impl BrowserState {
             phase: BrowserPhase::Idle,
             node: None,
             path: String::new(),
+            vars: Vec::new(),
             link_id: None,
             receiver: None,
             deadline: 0,
@@ -2270,6 +2278,7 @@ pub fn request_page(
     chat_cid: CID,
     node: [u8; TRUNCATED_HASHLENGTH],
     path: &str,
+    vars: Vec<(String, String)>,
     push_back: bool,
 ) {
     {
@@ -2279,7 +2288,7 @@ pub fn request_page(
             chat::cf_set_status_text(chat_cid, "page fetch already in progress…");
             return;
         }
-        b.requested = Some((node, path.to_string()));
+        b.requested = Some((node, path.to_string(), vars));
         b.pending_push = push_back;
         b.next_attempt = 0;
         b.route_tries = 0;
@@ -2354,8 +2363,8 @@ fn browser_tick(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
             None
         }
     };
-    if let Some((node, path)) = job {
-        start_fetch(shared, chat_cid, trng, node, path);
+    if let Some((node, path, vars)) = job {
+        start_fetch(shared, chat_cid, trng, node, path, vars);
     }
 }
 
@@ -2368,6 +2377,7 @@ fn start_fetch(
     trng: &Trng,
     node: [u8; TRUNCATED_HASHLENGTH],
     path: String,
+    vars: Vec<(String, String)>,
 ) {
     let now = now_secs();
     // Re-arm the request (bounded) while there is no connection or no route —
@@ -2375,7 +2385,7 @@ fn start_fetch(
     let rearm = |b: &mut BrowserState| -> bool {
         b.route_tries = b.route_tries.saturating_add(1);
         if b.route_tries <= BROWSER_ROUTE_TRIES {
-            b.requested = Some((node, path.clone()));
+            b.requested = Some((node, path.clone(), vars.clone()));
             b.next_attempt = now + BROWSER_ROUTE_RETRY_SECS;
             true
         } else {
@@ -2417,6 +2427,7 @@ fn start_fetch(
         b.phase = BrowserPhase::Linking;
         b.node = Some(node);
         b.path = path;
+        b.vars = vars;
         b.receiver = None;
         b.deadline = now + PAGE_DEADLINE_SECS + 12 * hops;
         b.link_id = None;
@@ -2480,15 +2491,24 @@ fn browser_send_request(
     trng: &Trng,
     link_id: [u8; TRUNCATED_HASHLENGTH],
 ) {
-    let path = {
+    let (path, vars) = {
         let mut b = plock(&shared.browser);
         b.phase = BrowserPhase::Fetching;
-        b.path.clone()
+        (b.path.clone(), b.vars.clone())
     };
     chat::cf_set_status_text_forced(chat_cid, &format!("page: requesting {path}…"));
     let path_hash = truncated_hash(path.as_bytes());
+    // URL variables travel as a request-data dict like NomadNet sends them:
+    // `[label`url`g=mirrors] → {"var_g": "mirrors"}; no vars → Nil.
+    let data = if vars.is_empty() {
+        Value::Nil
+    } else {
+        Value::StrMap(
+            vars.into_iter().map(|(k, v)| (format!("var_{k}"), Value::Str(v))).collect(),
+        )
+    };
     let req =
-        Value::Array(vec![Value::F64(now_secs() as f64), Value::Bin(path_hash.to_vec()), Value::Nil]);
+        Value::Array(vec![Value::F64(now_secs() as f64), Value::Bin(path_hash.to_vec()), data]);
     let packed = msgpack::encode(&req);
     let mut iv = [0u8; IV_LENGTH];
     crate::fill_random(trng, &mut iv);
@@ -2687,6 +2707,7 @@ fn page_received(shared: &Arc<Shared>, chat_cid: CID, resp: Value) {
             None => return, // finished/aborted concurrently
         };
         let path = core::mem::take(&mut b.path);
+        let vars = core::mem::take(&mut b.vars);
         if b.pending_push {
             if let Some(prev) = b.current.take() {
                 b.back.push(prev);
@@ -2696,7 +2717,7 @@ fn page_received(shared: &Arc<Shared>, chat_cid: CID, resp: Value) {
             }
             b.pending_push = false;
         }
-        b.current = Some((node, path.clone()));
+        b.current = Some((node, path.clone(), vars));
         b.links = doc.links;
         b.phase = BrowserPhase::Idle;
         b.node = None;
@@ -2753,24 +2774,24 @@ pub fn follow_selected_link(shared: &Arc<Shared>, chat_cid: CID) {
             return;
         }
     };
-    let (url, current) = {
+    let (url, vars, current) = {
         let b = plock(&shared.browser);
         match b.links.get(id) {
-            Some(l) => (l.url.clone(), b.current.clone()),
+            Some(l) => (l.url.clone(), l.fields.clone(), b.current.clone()),
             None => return,
         }
     };
     match micron::resolve_link(&url) {
         micron::LinkTarget::SameNode(path) => {
-            if let Some((node, _)) = current {
-                request_page(shared, chat_cid, node, &path, true);
+            if let Some((node, _, _)) = current {
+                request_page(shared, chat_cid, node, &path, vars, true);
             }
         }
         micron::LinkTarget::OtherNode(node, path) => {
-            request_page(shared, chat_cid, node, &path, true);
+            request_page(shared, chat_cid, node, &path, vars, true);
         }
         micron::LinkTarget::NodeIndex(node) => {
-            request_page(shared, chat_cid, node, PAGE_PATH_DEFAULT, true);
+            request_page(shared, chat_cid, node, PAGE_PATH_DEFAULT, vars, true);
         }
         micron::LinkTarget::Lxmf(_) => {
             chat::cf_set_status_text(chat_cid, "messaging links not supported yet");
@@ -2786,8 +2807,8 @@ pub fn follow_selected_link(shared: &Arc<Shared>, chat_cid: CID) {
 pub fn browser_back(shared: &Arc<Shared>, chat_cid: CID) -> bool {
     let prev = { plock(&shared.browser).back.pop() };
     match prev {
-        Some((node, path)) => {
-            request_page(shared, chat_cid, node, &path, false);
+        Some((node, path, vars)) => {
+            request_page(shared, chat_cid, node, &path, vars, false);
             true
         }
         None => false,

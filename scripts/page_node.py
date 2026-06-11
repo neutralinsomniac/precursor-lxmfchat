@@ -32,28 +32,30 @@ NODE_NAME = "pagetest node"
 
 OTHER_HASH = "00112233445566778899aabbccddeeff"
 
+# NOTE: micron links are BACKTICK-bracket (`[label`url]) — a bare [ is
+# literal text. Our first pages here got that wrong and hid a parser bug.
 INDEX_PAGE = f"""#!c=300
 # comment line, must not render
 >Test Node
-Welcome to the `!page test`! node.
+Welcome to the `!page test`! node. bare [brackets] stay literal
 -
 `cCentered line
 `=
-literal `! block [no`link]
+literal `! block `[no`link]
 `=
-Links: [Other page`:/page/other.mu] and [{OTHER_HASH}:/page/remote.mu]
-Bare node [{OTHER_HASH}] and address [operator`lxmf@{OTHER_HASH}]
+Links: `[Other page`:/page/other.mu] and `[{OTHER_HASH}:/page/remote.mu]
+Bare node `[{OTHER_HASH}] and address `[operator`lxmf@{OTHER_HASH}]
 """
 
 OTHER_PAGE = """>Other Page
-You followed a link. [Back to index`:/page/index.mu]
+You followed a link. `[Back to index`:/page/index.mu]
 """
 
 # Big enough that the response exceeds the link MDU and real RNS sends it as a
 # multi-part Resource. PAGE_TEST_REPEAT=2000 makes it span multiple hashmap
 # pages (HMU round-trips).
 BIG_PAGE = ">Big Page\n" + (
-    "`!filler`! line with a [link`:/page/index.mu] and text padding it out\n"
+    "`!filler`! line with a `[link`:/page/index.mu] and text padding it out\n"
     * int(os.environ.get("PAGE_TEST_REPEAT", "400"))
 )
 

@@ -825,7 +825,7 @@ impl<'a> LxmfChat<'a> {
     fn start_browse(&mut self, addr: &[u8; TRUNCATED_HASHLENGTH], name: &str) {
         plock(&self.shared.saved_nodes).insert(*addr, name.to_string());
         persist_node(&self.pddb, addr, name);
-        net::request_page(&self.shared, self.chat_cid, *addr, net::PAGE_PATH_DEFAULT, false);
+        net::request_page(&self.shared, self.chat_cid, *addr, net::PAGE_PATH_DEFAULT, Vec::new(), false);
     }
 
     /// F2 while browsing: follow the link under the document cursor.

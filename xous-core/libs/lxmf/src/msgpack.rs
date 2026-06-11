@@ -17,6 +17,10 @@ pub enum Value {
     Array(Vec<Value>),
     /// Map keyed by integer (LXMF field keys are small ints); sufficient here.
     Map(BTreeMap<i64, Value>),
+    /// Map keyed by string, ENCODE-ONLY (the decoder still expects int keys).
+    /// Used for RNS request data dicts, e.g. NomadNet page URL variables
+    /// `{"var_g": "mirrors"}`. A Vec keeps the author's ordering.
+    StrMap(Vec<(String, Value)>),
 }
 
 impl Value {
@@ -156,6 +160,22 @@ fn encode_into(v: &Value, out: &mut Vec<u8>) {
             }
             for (k, val) in m {
                 write_i(out, *k);
+                encode_into(val, out);
+            }
+        }
+        Value::StrMap(m) => {
+            let n = m.len();
+            if n < 16 {
+                out.push(0x80 | n as u8);
+            } else if n <= u16::MAX as usize {
+                out.push(0xde);
+                out.extend_from_slice(&(n as u16).to_be_bytes());
+            } else {
+                out.push(0xdf);
+                out.extend_from_slice(&(n as u32).to_be_bytes());
+            }
+            for (k, val) in m {
+                encode_into(&Value::Str(k.clone()), out);
                 encode_into(val, out);
             }
         }
@@ -324,6 +344,14 @@ mod tests {
         let enc = encode(&v);
         let dec = decode(&enc).unwrap();
         assert_eq!(v, dec);
+    }
+
+    #[test]
+    fn strmap_matches_umsgpack() {
+        // Reference bytes from python umsgpack.packb({"var_g": "mirrors"}) —
+        // the request-data dict NomadNet sends for a page URL variable.
+        let v = Value::StrMap(vec![("var_g".to_string(), Value::Str("mirrors".to_string()))]);
+        assert_eq!(hex::encode(encode(&v)), "81a57661725f67a76d6972726f7273");
     }
 
     #[test]

@@ -263,8 +263,22 @@ fn main() {
                             println!("sync: requested message list");
                         } else if mode == "fetch" {
                             // Anonymous page request: deliberately NO identify
-                            // (node page handlers are ALLOW_ALL).
-                            send_request(&mut writer, &tp, &link_id, fetch_path.as_bytes(), Value::Nil);
+                            // (node page handlers are ALLOW_ALL). The path may
+                            // carry NomadNet-style URL vars after a backtick
+                            // ("/page/group.mu`g=mirrors") — sent as the
+                            // {"var_<k>": v} request-data dict.
+                            let (path, data) = match fetch_path.split_once('`') {
+                                Some((p, varstr)) => {
+                                    let vars: Vec<(String, Value)> = varstr
+                                        .split('|')
+                                        .filter_map(|e| e.split_once('='))
+                                        .map(|(k, v)| (format!("var_{k}"), Value::Str(v.to_string())))
+                                        .collect();
+                                    (p.to_string(), Value::StrMap(vars))
+                                }
+                                None => (fetch_path.clone(), Value::Nil),
+                            };
+                            send_request(&mut writer, &tp, &link_id, path.as_bytes(), data);
                             println!("fetch: requested {}", fetch_path);
                         } else {
                             // Identify on the link so the peer's LXMRouter registers
