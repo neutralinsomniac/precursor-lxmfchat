@@ -96,6 +96,26 @@ lazy allocation works with no behavior change.
 - Workaround here: vendored copy in `xous-core/libs/bzip2-rs` with lazy `tt`
   allocation + a clamp on supported block content.
 
+## Future work to propose upstream (TODO, not yet written)
+
+### gam/modals: first-class Okay/Cancel in radio-list dialogs (F2/F3)
+The modals `get_radiobutton` API has no "dismiss" concept — it blocks until
+some item label is returned. So any cancellable picker must inject a
+synthetic `[cancel]` list row, and confirming means scrolling past every
+entry to the built-in `Okay` line. Local additions in this tree (commits
+`81a6e60`, `08dac5c`): F2 confirms the highlighted item from anywhere in the
+list; F3 confirms the item labeled `gam::modal::CANCEL_SENTINEL` *if the
+list has one* (deliberately conservative so other apps' dialogs can't be
+misfired); the app relabels the F-key tray okay/cancel while a picker is up.
+The proper rewrite to attempt upstream: give RadioButtons (and likely
+CheckBoxes) native accept/cancel semantics — F3 closes and reports
+"cancelled" through the modals API itself (an `Option`/status return rather
+than a reserved label), F2 as the accept accelerator, and standard key hints
+rendered by the modal — so apps need neither the synthetic `[cancel]` row
+nor the sentinel convention. Needs an API-compatibility story for existing
+`get_radiobutton` callers (vault, mtxchat, dns, …), which is why it stayed
+a local accelerator hack here.
+
 ## Not reportable (red herrings we disproved)
 
 - "std Mutex parking loses wakeups on hardware" — wrong; the hang was our own
