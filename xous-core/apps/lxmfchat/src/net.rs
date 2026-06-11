@@ -2521,10 +2521,9 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                                         outbox[i].in_flight = Some(packet_hash);
                                         outbox[i].attempts += 1;
                                         outbox[i].next_action = now + DELIVERY_RETRY;
-                                        chat::cf_set_status_text(
-                                            chat_cid,
-                                            &format!("{label}: replied over their link…"),
-                                        );
+                                        // No status line: the ✓ on the bubble is the
+                                        // user-visible signal; this is just transport.
+                                        log::info!("reply to {label} sent over their link {}", hex(&lid));
                                         i += 1;
                                         continue;
                                     }
