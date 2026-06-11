@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 
 use chat::{ChatOp, Post};
@@ -231,6 +231,14 @@ pub struct Shared {
     /// socket if this stays nonzero too long, which errors the blocked write out
     /// and lets the connection manager reconnect.
     pub write_started: core::sync::atomic::AtomicU32,
+    /// Unix seconds (truncated to u32) when we last read ANY bytes from the
+    /// hub. A socket that died while the device slept never errors out on its
+    /// own — writes keep buffering into the net stack and the blocked read
+    /// never returns — so inbound silence is the only death signal we get. The
+    /// keepalive thread probes a stale connection (path request for our own
+    /// destination, which the hub must answer) and forces a reconnect when the
+    /// probes go unanswered.
+    pub last_inbound: core::sync::atomic::AtomicU32,
     /// The hub to (re)connect to, as `host:port`. Read by the connection manager
     /// each cycle so a "Set hub" takes effect on the next (re)connect.
     pub hub: Mutex<String>,
@@ -455,7 +463,18 @@ pub fn connection_manager(shared: Arc<Shared>, chat_cid: CID) {
         }
 
         chat::cf_set_status_text(chat_cid, &format!("connecting to {hub}…"));
-        match TcpStream::connect((host.as_str(), port)) {
+        // Resolve, then dial with an EXPLICIT timeout. A plain connect() carries
+        // no deadline into the net service, and a connection stuck in SynSent
+        // with no expiry waits there forever — a SYN blackholed right after a
+        // wake (wifi still re-associating) would stall the manager for good.
+        let dialed = (host.as_str(), port).to_socket_addrs().map_err(|e| e.to_string()).and_then(
+            |mut addrs| match addrs.next() {
+                Some(addr) => TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(15))
+                    .map_err(|e| e.to_string()),
+                None => Err("no address".to_string()),
+            },
+        );
+        match dialed {
             Ok(stream) => {
                 stream.set_nodelay(true).ok();
                 // Bound hub writes so a stalled socket (e.g. during a resource
@@ -467,6 +486,9 @@ pub fn connection_manager(shared: Arc<Shared>, chat_cid: CID) {
                     Ok((reader, ctl)) => {
                         *plock(&shared.writer) = Some(stream);
                         *plock(&shared.ctl) = Some(ctl);
+                        shared
+                            .last_inbound
+                            .store(now_secs() as u32, core::sync::atomic::Ordering::SeqCst);
                         shared.connected.store(true, core::sync::atomic::Ordering::SeqCst);
                         backoff = 2;
                         chat::cf_set_status_text(chat_cid, &format!("connected to {hub}"));
@@ -528,6 +550,13 @@ fn read_until_closed(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Tr
     let mut deframer = Deframer::new();
     let mut buf = [0u8; 2048];
     log::info!("lxmf read loop started");
+    // Read with a timeout so the loop NEVER depends on a shutdown() aborting the
+    // blocked read to terminate. On the device, shutting down a socket that died
+    // across a suspend demonstrably did NOT unblock the read (menu→Connect sat
+    // at "reconnecting…" forever) — so every reconnect path (force_reconnect,
+    // write-error, menu) clears `connected`, and the timeout tick notices that
+    // and exits the loop on its own.
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(15))).ok();
     loop {
         match stream.read(&mut buf) {
             Ok(0) => {
@@ -535,8 +564,22 @@ fn read_until_closed(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Tr
                 break;
             }
             Ok(n) => {
+                // Any inbound bytes prove the connection is alive — feed the
+                // keepalive thread's liveness watchdog.
+                shared.last_inbound.store(now_secs() as u32, core::sync::atomic::Ordering::SeqCst);
                 for frame in deframer.push(&buf[..n]) {
                     handle_frame(shared, chat_cid, pddb, trng, &frame);
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if !shared.connected.load(core::sync::atomic::Ordering::SeqCst) {
+                    log::info!("reconnect requested — leaving the read loop");
+                    break;
                 }
             }
             Err(e) => {
@@ -586,6 +629,12 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
 
     match event {
         Event::Announce { destination_hash, info } => {
+            // Our own announce coming back — the path response to a liveness
+            // probe. Reading it already proved the link alive; we're not a peer.
+            if destination_hash == shared.our_dh {
+                log::info!("hub liveness probe answered");
+                return;
+            }
             // Only list LXMF *delivery* destinations — skip propagation-node and
             // other-app announces, whose app_data isn't a messageable peer name.
             if info.name_hash != crate::lxmf_delivery_name_hash() {
@@ -1354,35 +1403,98 @@ pub fn keepalive_thread(shared: Arc<Shared>, chat_cid: CID) {
     use core::sync::atomic::Ordering;
     const TICK_SECS: u64 = 5;
     const KEEPALIVE_TICKS: u64 = 6; // empty frame every 30 s
-    // Runs for the app's lifetime (one instance). Two jobs:
-    // 1. STUCK-WRITE WATCHDOG (every tick): a hub write that's been in flight
+    /// A wall-clock jump this far past a 5 s tick means the device was
+    /// suspended: ticktimer sleeps don't count suspended time, but SystemTime
+    /// is resynced from the hardware RTC on resume.
+    const SUSPEND_GAP_SECS: u64 = 60;
+    /// Probe the hub once nothing has been read for this long…
+    const PROBE_AFTER_SECS: u32 = 180;
+    /// …re-probing at most this often…
+    const PROBE_MIN_INTERVAL_SECS: u32 = 20;
+    /// …and declare the connection dead (reconnect) after this much silence.
+    const DEAD_AFTER_SECS: u32 = 240;
+    // Runs for the app's lifetime (one instance). Four jobs:
+    // 1. SUSPEND DETECTOR (every tick): wifi drops during sleep but the net
+    //    stack never aborts existing TCP sockets, so after a wake the hub
+    //    socket is a zombie — writes buffer forever without erroring and the
+    //    blocked read never returns. Detect the wake by the wall-clock jump
+    //    and reconnect immediately.
+    // 2. STUCK-WRITE WATCHDOG (every tick): a hub write that's been in flight
     //    past WRITE_STUCK_SECS has hung the writer mutex (the socket write
     //    timeout demonstrably doesn't always fire on hardware) — shut the socket
     //    down via the control clone, which errors the blocked write out, releases
     //    the mutex, ends the read loop, and lets the manager reconnect. Without
     //    this, ONE stuck write silently wedged sync + sends + reconnect forever.
-    // 2. KEEPALIVE (every 6th tick): send an empty HDLC frame (a protocol-safe
-    //    no-op RNS discards) so NAT/hub idle timers don't drop a quiet link, and
-    //    so a silently-dead socket is detected within ~30 s.
+    // 3. LIVENESS WATCHDOG: an access-point hub is normally silent toward us, so
+    //    inbound silence alone can't distinguish quiet from dead. After
+    //    PROBE_AFTER_SECS without inbound bytes, send a path request for our OWN
+    //    destination — the hub knows us (we announce on connect) and must answer
+    //    with our announce, producing inbound bytes on a live link. Still
+    //    nothing by DEAD_AFTER_SECS → the socket is dead (e.g. wifi bounced
+    //    without a suspend): reconnect. Catches every silent-blackhole cause.
+    // 4. KEEPALIVE (every 6th tick): send an empty HDLC frame (a protocol-safe
+    //    no-op RNS discards) so NAT/hub idle timers don't drop a quiet link.
+    let trng = XousNames::new().ok().and_then(|xns| Trng::new(&xns).ok());
+    if trng.is_none() {
+        // Without randomness we can't build probe tags; leave the liveness
+        // watchdog off rather than reconnect-loop on a healthy quiet hub.
+        log::error!("keepalive: TRNG init failed — liveness probing disabled");
+    }
     let mut ticks: u64 = 0;
+    let mut last_wall = now_secs();
+    let mut last_probe: u32 = 0;
     loop {
         std::thread::sleep(std::time::Duration::from_secs(TICK_SECS));
         ticks += 1;
-        let started = shared.write_started.load(Ordering::SeqCst);
-        if started != 0 && (now_secs() as u32).saturating_sub(started) > WRITE_STUCK_SECS {
-            log::warn!("hub write stuck >{WRITE_STUCK_SECS}s — shutting the socket down to unwedge it");
-            chat::cf_set_status_text(chat_cid, "hub write stalled — resetting connection…");
-            shared.write_started.store(0, Ordering::SeqCst);
-            shared.connected.store(false, Ordering::SeqCst);
-            let c = plock(&shared.ctl).take();
-            if let Some(c) = c {
-                c.shutdown(std::net::Shutdown::Both).ok();
-            }
+        let now = now_secs();
+        let gap = now.saturating_sub(last_wall);
+        last_wall = now;
+        if gap > SUSPEND_GAP_SECS && shared.connected.load(Ordering::SeqCst) {
+            log::warn!("woke from suspend (clock jumped {gap}s) — reconnecting to the hub");
+            force_reconnect(&shared, chat_cid, "woke from sleep — reconnecting…");
             continue;
         }
-        if ticks % KEEPALIVE_TICKS == 0 && shared.connected.load(Ordering::SeqCst) {
-            write_to_hub(&shared, &[]);
+        let started = shared.write_started.load(Ordering::SeqCst);
+        if started != 0 && (now as u32).saturating_sub(started) > WRITE_STUCK_SECS {
+            log::warn!("hub write stuck >{WRITE_STUCK_SECS}s — shutting the socket down to unwedge it");
+            force_reconnect(&shared, chat_cid, "hub write stalled — resetting connection…");
+            continue;
         }
+        if shared.connected.load(Ordering::SeqCst) {
+            if let Some(trng) = trng.as_ref() {
+                let silent = (now as u32).saturating_sub(shared.last_inbound.load(Ordering::SeqCst));
+                if silent > DEAD_AFTER_SECS {
+                    log::warn!("nothing read from the hub in {silent}s despite probes — reconnecting");
+                    force_reconnect(&shared, chat_cid, "hub unresponsive — reconnecting…");
+                    continue;
+                }
+                if silent > PROBE_AFTER_SECS
+                    && (now as u32).saturating_sub(last_probe) >= PROBE_MIN_INTERVAL_SECS
+                {
+                    last_probe = now as u32;
+                    log::info!("quiet for {silent}s — probing the hub (path request for ourselves)");
+                    request_peer_key(&shared, trng, &shared.our_dh);
+                }
+            }
+            if ticks % KEEPALIVE_TICKS == 0 {
+                write_to_hub(&shared, &[]);
+            }
+        }
+    }
+}
+
+/// Tear the hub connection down from outside the manager so it dials fresh.
+/// Belt and suspenders: clearing `connected` makes the read loop exit on its
+/// own at its next timeout tick (≤15 s), and the shutdown() errors out any
+/// blocked read/write immediately when the net service honors the abort (it
+/// demonstrably may not for a socket that died across a suspend).
+pub(crate) fn force_reconnect(shared: &Arc<Shared>, chat_cid: CID, status: &str) {
+    use core::sync::atomic::Ordering;
+    chat::cf_set_status_text(chat_cid, status);
+    shared.write_started.store(0, Ordering::SeqCst);
+    shared.connected.store(false, Ordering::SeqCst);
+    if let Some(c) = plock(&shared.ctl).take() {
+        c.shutdown(std::net::Shutdown::Both).ok();
     }
 }
 

@@ -184,6 +184,7 @@ impl<'a> LxmfChat<'a> {
             connected: core::sync::atomic::AtomicBool::new(false),
             ctl: Mutex::new(None),
             write_started: core::sync::atomic::AtomicU32::new(0),
+            last_inbound: core::sync::atomic::AtomicU32::new(0),
             our_dh,
             display_name: Mutex::new(display_name),
             dialogue_id: DIALOGUE_WELCOME.to_string(),
@@ -271,16 +272,10 @@ impl<'a> LxmfChat<'a> {
             std::thread::spawn(move || net::sync_thread(synct, sync_cid));
             return;
         }
-        // Manager already running: drop any live socket so it reconnects to the
-        // (possibly newly-set) hub. If already disconnected it's mid-backoff and
-        // will pick up the new hub on its next attempt. Shutdown goes through the
-        // control clone — the writer mutex may be held by an in-flight (possibly
-        // stuck) write, and the main thread must never block on it.
-        let ctl = plock(&self.shared.ctl).take();
-        if let Some(ctl) = ctl {
-            ctl.shutdown(std::net::Shutdown::Both).ok();
-        }
-        self.chat.set_status_text(&format!("reconnecting to {}…", self.hub));
+        // Manager already running: force the connection down so it reconnects
+        // to the (possibly newly-set) hub. If already disconnected it's
+        // mid-backoff and will pick up the new hub on its next attempt.
+        net::force_reconnect(&self.shared, self.chat_cid, &format!("reconnecting to {}…", self.hub));
     }
 
     /// Announce our lxmf.delivery destination on the hub.
