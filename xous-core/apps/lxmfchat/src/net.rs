@@ -1623,7 +1623,14 @@ pub fn keepalive_thread(shared: Arc<Shared>, chat_cid: CID) {
     wait_for_time_server();
     use core::sync::atomic::Ordering;
     const TICK_SECS: u64 = 5;
-    const KEEPALIVE_TICKS: u64 = 6; // empty frame every 30 s
+    // Empty frame every 10 s. The hub (RNS TCPServerInterface) arms its client
+    // sockets with SO_KEEPALIVE probing 5 s after the last segment it received
+    // and TCP_USER_TIMEOUT=24 s — it ABORTS the connection ~29 s after it last
+    // heard from us. The old 30 s cadence was slower than that deadline, so any
+    // delayed/dropped probe ACK (wifi power-save naps) lost the race and showed
+    // up as "closed by hub after ~45s". 10 s = three chances per kill window,
+    // and the regular transmit keeps the radio from napping deeply at all.
+    const KEEPALIVE_TICKS: u64 = 2;
     /// A wall-clock jump this far past a 5 s tick means the device was
     /// suspended: ticktimer sleeps don't count suspended time, but SystemTime
     /// is resynced from the hardware RTC on resume.
@@ -1653,7 +1660,7 @@ pub fn keepalive_thread(shared: Arc<Shared>, chat_cid: CID) {
     //    with our announce, producing inbound bytes on a live link. Still
     //    nothing by DEAD_AFTER_SECS → the socket is dead (e.g. wifi bounced
     //    without a suspend): reconnect. Catches every silent-blackhole cause.
-    // 4. KEEPALIVE (every 6th tick): send an empty HDLC frame (a protocol-safe
+    // 4. KEEPALIVE (every 2nd tick): send an empty HDLC frame (a protocol-safe
     //    no-op RNS discards) so NAT/hub idle timers don't drop a quiet link.
     let trng = XousNames::new().ok().and_then(|xns| Trng::new(&xns).ok());
     if trng.is_none() {
