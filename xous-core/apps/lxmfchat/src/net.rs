@@ -2417,54 +2417,13 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                 }
             } else {
                 // ---- Primary: DIRECT delivery over a link (the reference
-                // default): establish (or reuse) a link, send the message as a
-                // single link DATA packet, and await its packet proof. Links
-                // give forward-secret session keys, and the proof routes back
-                // along the link itself. ----
-                let (known, have_path) = {
-                    let tp = plock(&shared.transport);
-                    (tp.known(&outbox[i].peer).cloned(), tp.has_path(&outbox[i].peer))
-                };
-                let known = match known {
-                    Some(k) => k,
-                    None => {
-                        // No key yet (e.g. the contact was imported from an
-                        // address, never announced to us): keep asking. The
-                        // Announce handler fires the send the moment the key
-                        // lands; the deadline turns this into "no route found".
-                        let label = peer_label(shared, &outbox[i].peer);
-                        chat::cf_set_status_text(chat_cid, &format!("{label}: requesting key…"));
-                        request_peer_key(shared, trng, &outbox[i].peer);
-                        outbox[i].next_action = now + KEY_RETRY;
-                        i += 1;
-                        continue;
-                    }
-                };
-                // Even with the peer's key, we need a current route: a transport
-                // node will not forward a packet to a destination >1 hop away
-                // unless it is addressed via that node (HEADER_2). Request a path
-                // (re-announce) and wait — mirrors RNS requesting a path before
-                // sending. The announce response teaches us the next hop.
-                if !have_path {
-                    let label = peer_label(shared, &outbox[i].peer);
-                    // If the route never resolves (peer offline / unannounced), fall
-                    // back to the propagation node rather than spinning until the
-                    // deadline — the PN can still store-and-forward for an offline
-                    // peer (LXMF does the same after its pathless tries).
-                    if outbox[i].route_tries >= MAX_ROUTE_TRIES && !outbox[i].tried_pn && pn.is_some() {
-                        outbox[i].via_pn = true;
-                        outbox[i].deadline = now + PROP_DEADLINE; // fresh, independent budget
-                        outbox[i].next_action = now; // act on the PN path immediately
-                        chat::cf_set_status_text(chat_cid, &format!("{label}: no route — trying propagation node…"));
-                        continue; // re-enter the loop on this same message via the PN branch
-                    }
-                    request_peer_key(shared, trng, &outbox[i].peer);
-                    outbox[i].route_tries += 1;
-                    chat::cf_set_status_text(chat_cid, &format!("{label}: finding a route…"));
-                    outbox[i].next_action = now + KEY_RETRY;
-                    i += 1;
-                    continue;
-                }
+                // default): a link we established, else the peer's link to us
+                // (the backchannel). A live link in either direction needs no
+                // key lookup and no route — its packets are addressed to the
+                // link id, which every hop forwards from its link table. Only
+                // establishing a FRESH link gates on key + route, mirroring
+                // LXMRouter.process_outbound (direct_links → backchannel_links
+                // → has_path/request_path). ----
                 let peer = outbox[i].peer;
                 let label = peer_label(shared, &peer);
                 let link = { plock(&shared.transport).outbound_link_for(&peer, now) };
@@ -2573,6 +2532,52 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                                     plock(&shared.backchannels).remove(&peer);
                                 }
                             }
+                        }
+                        // Neither direction has a live link, so establish our
+                        // own — only THIS needs the peer's key (the link
+                        // request encrypts to their identity) and a current
+                        // route: a transport node will not forward a packet to
+                        // a destination >1 hop away unless it is addressed via
+                        // that node (HEADER_2). Mirrors RNS requesting a path
+                        // before opening a link.
+                        let (known, have_path) = {
+                            let tp = plock(&shared.transport);
+                            (tp.known(&peer).cloned(), tp.has_path(&peer))
+                        };
+                        let known = match known {
+                            Some(k) => k,
+                            None => {
+                                // No key yet (e.g. the contact was imported from
+                                // an address, never announced to us): keep asking.
+                                // The Announce handler fires the send the moment
+                                // the key lands; the deadline turns this into
+                                // "no route found".
+                                chat::cf_set_status_text(chat_cid, &format!("{label}: requesting key…"));
+                                request_peer_key(shared, trng, &peer);
+                                outbox[i].next_action = now + KEY_RETRY;
+                                i += 1;
+                                continue;
+                            }
+                        };
+                        if !have_path {
+                            // If the route never resolves (peer offline /
+                            // unannounced), fall back to the propagation node
+                            // rather than spinning until the deadline — the PN
+                            // can still store-and-forward for an offline peer
+                            // (LXMF does the same after its pathless tries).
+                            if outbox[i].route_tries >= MAX_ROUTE_TRIES && !outbox[i].tried_pn && pn.is_some() {
+                                outbox[i].via_pn = true;
+                                outbox[i].deadline = now + PROP_DEADLINE; // fresh, independent budget
+                                outbox[i].next_action = now; // act on the PN path immediately
+                                chat::cf_set_status_text(chat_cid, &format!("{label}: no route — trying propagation node…"));
+                                continue; // re-enter the loop on this same message via the PN branch
+                            }
+                            request_peer_key(shared, trng, &peer);
+                            outbox[i].route_tries += 1;
+                            chat::cf_set_status_text(chat_cid, &format!("{label}: finding a route…"));
+                            outbox[i].next_action = now + KEY_RETRY;
+                            i += 1;
+                            continue;
                         }
                         // No live link: establish one (a pending recent request
                         // is left alone). The OutboundLinkUp event pumps the
