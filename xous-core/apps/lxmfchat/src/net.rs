@@ -67,6 +67,7 @@ const PROP_DEADLINE: u64 = 120; // budget for propagation, from escalation (✗)
 const DELIVERY_RETRY: u64 = 10; // re-send opportunistically if no proof yet (LXMF: 10s)
 const MAX_ATTEMPTS: u8 = 5; // opportunistic delivery tries before escalating (LXMF: 5)
 const MAX_ROUTE_TRIES: u8 = 3; // path requests (× KEY_RETRY) before escalating to the PN
+const MAX_LINK_TRIES: u8 = 3; // link requests (each gets its ~20 s answer window) before the PN
 /// Whether to sync from the propagation node automatically on first connect.
 /// Runs once per app run, as soon as the node's route resolves; the "Sync
 /// messages" menu remains for manual re-syncs.
@@ -125,6 +126,13 @@ pub struct OutboundMsg {
     /// propagation node (which it can still reach even when the peer is offline) —
     /// mirrors LXMF falling back to propagation after its pathless tries.
     pub route_tries: u8,
+    /// LINKREQUESTs actually sent while establishing our own link to the peer.
+    /// Deliberately separate from `route_tries`: a send right after a hub
+    /// reconnect legitimately spends route tries first (paths are session
+    /// state), and when both phases shared one counter the link phase arrived
+    /// with its budget already spent — escalating to the propagation node two
+    /// seconds after the first "establishing link…".
+    pub link_tries: u8,
     /// What the last pump pass found missing: true = the peer's identity key
     /// itself, false = just a fresh route. Only used to phrase the "…— sending"
     /// status honestly when the awaited announce arrives ("key" vs "route" —
@@ -1516,12 +1524,17 @@ pub(crate) fn force_reconnect(shared: &Arc<Shared>, chat_cid: CID, status: &str)
 /// Ask the network to (re-)announce `target` so we learn its public key. Used
 /// when we receive from, or want to message, a peer we have no key for — the
 /// normal case on an access_point interface where announces aren't flooded to us.
-pub fn request_peer_key(shared: &Arc<Shared>, trng: &Trng, target: &[u8; TRUNCATED_HASHLENGTH]) {
+pub fn request_peer_key(shared: &Arc<Shared>, trng: &Trng, target: &[u8; TRUNCATED_HASHLENGTH]) -> bool {
     let mut tag = [0u8; TRUNCATED_HASHLENGTH];
     crate::fill_random(trng, &mut tag);
     let raw = { plock(&shared.transport).make_path_request(target, &tag) };
-    write_to_hub(shared, &raw);
-    log::info!("sent path request for {}", hex(target));
+    let ok = write_to_hub(shared, &raw);
+    if ok {
+        log::info!("sent path request for {}", hex(target));
+    } else {
+        log::warn!("path request for {} not sent (no hub connection)", hex(target));
+    }
+    ok
 }
 
 /// Acquire a mutex by polling `try_lock` instead of `lock()`.
@@ -1781,16 +1794,19 @@ fn send_link_request(
             let mut ed = [0u8; KEY_HALF];
             crate::fill_random(trng, &mut ex);
             crate::fill_random(trng, &mut ed);
-            Some(tp.make_link_request(pn, pn_identity, &ex, &ed, now).0)
+            Some(tp.make_link_request(pn, pn_identity, &ex, &ed, now))
         }
     };
     match raw {
         None => LinkReqOutcome::Pending,
-        Some(raw) => {
-            let ok = write_to_hub(shared, &raw);
-            if ok {
+        Some((raw, link_id)) => {
+            if write_to_hub(shared, &raw) {
                 LinkReqOutcome::Sent
             } else {
+                // Nothing went out: drop the pending entry make_link_request
+                // registered, or for the next ~20 s every retry would be
+                // answered "Pending" on the strength of a request nobody saw.
+                plock(&shared.transport).forget_pending_link(&link_id);
                 LinkReqOutcome::WriteFailed
             }
         }
@@ -2139,6 +2155,7 @@ pub fn enqueue_outbound(
         in_flight: None,
         attempts: 0,
         route_tries: 0,
+        link_tries: 0,
         awaiting_key: false,
         pn_blob: None,
         next_action: 0,
@@ -2760,8 +2777,13 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                                 chat::cf_set_status_text(chat_cid, &format!("{label}: no route — trying propagation node…"));
                                 continue; // re-enter the loop on this same message via the PN branch
                             }
-                            request_peer_key(shared, trng, &peer);
-                            outbox[i].route_tries += 1;
+                            // A try only counts if the path request actually
+                            // left the device — right after a reconnect the
+                            // first writes can land on a dead socket, and those
+                            // must not burn the route budget.
+                            if request_peer_key(shared, trng, &peer) {
+                                outbox[i].route_tries += 1;
+                            }
                             outbox[i].awaiting_key = false;
                             chat::cf_set_status_text(chat_cid, &format!("{label}: finding a route…"));
                             outbox[i].next_action = now + KEY_RETRY;
@@ -2775,12 +2797,19 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                         //
                         // If the link never establishes (peer offline, stale
                         // path), `attempts` stays 0 and nothing else escalates —
-                        // count establishment tries and fall back to the
+                        // count establishment requests (`link_tries`, NOT the
+                        // route counter: route tries spent getting here must
+                        // not eat the link budget) and fall back to the
                         // propagation node like the no-route path does, instead
-                        // of spinning until the deadline ✗'s the message. Each
-                        // expired request window is ~20 s (PENDING_LINK_EXPIRY),
-                        // so this is about a minute of trying.
-                        if outbox[i].route_tries >= MAX_ROUTE_TRIES
+                        // of spinning until the deadline ✗'s the message.
+                        // Escalate only once the LAST request's answer window
+                        // (~20 s, PENDING_LINK_EXPIRY) has also expired — three
+                        // full windows ≈ a minute of honest trying, and a slow
+                        // LRPROOF (this hub's RTT runs seconds) isn't cut off
+                        // at the next 2 s tick.
+                        let pending = { plock(&shared.transport).pending_link_to(&peer, now) };
+                        if !pending
+                            && outbox[i].link_tries >= MAX_LINK_TRIES
                             && !outbox[i].tried_pn
                             && pn.is_some()
                         {
@@ -2793,11 +2822,16 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                             );
                             continue;
                         }
-                        if let LinkReqOutcome::Sent =
-                            send_link_request(shared, trng, &peer, &known.identity, now)
-                        {
-                            outbox[i].route_tries += 1;
-                            chat::cf_set_status_text(chat_cid, &format!("{label}: establishing link…"));
+                        match send_link_request(shared, trng, &peer, &known.identity, now) {
+                            LinkReqOutcome::Sent => {
+                                outbox[i].link_tries += 1;
+                                chat::cf_set_status_text(chat_cid, &format!("{label}: establishing link…"));
+                            }
+                            // Pending: the window is still open, keep waiting.
+                            // WriteFailed: the hub socket is down/reconnecting;
+                            // nothing went out (and no pending entry remains),
+                            // so the same try repeats once the hub is back.
+                            LinkReqOutcome::Pending | LinkReqOutcome::WriteFailed => {}
                         }
                         outbox[i].next_action = now + 2;
                     }

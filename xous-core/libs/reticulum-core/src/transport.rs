@@ -974,6 +974,15 @@ impl Transport {
         self.remove_out_link(link_id);
     }
 
+    /// Forget a pending outbound link request whose LINKREQUEST never made it
+    /// onto the wire (the hub write failed). Without this the dead entry reads
+    /// as "request pending" for the full expiry window and stonewalls every
+    /// retry — nobody saw the request, so no LRPROOF is coming.
+    pub fn forget_pending_link(&mut self, link_id: &[u8; TRUNCATED_HASHLENGTH]) {
+        self.pending_out.remove(link_id);
+        self.pending_out_order.retain(|i| i != link_id);
+    }
+
     fn remove_out_link(&mut self, link_id: &[u8; TRUNCATED_HASHLENGTH]) {
         self.out_resources.remove(link_id);
         self.out_links.remove(link_id);
