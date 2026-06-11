@@ -2695,8 +2695,10 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                             }
                         }
                         // Neither direction has a live link, so establish our
-                        // own — only THIS needs the peer's key (the link
-                        // request encrypts to their identity) and a current
+                        // own — only THIS needs the peer's identity key (NOT
+                        // for encryption — the link key is ephemeral-ephemeral
+                        // ECDH — but to validate their identity-signed LRPROOF,
+                        // or anyone could answer the request) and a current
                         // route: a transport node will not forward a packet to
                         // a destination >1 hop away unless it is addressed via
                         // that node (HEADER_2). Mirrors RNS requesting a path
