@@ -331,6 +331,13 @@ pub struct Shared {
     /// destination, which the hub must answer) and forces a reconnect when the
     /// probes go unanswered.
     pub last_inbound: core::sync::atomic::AtomicU32,
+    /// WHY the current/last connection went down — "closed by hub", "read
+    /// failed: …", "woke from sleep", … . First cause wins (a forced reconnect
+    /// also makes the read loop exit; the trigger is the interesting part, not
+    /// the fallout), recorded via [`note_disconnect`], consumed and shown by the
+    /// connection manager after the read loop exits, cleared on connect. This is
+    /// what tells a user WHICH LAYER is losing the connection.
+    pub disconnect_reason: Mutex<Option<String>>,
     /// The hub to (re)connect to, as `host:port`. Read by the connection manager
     /// each cycle so a "Set hub" takes effect on the next (re)connect.
     pub hub: Mutex<String>,
@@ -535,6 +542,10 @@ pub fn connection_manager(shared: Arc<Shared>, chat_cid: CID) {
     #[cfg(target_os = "xous")]
     let netmgr = net::NetManager::new();
     let mut backoff = 2u64;
+    // The previous drop's cause + uptime, echoed in the next "connected" status:
+    // the "link lost" line alone only shows for the backoff seconds, too brief
+    // to diagnose from; this keeps the answer on screen until the next event.
+    let mut last_drop: Option<String> = None;
     loop {
         let hub = plock(&shared.hub).clone();
         let parsed = hub
@@ -595,8 +606,19 @@ pub fn connection_manager(shared: Arc<Shared>, chat_cid: CID) {
                             .last_inbound
                             .store(now_secs() as u32, core::sync::atomic::Ordering::SeqCst);
                         shared.connected.store(true, core::sync::atomic::Ordering::SeqCst);
+                        // A reason noted while we were already down (e.g. a menu
+                        // reconnect during backoff) must not be blamed for this
+                        // fresh connection's eventual drop.
+                        plock(&shared.disconnect_reason).take();
+                        let connected_at = now_secs();
                         backoff = 2;
-                        chat::cf_set_status_text(chat_cid, &format!("connected to {hub}"));
+                        match last_drop.take() {
+                            Some(d) => chat::cf_set_status_text(
+                                chat_cid,
+                                &format!("connected — last drop: {d}"),
+                            ),
+                            None => chat::cf_set_status_text(chat_cid, &format!("connected to {hub}")),
+                        }
                         send_announce(&shared, &trng);
                         // Proactively learn the propagation node's route now, so a
                         // later store-and-forward fallback doesn't have to discover
@@ -639,7 +661,25 @@ pub fn connection_manager(shared: Arc<Shared>, chat_cid: CID) {
                             // Any kept page link died with the session.
                             plock(&shared.browser).link_id = None;
                         }
-                        chat::cf_set_status_text(chat_cid, "hub connection lost — reconnecting…");
+                        // Say WHY and after how long, so the failing layer is
+                        // identifiable from the status bar alone: a forced
+                        // reconnect names its trigger (suspend/watchdog/menu);
+                        // an unprompted read-loop exit means the socket itself
+                        // died (hub closed it / TCP reset / wifi).
+                        let why = plock(&shared.disconnect_reason)
+                            .take()
+                            .unwrap_or_else(|| "connection dropped".to_string());
+                        let up = fmt_duration(now_secs().saturating_sub(connected_at));
+                        #[cfg(target_os = "xous")]
+                        let wifi = if netmgr.get_ipv4_config().is_some() { "" } else { ", wifi down" };
+                        #[cfg(not(target_os = "xous"))]
+                        let wifi = "";
+                        log::warn!("hub link lost after {up}: {why}{wifi}");
+                        chat::cf_set_status_text(
+                            chat_cid,
+                            &format!("link lost after {up} — {why}{wifi}"),
+                        );
+                        last_drop = Some(format!("{why} after {up}{wifi}"));
                     }
                     Err(e) => {
                         shared.connected.store(false, core::sync::atomic::Ordering::SeqCst);
@@ -673,6 +713,7 @@ fn read_until_closed(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Tr
         match stream.read(&mut buf) {
             Ok(0) => {
                 log::info!("hub connection closed");
+                note_disconnect(shared, "closed by hub (EOF)".to_string());
                 break;
             }
             Ok(n) => {
@@ -696,9 +737,32 @@ fn read_until_closed(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Tr
             }
             Err(e) => {
                 log::warn!("hub read error: {e}");
+                note_disconnect(shared, format!("read failed: {:?}", e.kind()));
                 break;
             }
         }
+    }
+}
+
+/// Record WHY the hub connection is going down, for the connection manager's
+/// "link lost after X — why" status. First cause wins: a forced reconnect also
+/// makes the read loop exit (and may error the socket out), and the trigger is
+/// the diagnosis — not the fallout.
+fn note_disconnect(shared: &Arc<Shared>, reason: String) {
+    let mut slot = plock(&shared.disconnect_reason);
+    if slot.is_none() {
+        *slot = Some(reason);
+    }
+}
+
+/// `93s` → "1m33s": compact connection-uptime label for the status bar.
+fn fmt_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
     }
 }
 
@@ -1603,13 +1667,18 @@ pub fn keepalive_thread(shared: Arc<Shared>, chat_cid: CID) {
         last_wall = now;
         if gap > SUSPEND_GAP_SECS && shared.connected.load(Ordering::SeqCst) {
             log::warn!("woke from suspend (clock jumped {gap}s) — reconnecting to the hub");
-            force_reconnect(&shared, chat_cid, "woke from sleep — reconnecting…");
+            force_reconnect(&shared, chat_cid, "woke from sleep — reconnecting…", "woke from sleep");
             continue;
         }
         let started = shared.write_started.load(Ordering::SeqCst);
         if started != 0 && (now as u32).saturating_sub(started) > WRITE_STUCK_SECS {
             log::warn!("hub write stuck >{WRITE_STUCK_SECS}s — shutting the socket down to unwedge it");
-            force_reconnect(&shared, chat_cid, "hub write stalled — resetting connection…");
+            force_reconnect(
+                &shared,
+                chat_cid,
+                "hub write stalled — resetting connection…",
+                "write stalled >20s",
+            );
             continue;
         }
         if shared.connected.load(Ordering::SeqCst) {
@@ -1617,7 +1686,12 @@ pub fn keepalive_thread(shared: Arc<Shared>, chat_cid: CID) {
                 let silent = (now as u32).saturating_sub(shared.last_inbound.load(Ordering::SeqCst));
                 if silent > DEAD_AFTER_SECS {
                     log::warn!("nothing read from the hub in {silent}s despite probes — reconnecting");
-                    force_reconnect(&shared, chat_cid, "hub unresponsive — reconnecting…");
+                    force_reconnect(
+                        &shared,
+                        chat_cid,
+                        "hub unresponsive — reconnecting…",
+                        &format!("no inbound for {silent}s, probes unanswered"),
+                    );
                     continue;
                 }
                 if silent > PROBE_AFTER_SECS
@@ -1640,8 +1714,9 @@ pub fn keepalive_thread(shared: Arc<Shared>, chat_cid: CID) {
 /// own at its next timeout tick (≤15 s), and the shutdown() errors out any
 /// blocked read/write immediately when the net service honors the abort (it
 /// demonstrably may not for a socket that died across a suspend).
-pub(crate) fn force_reconnect(shared: &Arc<Shared>, chat_cid: CID, status: &str) {
+pub(crate) fn force_reconnect(shared: &Arc<Shared>, chat_cid: CID, status: &str, reason: &str) {
     use core::sync::atomic::Ordering;
+    note_disconnect(shared, reason.to_string());
     chat::cf_set_status_text(chat_cid, status);
     shared.write_started.store(0, Ordering::SeqCst);
     shared.connected.store(false, Ordering::SeqCst);
@@ -1732,11 +1807,12 @@ pub(crate) fn write_to_hub(shared: &Arc<Shared>, raw: &[u8]) -> bool {
             shared.write_started.store(now_secs() as u32, Ordering::SeqCst);
             let res = w.write_all(&framed).and_then(|_| w.flush());
             shared.write_started.store(0, Ordering::SeqCst);
-            if res.is_err() {
+            if let Err(e) = &res {
                 // A failed/timed-out write means the connection is dead OR the HDLC
                 // stream is now half-written and desynced. Don't keep limping along
                 // (that silently drops every later message): shut the socket so the
                 // read loop returns and the connection manager reconnects cleanly.
+                note_disconnect(shared, format!("write failed: {:?}", e.kind()));
                 w.shutdown(std::net::Shutdown::Both).ok();
                 *guard = None;
                 shared.connected.store(false, Ordering::SeqCst);

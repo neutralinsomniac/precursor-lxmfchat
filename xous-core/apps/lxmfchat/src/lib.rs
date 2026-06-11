@@ -197,6 +197,7 @@ impl<'a> LxmfChat<'a> {
             ctl: Mutex::new(None),
             write_started: core::sync::atomic::AtomicU32::new(0),
             last_inbound: core::sync::atomic::AtomicU32::new(0),
+            disconnect_reason: Mutex::new(None),
             our_dh,
             display_name: Mutex::new(display_name),
             dialogue_id: DIALOGUE_WELCOME.to_string(),
@@ -294,7 +295,12 @@ impl<'a> LxmfChat<'a> {
         // Manager already running: force the connection down so it reconnects
         // to the (possibly newly-set) hub. If already disconnected it's
         // mid-backoff and will pick up the new hub on its next attempt.
-        net::force_reconnect(&self.shared, self.chat_cid, &format!("reconnecting to {}…", self.hub));
+        net::force_reconnect(
+            &self.shared,
+            self.chat_cid,
+            &format!("reconnecting to {}…", self.hub),
+            "reconnect requested",
+        );
     }
 
     /// Announce our lxmf.delivery destination on the hub.
