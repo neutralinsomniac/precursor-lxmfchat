@@ -28,10 +28,17 @@ const MAX_LINKS: usize = 64;
 const MAX_OUT_LINKS: usize = 32;
 const MAX_PENDING_OUT: usize = 32;
 const MAX_RECEIPTS: usize = 64;
-/// A LINKREQUEST that hasn't been proven within this window is considered lost;
-/// `pending_link_to` stops reporting it so the caller sends a fresh request.
-/// Generous vs. real link establishment (a few RTTs, ≤ ~15 s on a slow hub).
+/// A LINKREQUEST that hasn't been proven within its patience window is
+/// considered lost; `pending_link_to` stops reporting it so the caller sends a
+/// fresh request. The window scales with the destination's hop count, like the
+/// reference (RNS Link.py: first-hop timeout + 6 s/hop establishment timeout)
+/// — a node 7 hops into a slow mesh can legitimately take ~45 s to prove, and
+/// a flat 20 s window made us forget the pending entry (and churn a fresh
+/// link_id on retry) right before the proof arrived. This floor covers the
+/// 1-hop hub case; `pending_expiry_secs` adds the per-hop allowance.
 const PENDING_LINK_EXPIRY_SECS: u64 = 20;
+/// Per-hop establishment allowance (RNS `DEFAULT_PER_HOP_TIMEOUT`).
+const PER_HOP_TIMEOUT_SECS: u64 = 6;
 /// Established outbound links idle longer than this are dropped instead of
 /// reused. We send no link keepalives, so the responder tears an idle link
 /// down on its own schedule — LXMF closes delivery links after 600 s of
@@ -79,8 +86,10 @@ struct PendingOut {
     sig_seed: [u8; KEY_HALF],
     identity: PublicIdentity,
     /// When the LINKREQUEST was sent; expired entries (no LRPROOF within
-    /// `PENDING_LINK_EXPIRY_SECS`) are pruned so a lost request can be retried.
+    /// `expiry_secs`) are pruned so a lost request can be retried.
     created: u64,
+    /// Hop-scaled patience for this request (see `pending_expiry_secs`).
+    expiry_secs: u64,
 }
 
 /// An established outbound link, reusable for further messages to `target`.
@@ -898,6 +907,7 @@ impl Transport {
         // or the transport node won't forward it. link_id is over the hashable
         // part (header-independent), so it is unaffected by the rewrite.
         let raw = self.apply_transport(target, raw);
+        let expiry_secs = self.pending_expiry_secs(target);
         self.insert_pending_out(
             link_id,
             PendingOut {
@@ -906,9 +916,20 @@ impl Transport {
                 sig_seed: *eph_ed25519,
                 identity: peer_identity.clone(),
                 created: now,
+                expiry_secs,
             },
         );
         (raw, link_id)
+    }
+
+    /// How long to wait for an LRPROOF before declaring a LINKREQUEST lost:
+    /// the flat floor plus the reference's 6 s-per-hop establishment allowance
+    /// (RNS Link.py scales its establishment timeout the same way) — a distant
+    /// node on a slow mesh needs the extra patience or we churn link ids
+    /// faster than its proof can travel back.
+    fn pending_expiry_secs(&self, target: &[u8; TRUNCATED_HASHLENGTH]) -> u64 {
+        let hops = self.path_hops(target).unwrap_or(1).max(1) as u64;
+        PENDING_LINK_EXPIRY_SECS.max(PER_HOP_TIMEOUT_SECS * (hops + 1))
     }
 
     /// An established, still-fresh outbound link to `target`, if one exists (for
@@ -957,7 +978,7 @@ impl Transport {
         let expired: Vec<[u8; TRUNCATED_HASHLENGTH]> = self
             .pending_out
             .iter()
-            .filter(|(_, p)| now > p.created.saturating_add(PENDING_LINK_EXPIRY_SECS))
+            .filter(|(_, p)| now > p.created.saturating_add(p.expiry_secs))
             .map(|(id, _)| *id)
             .collect();
         for id in expired {
@@ -1927,5 +1948,50 @@ mod tests {
             &carol_dh, &carol.identity, None, b"hi", &[7u8; KEY_HALF], &[8u8; IV_LENGTH],
         );
         assert_eq!(Packet::decode(&raw2).unwrap().header_type, HeaderType::One, "direct dest stays HEADER_1");
+    }
+
+    #[test]
+    fn pending_link_patience_scales_with_hops() {
+        use crate::packet::{HeaderType, Packet};
+        // Bob's node is 7 hops into a slow mesh: his LRPROOF can legitimately
+        // take ~45 s (the reference allows 6 s/hop), so the pending request
+        // must outlive the flat 20 s floor instead of being forgotten (and a
+        // fresh link id churned) right before the proof arrives.
+        let bob_dh = single_destination_hash("nomadnetwork", &["node"], &id(0x21).hash());
+        let direct = Transport::new(id(0x21)).make_announce("nomadnetwork", &["node"], b"PMesh", &mut OsRng, 1_700_000_000);
+        let mut relayed = Packet::decode(&direct).unwrap();
+        relayed.header_type = HeaderType::Two;
+        relayed.transport_type = TRANSPORT_TRANSPORT;
+        relayed.transport_id = Some([0xAB; TRUNCATED_HASHLENGTH]);
+        relayed.hops = 6; // +1 counting the hop into us = 7 away
+        let relayed = relayed.encode();
+
+        let mut alice = Transport::new(id(0x11));
+        let mut eph = || [0u8; KEY_HALF];
+        alice.handle_frame(&relayed, &mut eph);
+        assert_eq!(alice.path_hops(&bob_dh), Some(7));
+
+        let now = 1_000u64;
+        let bob = alice.known(&bob_dh).unwrap().clone();
+        let _ = alice.make_link_request(&bob_dh, &bob.identity, &[1; KEY_HALF], &[2; KEY_HALF], now);
+        let patience = PER_HOP_TIMEOUT_SECS * 8; // 6 s × (7 hops + 1) = 48 s
+        assert!(
+            alice.pending_link_to(&bob_dh, now + PENDING_LINK_EXPIRY_SECS + 1),
+            "a 7-hop pending link must survive the flat floor"
+        );
+        assert!(alice.pending_link_to(&bob_dh, now + patience - 1));
+        assert!(
+            !alice.pending_link_to(&bob_dh, now + patience + 1),
+            "and expire after the hop-scaled window"
+        );
+
+        // A destination with no known path keeps the flat floor.
+        let carol_dh = single_destination_hash("lxmf", &["delivery"], &id(0x23).hash());
+        let carol_ann = Transport::new(id(0x23)).make_announce("lxmf", &["delivery"], b"carol", &mut OsRng, 1_700_000_000);
+        alice.handle_frame(&carol_ann, &mut eph);
+        let carol = alice.known(&carol_dh).unwrap().clone();
+        let _ = alice.make_link_request(&carol_dh, &carol.identity, &[1; KEY_HALF], &[2; KEY_HALF], now);
+        assert!(alice.pending_link_to(&carol_dh, now + PENDING_LINK_EXPIRY_SECS - 1));
+        assert!(!alice.pending_link_to(&carol_dh, now + PENDING_LINK_EXPIRY_SECS + 1));
     }
 }

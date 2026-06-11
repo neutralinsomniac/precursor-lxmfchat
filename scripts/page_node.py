@@ -11,6 +11,10 @@ Resource path, exercising our Resource receiver.
 
   scripts/page_node.py            # listens on 127.0.0.1:4251, prints the
                                   # node dest hash to give host-client
+  PAGE_NODE_HUB=host:port scripts/page_node.py
+                                  # instead JOIN a real hub as a client, so a
+                                  # device on that hub can browse this node
+                                  # across the real network
 """
 import os
 import tempfile
@@ -20,6 +24,7 @@ import RNS
 
 LISTEN_IP = "127.0.0.1"
 LISTEN_PORT = 4251
+HUB = os.environ.get("PAGE_NODE_HUB")  # "host:port" → TCPClientInterface mode
 
 # Fixed identity so the node address is stable across runs.
 NODE_SEED = bytes.fromhex(("c1" * 32) + ("c2" * 32))
@@ -55,12 +60,21 @@ BIG_PAGE = ">Big Page\n" + (
 
 def main():
     cfgdir = tempfile.mkdtemp(prefix="page-node-")
+    if HUB:
+        host, port = HUB.rsplit(":", 1)
+        iface = (
+            "  [[hub]]\n    type = TCPClientInterface\n    enabled = Yes\n"
+            f"    target_host = {host}\n    target_port = {port}\n"
+        )
+    else:
+        iface = (
+            "  [[server]]\n    type = TCPServerInterface\n    enabled = Yes\n"
+            f"    listen_ip = {LISTEN_IP}\n    listen_port = {LISTEN_PORT}\n"
+        )
     with open(os.path.join(cfgdir, "config"), "w") as f:
         f.write(
             "[reticulum]\n  enable_transport = No\n  share_instance = No\n"
-            "  panic_on_interface_error = No\n[logging]\n  loglevel = 4\n[interfaces]\n"
-            "  [[server]]\n    type = TCPServerInterface\n    enabled = Yes\n"
-            f"    listen_ip = {LISTEN_IP}\n    listen_port = {LISTEN_PORT}\n"
+            "  panic_on_interface_error = No\n[logging]\n  loglevel = 4\n[interfaces]\n" + iface
         )
     RNS.Reticulum(configdir=cfgdir)
 

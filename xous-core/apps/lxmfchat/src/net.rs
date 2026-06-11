@@ -2408,13 +2408,17 @@ fn start_fetch(
             return;
         }
     };
+    // Patience scales with distance: link establishment alone is allowed
+    // ~6 s/hop by the reference, and a 7-hop mesh node can take most of a
+    // minute before the first byte of the page even starts back.
+    let hops = { plock(&shared.transport).path_hops(&node).unwrap_or(1).max(1) as u64 };
     {
         let mut b = plock(&shared.browser);
         b.phase = BrowserPhase::Linking;
         b.node = Some(node);
         b.path = path;
         b.receiver = None;
-        b.deadline = now + PAGE_DEADLINE_SECS;
+        b.deadline = now + PAGE_DEADLINE_SECS + 12 * hops;
         b.link_id = None;
         b.route_tries = 0;
         b.next_attempt = 0;
@@ -2429,7 +2433,10 @@ fn start_fetch(
             browser_send_request(shared, chat_cid, trng, lid);
         }
         None => {
-            chat::cf_set_status_text_forced(chat_cid, "page: contacting node (try 1)…");
+            chat::cf_set_status_text_forced(
+                chat_cid,
+                &format!("page: contacting node (try 1, hops {hops})…"),
+            );
             match send_link_request(shared, trng, &node, &known.identity, now) {
                 LinkReqOutcome::WriteFailed => {
                     browser_finish(shared, chat_cid, "hub write failed — try again");
