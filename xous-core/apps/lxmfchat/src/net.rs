@@ -125,6 +125,12 @@ pub struct OutboundMsg {
     /// propagation node (which it can still reach even when the peer is offline) —
     /// mirrors LXMF falling back to propagation after its pathless tries.
     pub route_tries: u8,
+    /// What the last pump pass found missing: true = the peer's identity key
+    /// itself, false = just a fresh route. Only used to phrase the "…— sending"
+    /// status honestly when the awaited announce arrives ("key" vs "route" —
+    /// a route refresh is normal once per peer per session and shouldn't read
+    /// like a missing key).
+    pub awaiting_key: bool,
     /// Cached propagation blob (message encrypted to the recipient + the node's
     /// PoW stamp). Computed once, lock-free (the stamp takes a few seconds), then
     /// reused on retries. None until the propagation fallback computes it.
@@ -679,12 +685,14 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
             // recipient drops it; (b) send now instead of waiting out the pump
             // tick, and say so (the wait was otherwise silent-ish).
             let cost = plock(&shared.stamp_costs).get(&destination_hash).copied();
-            let waiting = {
+            let (waiting, was_keyless) = {
                 let mut outbox = plock(&shared.outbox);
                 let mut waiting = false;
+                let mut was_keyless = false;
                 for m in outbox.iter_mut().filter(|m| m.peer == destination_hash) {
                     if m.attempts == 0 && m.in_flight.is_none() {
                         waiting = true;
+                        was_keyless |= m.awaiting_key;
                         if let Some(c) = cost {
                             if !m.stamped && m.needs_stamp.is_none() {
                                 m.needs_stamp = Some(c);
@@ -693,11 +701,16 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
                         m.next_action = 0; // act immediately
                     }
                 }
-                waiting
+                (waiting, was_keyless)
             };
             if waiting {
                 let label = peer_label(shared, &destination_hash);
-                chat::cf_set_status_text(chat_cid, &format!("{label}: key received — sending…"));
+                // A missing KEY and a stale ROUTE both park a message here, and
+                // the same announce answers both — but a route refresh is the
+                // normal once-per-session case for a saved contact, so don't
+                // make it read like we'd lost their key.
+                let got = if was_keyless { "key received" } else { "route found" };
+                chat::cf_set_status_text(chat_cid, &format!("{label}: {got} — sending…"));
                 pump_outbox(shared, chat_cid, pddb, trng);
             }
         }
@@ -2126,6 +2139,7 @@ pub fn enqueue_outbound(
         in_flight: None,
         attempts: 0,
         route_tries: 0,
+        awaiting_key: false,
         pn_blob: None,
         next_action: 0,
         created: now_secs(),
@@ -2506,6 +2520,7 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                     Some(k) => k,
                     None => {
                         request_peer_key(shared, trng, &target);
+                        outbox[i].awaiting_key = true;
                         outbox[i].next_action = now + KEY_RETRY;
                         i += 1;
                         continue;
@@ -2516,6 +2531,7 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                 // multiple hops away — see the opportunistic branch).
                 if !have_path {
                     request_peer_key(shared, trng, &target);
+                    outbox[i].awaiting_key = false;
                     outbox[i].next_action = now + KEY_RETRY;
                     i += 1;
                     continue;
@@ -2717,6 +2733,7 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                                 // "no route found".
                                 chat::cf_set_status_text(chat_cid, &format!("{label}: requesting key…"));
                                 request_peer_key(shared, trng, &peer);
+                                outbox[i].awaiting_key = true;
                                 outbox[i].next_action = now + KEY_RETRY;
                                 i += 1;
                                 continue;
@@ -2737,6 +2754,7 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                             }
                             request_peer_key(shared, trng, &peer);
                             outbox[i].route_tries += 1;
+                            outbox[i].awaiting_key = false;
                             chat::cf_set_status_text(chat_cid, &format!("{label}: finding a route…"));
                             outbox[i].next_action = now + KEY_RETRY;
                             i += 1;
