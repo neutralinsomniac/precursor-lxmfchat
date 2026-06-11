@@ -828,17 +828,18 @@ impl<'a> LxmfChat<'a> {
         net::request_page(&self.shared, self.chat_cid, *addr, net::PAGE_PATH_DEFAULT, false);
     }
 
-    /// → / F2 while browsing: follow the link under the document cursor.
+    /// F2 while browsing: follow the link under the document cursor.
     pub fn follow_link(&self) {
         if self.browsing() {
             net::follow_selected_link(&self.shared, self.chat_cid);
         }
     }
 
-    /// ← while browsing: go back one page, or exit on an empty stack.
+    /// F1 while browsing: go back one page. With a dedicated exit key (F3),
+    /// an empty stack just says so instead of surprise-exiting the browser.
     pub fn browser_back(&self) {
         if self.browsing() && !net::browser_back(&self.shared, self.chat_cid) {
-            self.browser_exit();
+            self.chat.set_status_text("no page to go back to (F3 exits)");
         }
     }
 

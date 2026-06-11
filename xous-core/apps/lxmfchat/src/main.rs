@@ -92,13 +92,15 @@ fn wrapped_main() -> ! {
                             }
                             app.redraw();
                         }
-                        // While the page browser is on screen the keys rebind:
-                        // F2/→ open the selected link, ← goes back, F3 exits
-                        // (the icontray hints say so). Otherwise the chat
-                        // bindings apply; Left/Right are no-ops there (the chat
-                        // lib already handled menus before forwarding them).
+                        // While the page browser is on screen the F-keys rebind
+                        // (the icontray hints say so): F1 back, F2 open the
+                        // selected link, F3 exit. The arrow keys stay dedicated
+                        // to the cursor — Left/Right are forwarded but unbound,
+                        // reserved for horizontal scrolling someday.
                         Some(Event::F1) => {
-                            if !app.browsing() {
+                            if app.browsing() {
+                                app.browser_back()
+                            } else {
                                 app.jump_to_unread()
                             }
                         }
@@ -116,8 +118,6 @@ fn wrapped_main() -> ! {
                                 app.sync_now()
                             }
                         }
-                        Some(Event::Left) => app.browser_back(),
-                        Some(Event::Right) => app.follow_link(),
                         // F4 left unbound: that key doubles as the power key.
                         _ => {}
                     }

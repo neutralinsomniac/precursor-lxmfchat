@@ -575,7 +575,9 @@ pub fn server(
                         }
                         '←' => {
                             log::info!("click ← : raise app menu");
-                            // document mode: ← is the app's "back" (Event::Left), never the menu
+                            // document mode: never the menu — ←/→ are forwarded
+                            // to the app, reserved for document navigation
+                            // (e.g. future horizontal scrolling)
                             if !ui.doc_active() && ui.get_menu_mode() {
                                 ui.raise_app_menu();
                             }
@@ -583,7 +585,6 @@ pub fn server(
                         }
                         '→' => {
                             log::info!("click → : raise msg menu : pull request welcome!");
-                            // document mode: → is the app's "open link" (Event::Right)
                             if !ui.doc_active() && ui.get_menu_mode() {
                                 ui.raise_msg_menu();
                             }

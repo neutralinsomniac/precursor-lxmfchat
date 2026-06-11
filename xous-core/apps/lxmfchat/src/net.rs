@@ -456,6 +456,12 @@ fn slot_label(shared: &Arc<Shared>, peer: &[u8; TRUNCATED_HASHLENGTH], max: usiz
 /// F2 the conversation it jumps back to ("↩alice"); blank when idle. Call
 /// whenever any of that changes (peer switch, message held, unread flushed).
 pub fn refresh_idle_status(shared: &Arc<Shared>, chat_cid: CID) {
+    // While the page browser is on screen the tray belongs to it (back/open/
+    // exit) and the idle status shows the page — a message arriving mid-browse
+    // must not clobber them. browser_exit re-calls this to catch up.
+    if plock(&shared.browser).viewing {
+        return;
+    }
     let current = *plock(&shared.current_peer);
     let line = match current {
         Some(p) => format!("\u{25c9} {}", peer_label(shared, &p)),
@@ -2700,7 +2706,7 @@ fn page_received(shared: &Arc<Shared>, chat_cid: CID, resp: Value) {
     chat::cf_document_show(chat_cid);
     if entering {
         // Browser key hints; restored by browser_exit.
-        chat::cf_icontray_set(chat_cid, 0, "");
+        chat::cf_icontray_set(chat_cid, 0, "back");
         chat::cf_icontray_set(chat_cid, 1, "open");
         chat::cf_icontray_set(chat_cid, 2, "exit");
     }
@@ -2731,7 +2737,7 @@ fn browser_finish(shared: &Arc<Shared>, chat_cid: CID, msg: &str) {
     chat::cf_set_status_text_forced(chat_cid, &line);
 }
 
-/// Follow the link under the document cursor (→ / F2 while browsing).
+/// Follow the link under the document cursor (F2 while browsing).
 pub fn follow_selected_link(shared: &Arc<Shared>, chat_cid: CID) {
     let id = match chat::cf_document_selected(chat_cid) {
         Some(id) => id as usize,
@@ -2768,8 +2774,8 @@ pub fn follow_selected_link(shared: &Arc<Shared>, chat_cid: CID) {
     }
 }
 
-/// Go back one page (← while browsing); exits the browser when the stack is
-/// empty. Returns false when there was nothing to go back to.
+/// Go back one page (F1 while browsing). Returns false when there was
+/// nothing to go back to (the caller tells the user; F3 is the exit).
 pub fn browser_back(shared: &Arc<Shared>, chat_cid: CID) -> bool {
     let prev = { plock(&shared.browser).back.pop() };
     match prev {
