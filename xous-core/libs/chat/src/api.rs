@@ -71,6 +71,12 @@ pub enum ChatOp {
     DocumentGetSelected,
     /// Document mode: scroll a screenful (scalar arg: 0 = up, 1 = down)
     DocumentPage,
+    /// Document mode: set the shown document aside and return to the chat
+    /// dialogue; DocumentResume brings it back exactly as it was (scalar)
+    DocumentSuspend,
+    /// Document mode: bring back a set-aside document, scroll and cursor
+    /// intact (blocking scalar; returns 1 if resumed, 0 when there was none)
+    DocumentResume,
 }
 
 #[derive(Debug, num_derive::FromPrimitive, num_derive::ToPrimitive)]

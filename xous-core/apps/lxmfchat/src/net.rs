@@ -482,7 +482,7 @@ fn slot_label(shared: &Arc<Shared>, peer: &[u8; TRUNCATED_HASHLENGTH], max: usiz
 pub fn refresh_idle_status(shared: &Arc<Shared>, chat_cid: CID) {
     // While the page browser is on screen the tray belongs to it (back/open/
     // exit) and the idle status shows the page — a message arriving mid-browse
-    // must not clobber them. browser_exit re-calls this to catch up.
+    // must not clobber them. browser_suspend re-calls this to catch up.
     if plock(&shared.browser).viewing {
         return;
     }
@@ -2999,9 +2999,13 @@ pub fn browser_back(shared: &Arc<Shared>, chat_cid: CID) -> bool {
     }
 }
 
-/// Leave the browser: abort any in-flight fetch, drop the page link, clear the
-/// navigation state, and return the UI to the chat dialogue.
-pub fn browser_exit(shared: &Arc<Shared>, chat_cid: CID) {
+/// Leave the browser view, KEEPING its session: the current page, back stack,
+/// link table and title stay in [`BrowserState`], and the rendered document
+/// (scroll + cursor included) is parked in the chat lib — [`browser_resume`]
+/// brings it all back exactly as it was. Any in-flight fetch is aborted and
+/// the page link dropped (navigation re-links on demand; a kept link wouldn't
+/// survive a reconnect anyway). The status bar goes back to the conversation.
+pub fn browser_suspend(shared: &Arc<Shared>, chat_cid: CID) {
     let link = {
         let mut b = plock(&shared.browser);
         b.phase = BrowserPhase::Idle;
@@ -3011,19 +3015,50 @@ pub fn browser_exit(shared: &Arc<Shared>, chat_cid: CID) {
         b.pending_push = false;
         b.pending_pop = false;
         b.route_tries = 0;
-        b.current = None;
-        b.back.clear();
-        b.links.clear();
         b.viewing = false;
+        // current, back, links, current_title survive for browser_resume.
         b.link_id.take()
     };
     if let Some(lid) = link {
         plock(&shared.transport).drop_out_link(&lid);
     }
-    chat::cf_document_clear(chat_cid);
+    chat::cf_document_suspend(chat_cid);
     chat::cf_icontray_set(chat_cid, 2, "sync");
     chat::cf_icontray_set(chat_cid, 3, ""); // F4 is unbound outside the browser
     refresh_idle_status(shared, chat_cid);
+    // refresh_idle_status only recomposes the *idle* text — the visible status
+    // line would keep showing the page title. Bring the conversation back.
+    let line = match *plock(&shared.current_peer) {
+        Some(p) => format!("\u{25c9} {}", peer_label(shared, &p)),
+        None => String::new(),
+    };
+    chat::cf_set_status_text(chat_cid, &line);
+}
+
+/// Bring a suspended browser session back on screen (main menu → Browser).
+/// Returns false when there is nothing to resume.
+pub fn browser_resume(shared: &Arc<Shared>, chat_cid: CID) -> bool {
+    let (node, path) = match { plock(&shared.browser).current.clone() } {
+        Some((node, path, _)) => (node, path),
+        None => return false,
+    };
+    if !chat::cf_document_resume(chat_cid) {
+        // The chat lib has no parked page (shouldn't happen — both halves are
+        // session state) — drop our stale mirror so the menu path is taken.
+        let mut b = plock(&shared.browser);
+        b.current = None;
+        b.back.clear();
+        b.links.clear();
+        b.current_title = None;
+        return false;
+    }
+    plock(&shared.browser).viewing = true;
+    browser_fkey_hints(chat_cid);
+    // Restore the page's title line (same composition as page_received).
+    let line = format!("\u{25a3} {}{}", node_label(shared, &node), path);
+    chat::cf_set_status_idle_text(chat_cid, &line);
+    chat::cf_set_status_text(chat_cid, &line);
+    true
 }
 
 fn post_to_chat(shared: &Arc<Shared>, chat_cid: CID, author: &str, timestamp: u64, text: &str) {

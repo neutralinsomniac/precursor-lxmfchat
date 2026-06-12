@@ -713,6 +713,22 @@ pub fn server(
                     }
                 })
             }
+            Some(ChatOp::DocumentSuspend) => {
+                ui.doc_suspend();
+                if allow_redraw {
+                    ui.redraw().expect("CHAT couldn't redraw");
+                }
+            }
+            Some(ChatOp::DocumentResume) => {
+                xous::msg_blocking_scalar_unpack!(msg, _, _, _, _, {
+                    let resumed = ui.doc_resume();
+                    if resumed && allow_redraw {
+                        ui.redraw().expect("CHAT couldn't redraw");
+                    }
+                    xous::return_scalar(msg.sender, resumed as usize)
+                        .expect("couldn't return resume result");
+                })
+            }
             Some(ChatOp::Quit) => {
                 log::error!("got Quit");
                 break;
@@ -949,6 +965,25 @@ pub fn cf_document_show(chat_cid: xous::CID) {
 /// Leave document mode and return to the chat dialogue.
 pub fn cf_document_clear(chat_cid: xous::CID) {
     xous::send_message(chat_cid, xous::Message::new_scalar(ChatOp::DocumentClear as usize, 0, 0, 0, 0)).ok();
+}
+
+/// Set the shown document aside and return to the chat dialogue;
+/// [`cf_document_resume`] brings it back exactly as it was.
+pub fn cf_document_suspend(chat_cid: xous::CID) {
+    xous::send_message(chat_cid, xous::Message::new_scalar(ChatOp::DocumentSuspend as usize, 0, 0, 0, 0))
+        .ok();
+}
+
+/// Bring back a document set aside by [`cf_document_suspend`] (scroll and
+/// cursor intact). Returns false when there was nothing to resume.
+pub fn cf_document_resume(chat_cid: xous::CID) -> bool {
+    match xous::send_message(
+        chat_cid,
+        xous::Message::new_blocking_scalar(ChatOp::DocumentResume as usize, 0, 0, 0, 0),
+    ) {
+        Ok(xous::Result::Scalar1(v)) => v != 0,
+        _ => false,
+    }
 }
 
 /// Scroll the document view by one screenful (document mode only).

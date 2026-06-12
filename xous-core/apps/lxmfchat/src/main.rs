@@ -150,7 +150,7 @@ fn wrapped_main() -> ! {
                         Some(MenuOp::SetHub) => app.set_hub_interactive(&modals),
                         Some(MenuOp::ClearHistory) => app.clear_history_interactive(&modals),
                         Some(MenuOp::Sync) => app.sync_now(),
-                        Some(MenuOp::Browser) => app.browser_menu(&modals),
+                        Some(MenuOp::Browser) => app.browser_open(&modals),
                         Some(MenuOp::SelectUrl) => app.select_url_interactive(&modals),
                         Some(MenuOp::Noop) | None => {}
                     }

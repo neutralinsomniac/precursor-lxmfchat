@@ -88,9 +88,12 @@ pub(crate) struct Ui {
     /// Document mode (e.g. the NomadNet page browser): when `document` is
     /// Some, redraws render it instead of the chat dialogue. `doc_staging`
     /// accumulates an incoming page so the current view stays up until
-    /// DocumentShow swaps it in. Chat-only apps never set either.
+    /// DocumentShow swaps it in. `doc_suspended` parks the shown document when
+    /// the app returns to the chat, so it can come back exactly as it was
+    /// (scroll and cursor included). Chat-only apps never set any of them.
     document: Option<DocState>,
     doc_staging: Option<DocState>,
+    doc_suspended: Option<DocState>,
 
     // our security token for making changes to our record on the GAM
     token: [u32; 4],
@@ -206,6 +209,7 @@ impl Ui {
             icontray,
             document: None,
             doc_staging: None,
+            doc_suspended: None,
             token,
             status_idle_text: t!("chat.status.initial", locales::LANG).to_string(),
         }
@@ -631,11 +635,13 @@ impl Ui {
 
     /// Swap the staged document in and show it from the top. The IME input
     /// box is hidden while a document is up — there is nothing to type into,
-    /// and it otherwise covers a line of the page.
+    /// and it otherwise covers a line of the page. A newly shown page replaces
+    /// any suspended one (the app's back stack owns history, not this slot).
     pub(crate) fn doc_show(&mut self) {
         if let Some(doc) = self.doc_staging.take() {
             let entering = self.document.is_none();
             self.document = Some(doc);
+            self.doc_suspended = None;
             if entering {
                 self.set_input_visible(false);
             }
@@ -648,6 +654,29 @@ impl Ui {
             self.set_input_visible(true);
         }
         self.doc_staging = None;
+        self.doc_suspended = None;
+    }
+
+    /// Set the shown document aside and return to the chat dialogue;
+    /// `doc_resume` brings it back exactly as it was (scroll + cursor).
+    pub(crate) fn doc_suspend(&mut self) {
+        if let Some(doc) = self.document.take() {
+            self.doc_suspended = Some(doc);
+            self.set_input_visible(true);
+        }
+        self.doc_staging = None;
+    }
+
+    /// Bring back a set-aside document. Returns false when there is none.
+    pub(crate) fn doc_resume(&mut self) -> bool {
+        match self.doc_suspended.take() {
+            Some(doc) => {
+                self.document = Some(doc);
+                self.set_input_visible(false);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Show or hide the layout's IME input box (negative height = hidden;

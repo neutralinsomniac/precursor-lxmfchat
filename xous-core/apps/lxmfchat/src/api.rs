@@ -44,7 +44,8 @@ pub enum MenuOp {
     ClearHistory,
     /// Download messages stored for us at the propagation node (store-and-forward).
     Sync,
-    /// Open the page browser: raises its menu (bookmarks, URL entry, node pickers).
+    /// Open the page browser: resumes the suspended page if there is one,
+    /// else raises its menu (bookmarks, URL entry, node pickers).
     Browser,
     /// Scan the open conversation for page links and open one in the browser.
     SelectUrl,

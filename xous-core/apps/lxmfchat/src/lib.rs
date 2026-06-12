@@ -355,7 +355,7 @@ impl<'a> LxmfChat<'a> {
         // The input line still works while a page is on screen, but a "send"
         // there is almost certainly a mistake — the conversation isn't visible.
         if self.browsing() {
-            self.chat.set_status_text("exit the browser first (F3) to send messages");
+            self.chat.set_status_text("exit the browser first (F4) to send messages");
             return;
         }
         let peer = match *plock(&self.shared.current_peer) {
@@ -889,7 +889,17 @@ impl<'a> LxmfChat<'a> {
     }
 
     /// F4 while browsing: leave the browser and return to the conversation.
-    pub fn browser_exit(&self) { net::browser_exit(&self.shared, self.chat_cid); }
+    /// The session (page, back stack, scroll position) is kept — the main
+    /// menu's Browser entry resumes right where this left off.
+    pub fn browser_exit(&self) { net::browser_suspend(&self.shared, self.chat_cid); }
+
+    /// Main menu → Browser: resume the suspended page if there is one, else
+    /// raise the browser menu (bookmarks / URL entry / node pickers).
+    pub fn browser_open(&mut self, modals: &modals::Modals) {
+        if !net::browser_resume(&self.shared, self.chat_cid) {
+            self.browser_menu(modals);
+        }
+    }
 
     /// The browser menu — navigation, bookmarks, and page actions. Raised by
     /// F1 while a page is shown, and by the main menu's "Browser" entry from
