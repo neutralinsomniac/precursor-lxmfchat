@@ -439,10 +439,9 @@ pub struct Shared {
     /// Low-level I/O handle, used to buzz the vibration motor on a new inbound
     /// message. `vibe` is a fire-and-forget scalar, safe to call from any thread.
     pub llio: llio::Llio,
-    /// AutoInterface (local-network peer discovery + UDP data) state.
+    /// AutoInterface (local-network peering) state.
     pub auto: Mutex<crate::autoiface::AutoState>,
-    /// Whether AutoInterface is accepting/announcing/sending — an atomic so the
-    /// outbound hot path ([`broadcast_out`]) checks it without taking a lock.
+    /// Atomic so the outbound hot path checks it without a lock.
     pub auto_enabled: core::sync::atomic::AtomicBool,
 }
 
@@ -1804,17 +1803,12 @@ pub(crate) fn plock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// then shuts the socket down out from under it, erroring the write out.
 const WRITE_STUCK_SECS: u32 = 20;
 
-/// Send a raw RNS packet out every interface we have: HDLC-framed to the hub
-/// TCP connection, and as one UDP datagram to each live AutoInterface peer.
-/// This is the app's single outbound choke point — link proofs, announces,
-/// path requests and data all leave through here, so a packet a local peer is
-/// waiting for (e.g. our LRPROOF to their link request) reaches them even with
-/// no hub connection. Receivers de-duplicate by packet hash, so a peer
-/// reachable both ways getting two copies is fine (normal RNS leaf behavior).
-///
-/// Returns true if at least one interface accepted the bytes. An empty `raw`
-/// is the hub TCP keepalive — meaningless as a datagram, so it skips UDP
-/// (AutoInterface peering has its own liveness: the discovery tokens).
+/// Send a raw RNS packet out every interface: HDLC-framed to the hub, one UDP
+/// datagram per AutoInterface peer. The single outbound choke point, so
+/// replies a local peer waits for (e.g. our LRPROOF) reach it hub or no hub;
+/// receivers de-duplicate by packet hash, so dual-path copies are fine. True
+/// if any interface accepted the bytes. An empty `raw` is the hub TCP
+/// keepalive — meaningless as a datagram, so it skips UDP.
 pub(crate) fn broadcast_out(shared: &Arc<Shared>, raw: &[u8]) -> bool {
     let hub_ok = hub_write(shared, raw);
     let auto_ok = crate::autoiface::send_to_peers(shared, raw);

@@ -362,13 +362,11 @@ pub(crate) enum Opcode {
 
     LoopbackRx = 47,
 
-    /// Subscribe the interface to an IPv6 multicast group, so packets addressed
-    /// to it are accepted (needed e.g. for Reticulum AutoInterface discovery;
-    /// libstd's `join_multicast_v6` is a stub on Xous). Blocking scalar; the four
-    /// args are the group address as four big-endian u32 words. Returns 1 on
-    /// success, 0 if the group table is full.
+    /// Subscribe the interface to an IPv6 multicast group (libstd's
+    /// `join_multicast_v6` is a stub on Xous). Blocking scalar: the group
+    /// address as four big-endian u32 words; returns 1 on success.
     JoinMulticastV6 = 48,
-    /// Unsubscribe from an IPv6 multicast group. Same encoding as JoinMulticastV6.
+    /// Same encoding as JoinMulticastV6.
     LeaveMulticastV6 = 49,
     // do not use any numbers higher than 0x8000 as that is reserved for the nonblocking flag
 }

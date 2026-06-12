@@ -115,9 +115,7 @@ pub struct InterfaceInner {
     /// When to report for (all or) the next multicast group membership via IGMP
     #[cfg(feature = "proto-igmp")]
     igmp_report_state: IgmpReportState,
-    /// Xous patch: subscribed IPv6 multicast groups, accepted on RX. No MLD
-    /// reports are emitted, so delivery relies on the medium flooding multicast
-    /// (true for WiFi APs / non-snooping switches).
+    /// Xous patch: subscribed IPv6 multicast groups, accepted on RX.
     #[cfg(feature = "proto-ipv6")]
     ipv6_multicast_groups: LinearMap<Ipv6Address, (), IFACE_MAX_MULTICAST_GROUP_COUNT>,
 }
@@ -338,16 +336,15 @@ impl Interface {
     }
 
     /// Xous patch: subscribe to an IPv6 multicast group so inbound packets to
-    /// it are accepted. No MLD report is sent; delivery relies on the medium
-    /// flooding multicast (WiFi APs, non-MLD-snooping switches). Returns false
-    /// if the group table is full.
+    /// it are accepted. No MLD report is sent — delivery relies on the medium
+    /// flooding multicast (WiFi APs, non-MLD-snooping switches). False = the
+    /// group table is full.
     #[cfg(feature = "proto-ipv6")]
     pub fn join_multicast_group_v6(&mut self, addr: Ipv6Address) -> bool {
         self.inner.ipv6_multicast_groups.insert(addr, ()).is_ok()
     }
 
-    /// Xous patch: unsubscribe from an IPv6 multicast group. Returns true if
-    /// the group was joined.
+    /// Xous patch: unsubscribe from an IPv6 multicast group.
     #[cfg(feature = "proto-ipv6")]
     pub fn leave_multicast_group_v6(&mut self, addr: Ipv6Address) -> bool {
         self.inner.ipv6_multicast_groups.remove(&addr).is_some()

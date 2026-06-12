@@ -62,11 +62,9 @@ enum WaitOp {
     Quit,
 }
 
-/// The EUI-64 link-local IPv6 address (fe80::/64) for the interface's MAC,
-/// required for link-local IPv6 communications (e.g. Reticulum AutoInterface
-/// peer discovery). Derived from the same hardware address the interface was
-/// configured with, which may be a randomized stand-in when the EC's MAC is
-/// bogus.
+/// EUI-64 link-local address (fe80::/64) for the interface's MAC. Derived
+/// from the *configured* hardware address, which may be a randomized stand-in
+/// when the EC's MAC is bogus.
 fn ipv6_link_local(iface: &Interface) -> Option<IpCidr> {
     match iface.hardware_addr() {
         HardwareAddress::Ethernet(mac) => {

@@ -43,10 +43,10 @@ pub(crate) fn std_udp_bind(
     let handle = sockets.add(udp_socket);
     let udp_socket = sockets.get_mut::<udp::Socket>(handle);
 
-    // Attempt to connect, returning the error if there is one. An unspecified
-    // address (0.0.0.0 / ::) is a true wildcard listen; `From<IpEndpoint> for
-    // IpListenEndpoint` would instead bind the literal unspecified address,
-    // which never matches a unicast destination in `udp::Socket::accepts`.
+    // An unspecified address (0.0.0.0 / ::) must become a wildcard listen
+    // (addr: None): `From<IpEndpoint>` would bind the literal unspecified
+    // address, which never matches a unicast destination in
+    // `udp::Socket::accepts`.
     let listen_endpoint = smoltcp::wire::IpListenEndpoint {
         addr: if address.is_unspecified() { None } else { Some(address) },
         port: local_port,

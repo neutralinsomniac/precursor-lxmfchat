@@ -48,9 +48,7 @@ const BOOKMARKS_DICT: &str = "lxmf.bookmarks";
 const KEY_IDENTITY: &str = "identity";
 const KEY_HUB: &str = "hub";
 const KEY_PEER: &str = "peer";
-/// Whether AutoInterface (local-network peer discovery, no hub needed) is on
-/// ("1"/"0"). Off by default: it announces multicast every 1.6 s while
-/// enabled, which keeps the radio busier.
+/// AutoInterface on/off ("1"/"0"). Off by default — it beacons while enabled.
 const KEY_AUTOIFACE: &str = "autoiface";
 /// PDDB key for our announced display name.
 const KEY_NAME: &str = "name";
@@ -297,8 +295,6 @@ impl<'a> LxmfChat<'a> {
             let browse = self.shared.clone();
             let browse_cid = self.chat_cid;
             std::thread::spawn(move || net::browser_thread(browse, browse_cid));
-            // Local peer discovery (AutoInterface), if it was on last run; comes
-            // up in the background once wifi has an address.
             if read_string(&self.pddb, KEY_AUTOIFACE).as_deref() == Some("1") {
                 autoiface::start_background(&self.shared, self.chat_cid);
             }
@@ -315,8 +311,6 @@ impl<'a> LxmfChat<'a> {
         );
     }
 
-    /// Toggle AutoInterface — zero-conf discovery of (and messaging with)
-    /// Reticulum peers on the local wifi network, hub or no hub. Persisted.
     pub fn toggle_local_peers(&mut self) {
         if autoiface::enabled(&self.shared) {
             autoiface::stop(&self.shared, self.chat_cid);
@@ -324,8 +318,6 @@ impl<'a> LxmfChat<'a> {
         } else if autoiface::start(&self.shared, self.chat_cid) {
             write_string(&self.pddb, KEY_AUTOIFACE, "1");
         }
-        // A failed start (no wifi yet) painted its reason; not persisted, so a
-        // user choice is never silently lost across a retry.
     }
 
     /// Announce our lxmf.delivery destination on the hub.

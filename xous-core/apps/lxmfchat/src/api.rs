@@ -29,8 +29,7 @@ pub enum MenuOp {
     ImportContact,
     /// (Re)connect to the configured hub and announce our address
     Connect,
-    /// Toggle AutoInterface: discover and message Reticulum peers on the local
-    /// wifi network directly (no hub involved).
+    /// Toggle AutoInterface (local-network peering, no hub involved).
     LocalPeers,
     /// Announce our lxmf.delivery destination on the connected hub
     Announce,

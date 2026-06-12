@@ -99,14 +99,13 @@ impl NetManager {
         .expect("couldn't send reset");
     }
 
-    /// Subscribe the network interface to an IPv6 multicast group so inbound
-    /// packets addressed to it are accepted (libstd's `UdpSocket::join_multicast_v6`
-    /// is a stub on Xous). Returns Ok(false) if the group table is full.
+    /// Subscribe the interface to an IPv6 multicast group (libstd's
+    /// `UdpSocket::join_multicast_v6` is a stub on Xous). Ok(false) = group
+    /// table full.
     pub fn join_multicast_v6(&self, group: core::net::Ipv6Addr) -> Result<bool, xous::Error> {
         self.multicast_v6_op(Opcode::JoinMulticastV6, group)
     }
 
-    /// Unsubscribe the network interface from an IPv6 multicast group.
     pub fn leave_multicast_v6(&self, group: core::net::Ipv6Addr) -> Result<bool, xous::Error> {
         self.multicast_v6_op(Opcode::LeaveMulticastV6, group)
     }
