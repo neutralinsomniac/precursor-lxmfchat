@@ -149,6 +149,33 @@ UDP replies silently receives nothing.
   `join_multicast_v6` is an unimplementable stub on Xous, the netstack owns
   group membership).
 
+## betrusted-io / betrusted-ec
+
+### EC net bridge drops all IPv6 — no IPv6 connectivity possible on Precursor wifi
+Found while bringing up Reticulum AutoInterface (IPv6 link-local multicast
+discovery). Verified end-to-end on hardware + wire captures, June 2026:
+- **RX**: `sw/net/src/lib.rs handle_frame` forwards only `ETHERTYPE_IPV4` and
+  `ETHERTYPE_ARP` to the COM net bridge; everything else — explicitly
+  including IPv6 — is binned `DropEType`. Inbound IPv6 (neighbor
+  solicitations, UDP, everything) never reaches the SoC. The Xous net stack
+  compiles smoltcp with `proto-ipv6` and happily configures v6 addresses, but
+  no v6 frame can ever arrive.
+- **RX (radio)**: nothing ever calls `sl_wfx_add_multicast_addr`, so the
+  WF200's multicast whitelist is presumably in its default state; even with
+  the EtherType filter fixed, `33:33:*` frames may still be dropped at the
+  radio until the whitelist admits them (broadcast addr = allow-all).
+- **TX**: `send_net_packet` is unfiltered, and the SoC-side counter confirms
+  multicast frames are handed to `sl_wfx_send_ethernet_frame` — but they
+  never appear on the air (tcpdump on the same AP sees other STAs' multicast
+  to the same group fine). A WF200 error would be logged EC-side
+  (`SendFrameErr`) and raises `INT_WLAN_TX_ERROR` — which the **xous-core
+  net service ignores** (no `ComIntSources::WlanTxErr` arm), so TX rejection
+  is invisible to the host. Root cause of the TX drop (firmware rejection vs
+  silent eat) still to be pinned via EC logs.
+- Net effect: AutoInterface (and any IPv6) requires EC firmware changes:
+  forward `ETHERTYPE_IPV6` to `ComFwd`, open the WF200 multicast whitelist,
+  and surface TX errors.
+
 ## smoltcp 0.11 (vendored at `xous-core/imports/smoltcp`)
 
 smoltcp 0.11's `join_multicast_group` returns `Ipv6NotSupported` and its
