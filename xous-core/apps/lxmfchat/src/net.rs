@@ -32,6 +32,7 @@ use xous_names::XousNames;
 pub const MARK_PENDING: &str = "○"; // sent, awaiting acknowledgement
 pub const MARK_DELIVERED: &str = "✓"; // recipient acknowledged
 pub const MARK_QUEUED: &str = "»"; // handed to the propagation node (stored, not yet delivered)
+pub const MARK_SYNCED: &str = "»"; // received via the propagation node (downloaded by sync)
 pub const MARK_FAILED: &str = "×"; // direct + propagation both failed
 
 pub const STATUS_DELIVERED: u8 = 1;
@@ -1474,7 +1475,10 @@ fn extract_addresses(text: &str) -> Vec<[u8; TRUNCATED_HASHLENGTH]> {
 /// route into the sender's thread, and post it.
 /// `notify`: buzz the vibration motor for this message (live receipt). The sync
 /// path passes false and buzzes once for the whole batch instead.
-fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, lxmf_bytes: &[u8], notify: bool) {
+/// `live` distinguishes a message received over the link right now from one
+/// downloaded by a propagation-node sync: a live message buzzes the motor
+/// (sync buzzes once per batch) and a synced one gets the `»` mark.
+fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, lxmf_bytes: &[u8], live: bool) {
     if lxmf_bytes.len() < 2 * TRUNCATED_HASHLENGTH {
         return;
     }
@@ -1520,6 +1524,11 @@ fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, l
     let mut text = m.content_string();
     if !m.signature_validated {
         text.push_str("  ⚠(unverified)");
+    }
+    if !live {
+        // Downloaded from the propagation node rather than received live —
+        // mirror the outgoing » so both directions show store-and-forward hops.
+        text = bubble_text(&text, MARK_SYNCED);
     }
 
     crate::save_contact(shared, pddb, &src_hash, &author);
@@ -1615,7 +1624,7 @@ fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, l
     // unread status line) is on screen. The PDDB writes between decrypt and draw
     // are slow enough that an early buzz leaves the user staring at an unchanged
     // screen. Live receipt only; the sync path buzzes once per batch.
-    if notify {
+    if live {
         shared.llio.vibe(llio::VibePattern::Long).ok();
     }
 }
@@ -2303,7 +2312,7 @@ fn deliver_synced_message(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng
     };
     let mut full = blob[..TRUNCATED_HASHLENGTH].to_vec();
     full.extend_from_slice(&plaintext);
-    deliver_lxmf(shared, chat_cid, pddb, trng, &full, false); // synced: batch-buzz instead
+    deliver_lxmf(shared, chat_cid, pddb, trng, &full, false); // synced: » mark, batch-buzz instead
 }
 
 /// End the current sync (success or failure) and reset the state machine. The
