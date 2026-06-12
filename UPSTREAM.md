@@ -107,9 +107,33 @@ After unplugging mid-write, every subsequent flash attempt fails with
 Only a physical unplug/replug (full controller reset) recovers. Minor, but a
 retry-after-reset in the tool would save confusion.
 
+### 8. ime-frontend: input-box growth misses by 2px, then overshoots by a whole line
+When typed text overflows the input box, the IME grows it by
+`ic_bounds.y + last_height + 2`. Two fenceposts make that land **2px short**
+of fitting the next line: `ic_bounds.y` is the canvas' normalized *inclusive*
+bottom-right (height − 1), and the renderer wraps within
+`height − 2·margin − 2` with a strict `<` fit test. The next keystroke
+overflows again and the retry adds another full line — so every grown box
+carries a permanent blank line under the line being typed. Separately, the
+grow trigger (`cursor.line_height == 0`) only fires for mid-word overflow
+(`reject_candidate_word`); overflow at a whitespace wrap keeps
+`line_height > 0`, so the box never grows at all in that case. Reproduced
+against the real typesetter in `libs/ux-api/tests/grow_sim.rs` (run with
+`--features hosted,std`): heights go 27 → 47 (still overflowing) → 67
+(2 lines + a 19px blank slot).
+- Local fix (`services/ime-frontend/src/main.rs`): trigger on
+  `line_height == 0 || overflow`, and compute the request precisely as
+  `cursor.pt.y + 2·line_height + 1 + 2·margin.y + 2` (on overflow the cursor
+  sits at the top of the last fitting line). Each grow now adds exactly one
+  line, caret on the bottom line with ~2px slack. Also: re-read the canvas
+  bounds for the post-grow redraw (the `granted` Point is the *content*
+  canvas' screen-space corner for ChatLayout, not the input canvas size), and
+  remember a refused request (`grow_refused`) so a height-capped box doesn't
+  spam resize/redraw on every keystroke.
+
 ## paolobarbolini / bzip2-rs
 
-### 8. Decoder preallocates by declared block size, not content (OOM on small targets)
+### 9. Decoder preallocates by declared block size, not content (OOM on small targets)
 `block/mod.rs` allocates the BWT working array as
 `Vec::with_capacity(header.max_blocksize())` — for a `BZh9` stream (Python's
 `bz2` default) that's 900,000 × 4 B = **3.6 MB up front**, even when the

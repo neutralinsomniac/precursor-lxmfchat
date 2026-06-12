@@ -59,6 +59,8 @@ struct InputTracker {
     last_height: u32,
     /// keep track if our box was grown
     was_grown: bool,
+    /// a grow request the layout refused, so we don't re-ask on every keystroke
+    grow_refused: Option<isize>,
 
     /// if set to true, the F1-F4 keys work as menu selects, and not as predictive inputs
     menu_mode: bool,
@@ -87,6 +89,7 @@ impl InputTracker {
             insertion: 0,
             last_height: 0,
             was_grown: false,
+            grow_refused: None,
             pred_options: Default::default(),
             menu_mode: false,
             #[cfg(feature = "tts")]
@@ -523,6 +526,7 @@ impl InputTracker {
                             }
                             self.last_height = 0;
                             self.was_grown = false;
+                            self.grow_refused = None;
                         }
                         self.clear_area().expect("can't clear on carriage return");
                         update_predictor = true;
@@ -637,46 +641,71 @@ impl InputTracker {
                     info!("got computed cursor of {:?}", input_tv.cursor);
                 }
 
-                // check if the cursor is now at the bottom of the textview, this means we need to grow the
-                // box
-                if input_tv.cursor.line_height == 0 && self.characters > 0 {
+                // check if the text overran the box, which means we need to grow it. A mid-word
+                // wrap that ran out of vertical space reports a rejected cursor with
+                // line_height == 0; a wrap at whitespace reports overflow with the cursor
+                // still sitting on the last line that fit.
+                if (input_tv.cursor.line_height == 0 || input_tv.overflow == Some(true))
+                    && self.characters > 0
+                {
                     if debug1 {
                         info!("caught case of overflowed text box, attempting to resize");
                     }
-                    let delta = if self.last_height > 0 {
-                        self.last_height + 1 + 1 // 1 pixel allowance for interline space, plus 1 for fencepost
+                    let line_height: isize = if input_tv.cursor.line_height > 0 {
+                        input_tv.cursor.line_height as isize
+                    } else if self.last_height > 0 {
+                        self.last_height as isize
                     } else {
-                        31 // a default value to grow in case we don't have a valid last height
+                        29 // a default value in case we never saw a valid line height
                     };
-                    let mut req = SetCanvasBoundsRequest {
-                        requested: Point::new(0, ic_bounds.y + delta as isize),
-                        granted: None,
-                        token_type: gam::TokenType::Gam,
-                        token: self.gam_token.unwrap(),
-                    };
-                    if debug1 {
-                        info!("attempting resize to {:?}", req.requested);
-                    }
-                    self.gam
-                        .set_canvas_bounds_request(&mut req)
-                        .expect("couldn't call set_bounds_request on input area overflow");
-                    self.clear_area().expect("couldn't clear area after resize");
-                    match req.granted {
-                        Some(bounds) => {
+                    // On overflow the cursor sits at the top of the last line that fit. The new
+                    // canvas height must hold that line plus one more, and then cover everything
+                    // the renderer subtracts before wrapping: the typesetter's strict less-than
+                    // fit test (+1), the TextView margins, the 1px top inset of our bounding
+                    // box, and the pixel an inclusive rect loses when reported as a size.
+                    // Anything short of this sum overflows again on the next keystroke, and the
+                    // retry used to overshoot by a full line — leaving a permanent blank line
+                    // under the one being typed.
+                    let needed =
+                        input_tv.cursor.pt.y + 2 * line_height + 1 + 2 * input_tv.margin.y + 2;
+                    if needed > ic_bounds.y + 1 && self.grow_refused != Some(needed) {
+                        let mut req = SetCanvasBoundsRequest {
+                            requested: Point::new(0, needed),
+                            granted: None,
+                            token_type: gam::TokenType::Gam,
+                            token: self.gam_token.unwrap(),
+                        };
+                        if debug1 {
+                            info!("attempting resize to {:?}", req.requested);
+                        }
+                        self.gam
+                            .set_canvas_bounds_request(&mut req)
+                            .expect("couldn't call set_bounds_request on input area overflow");
+                        self.clear_area().expect("couldn't clear area after resize");
+                        // the granted point is in the layout's coordinate space, not ours;
+                        // re-read the canvas for the bounds we actually got
+                        let new_bounds: Point =
+                            self.gam.get_canvas_bounds(ic).expect("couldn't get input canvas bounds");
+                        if new_bounds.y > ic_bounds.y {
                             self.was_grown = true;
                             if debug1 {
-                                info!("refresh succeeded, now redrawing with height of {:?}", bounds);
+                                info!("refresh succeeded, now redrawing with height of {:?}", new_bounds);
                             }
-                            // request was approved, redraw with the new bounding box
                             input_tv.bounds_hint =
-                                TextBounds::BoundingBox(Rectangle::new(Point::new(0, 1), bounds));
-                            input_tv.bounds_computed = None;
-                            self.gam.post_textview(&mut input_tv).expect("can't draw input TextView");
+                                TextBounds::BoundingBox(Rectangle::new(Point::new(0, 1), new_bounds));
+                        } else {
+                            // the layout won't give us more room; remember the failed request so
+                            // we don't spam resize/redraw cycles on every following keystroke
+                            self.grow_refused = Some(needed);
+                            info!("couldn't resize input canvas after overflow of text");
                         }
-                        _ => info!("couldn't resize input canvas after overflow of text"),
+                        // redraw either way: clear_area() above wiped the canvas
+                        input_tv.bounds_computed = None;
+                        self.gam.post_textview(&mut input_tv).expect("can't draw input TextView");
                     }
                 } else {
                     self.last_height = input_tv.cursor.line_height as u32;
+                    self.grow_refused = None;
                 }
 
                 // Even after any growth, a long line may still not fit (growth
