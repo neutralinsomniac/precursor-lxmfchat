@@ -42,6 +42,8 @@ use xous_ipc::Buffer;
 
 // 0 indicates no address is currently assigned
 pub static IPV4_ADDRESS: AtomicU32 = AtomicU32::new(0);
+/// Multicast (non-broadcast) ethernet frames handed to the EC for transmit.
+pub static MCAST_TX_COUNT: AtomicU32 = AtomicU32::new(0);
 // stash the MAC address for inserstion as a loopback target. Coded as big-end bytes.
 pub static MAC_ADDRESS_LSB: AtomicU32 = AtomicU32::new(0);
 pub static MAC_ADDRESS_MSB: AtomicU16 = AtomicU16::new(0);
@@ -2000,6 +2002,9 @@ fn main() -> ! {
                 let group = smoltcp::wire::Ipv6Address::from_bytes(&b);
                 let ok = iface.leave_multicast_group_v6(group);
                 xous::return_scalar(msg.sender, if ok { 1 } else { 0 }).ok();
+            }),
+            Some(Opcode::GetMulticastTxCount) => msg_blocking_scalar_unpack!(msg, _, _, _, _, {
+                xous::return_scalar(msg.sender, MCAST_TX_COUNT.load(Ordering::SeqCst) as usize).ok();
             }),
             Some(Opcode::HasIpv6Addr) => msg_blocking_scalar_unpack!(msg, a0, a1, a2, a3, {
                 let mut b = [0u8; 16];

@@ -116,6 +116,17 @@ impl NetManager {
         self.ipv6_addr_op(Opcode::HasIpv6Addr, addr)
     }
 
+    /// How many multicast frames have been handed to the radio for transmit.
+    pub fn multicast_tx_count(&self) -> Result<usize, xous::Error> {
+        match send_message(
+            self.netconn.conn(),
+            Message::new_blocking_scalar(Opcode::GetMulticastTxCount.to_usize().unwrap(), 0, 0, 0, 0),
+        )? {
+            xous::Result::Scalar1(r) => Ok(r),
+            _ => Err(xous::Error::InternalError),
+        }
+    }
+
     fn ipv6_addr_op(&self, op: Opcode, addr: core::net::Ipv6Addr) -> Result<usize, xous::Error> {
         let o = addr.octets();
         let mut words = [0usize; 4];

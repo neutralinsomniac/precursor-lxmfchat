@@ -290,11 +290,14 @@ fn data_rx(shared: Arc<Shared>, chat_cid: CID, sock: UdpSocket) {
 
 fn announce_loop(shared: Arc<Shared>, chat_cid: CID, group: Ipv6Addr) {
     let mut last_beacon: u64 = 0;
-    // One status line on the first successful beacon, and on errors (throttled)
-    // — a beacon that the netstack eats silently is otherwise indistinguishable
+    // Status on the first beacons (with the count of multicast frames that
+    // actually reached the radio), and on errors (throttled) — a beacon the
+    // netstack eats after the socket queue is otherwise indistinguishable
     // from a working one.
-    let mut beacon_confirmed = false;
+    let mut beacons_sent: u32 = 0;
     let mut last_err_status: u64 = 0;
+    #[cfg(target_os = "xous")]
+    let netmgr = net::NetManager::new();
     loop {
         std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
         if !enabled(&shared) {
@@ -314,9 +317,19 @@ fn announce_loop(shared: Arc<Shared>, chat_cid: CID, group: Ipv6Addr) {
             let dest = SocketAddrV6::new(group, DISCOVERY_PORT, 0, scope);
             match tx.send_to(&token, dest) {
                 Ok(_) => {
-                    if !beacon_confirmed {
-                        beacon_confirmed = true;
-                        chat::cf_set_status_text(chat_cid, &format!("local: beaconing as {our_ll}"));
+                    beacons_sent += 1;
+                    if beacons_sent <= 3 {
+                        // Let the netstack's pump dispatch the queued datagram
+                        // before sampling the radio counter.
+                        std::thread::sleep(std::time::Duration::from_millis(1000));
+                        #[cfg(target_os = "xous")]
+                        let radio = netmgr.multicast_tx_count().unwrap_or(0);
+                        #[cfg(not(target_os = "xous"))]
+                        let radio = beacons_sent as usize;
+                        chat::cf_set_status_text(
+                            chat_cid,
+                            &format!("local: beacon {beacons_sent} as {our_ll} — radio tx {radio}"),
+                        );
                     }
                 }
                 Err(e) => {
