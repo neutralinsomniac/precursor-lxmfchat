@@ -77,8 +77,31 @@ Fixed in this tree, all pre-existing upstream:
   scrollback caps so a dialogue can't outgrow the PDDB value limit.
 - `ux-api` ScrollableList (modals radio list) had no wrap-around on
   up/down; patched `move_selection` to wrap (GAM menus already wrap).
+- `ui::layout()` anchored bottom-up bubbles at a viewport size cached once
+  at startup. When the IME input box grows during composition the content
+  canvas shrinks, so every bubble was laid out below the canvas bottom and
+  clipped away — a blank chat while composing a multi-line message. Fixed by
+  re-fetching `get_canvas_bounds` at the top of every redraw. (Pairs with
+  the GAM redraw gap below — both are needed for the visible fix.)
 
-### 6. tools/usb_update.py: endpoint desync after interrupted write
+### 6. gam: IME-driven input-box resize blanks the app's content canvas with no redraw
+When the IME front end grows the input box (long line wraps during
+composition) or snaps it back after a send, `ChatLayout::resize_height`
+shrinks/restores the **content** canvas and clears it to white — but the
+`SetCanvasBounds` handler in `services/gam/src/main.rs` deliberately sends no
+redraw ("every context will call redraw after it has finished fitting its
+bounds"). That's true for the *requesting* context (the IME repaints its
+input canvas), but the content canvas belongs to the **app**, which is never
+told anything happened. Result: any `UxType::Chat` app (shellchat, mtxchat)
+shows a blank content area from the moment the input box grows until
+something else triggers a redraw.
+- Local fix: after a granted resize via the **Gam** token (the IME is its
+  only caller; modals/menus resize with App tokens and repaint themselves),
+  call `context_mgr.redraw()` so the focused app repaints its content.
+- Note for the report: fixing only the GAM is not sufficient for chat-lib
+  apps — see the stale-viewport bullet in entry 5.
+
+### 7. tools/usb_update.py: endpoint desync after interrupted write
 After unplugging mid-write, every subsequent flash attempt fails with
 `[Errno 75] Overflow`; `pyusb dev.reset()` re-enumerates but doesn't clear it.
 Only a physical unplug/replug (full controller reset) recovers. Minor, but a
@@ -86,7 +109,7 @@ retry-after-reset in the tool would save confusion.
 
 ## paolobarbolini / bzip2-rs
 
-### 7. Decoder preallocates by declared block size, not content (OOM on small targets)
+### 8. Decoder preallocates by declared block size, not content (OOM on small targets)
 `block/mod.rs` allocates the BWT working array as
 `Vec::with_capacity(header.max_blocksize())` — for a `BZh9` stream (Python's
 `bz2` default) that's 900,000 × 4 B = **3.6 MB up front**, even when the

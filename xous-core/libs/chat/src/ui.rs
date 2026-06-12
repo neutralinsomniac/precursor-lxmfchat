@@ -595,6 +595,15 @@ impl Ui {
     /// * ensuring the selected post is fully visible, and
     /// * best use of the screen is achieved
     pub(crate) fn redraw(&mut self) -> Result<(), xous::Error> {
+        // The content canvas changes size under us: the IME input box grows
+        // while a long message is composed (canvas shrinks) and snaps back on
+        // send, and document mode hides the input box (canvas grows). The
+        // startup size cached in `vp` would anchor bottom-up bubbles below a
+        // shrunken canvas — every bubble clipped away — so re-measure first.
+        if let Ok(size) = self.gam.get_canvas_bounds(self.vp.canvas) {
+            self.vp.total_screensize = size;
+            self.vp.layout_screensize = Point::new(size.x, size.y - self.vp.status_height as isize);
+        }
         if self.doc_active() {
             self.layout_document();
             self.status_last_update_ms = self.tt.elapsed_ms();
@@ -656,14 +665,16 @@ impl Ui {
         self.doc_staging = None;
     }
 
-    /// Show or hide the layout's IME input box (0 height = hidden; any
-    /// positive request is clamped up to the one-line minimum). Authorized by
-    /// our app token — the GAM resizes this context's own chat layout.
+    /// Show or hide the layout's IME input box (negative height = hidden;
+    /// 0 or any small positive request is clamped up to the one-line minimum
+    /// — 0 can't mean "hide" because the IME requests 0 to reset its height
+    /// after every send). Authorized by our app token — the GAM resizes this
+    /// context's own chat layout.
     fn set_input_visible(&self, visible: bool) {
         let mut req = gam::api::SetCanvasBoundsRequest {
             token: self.token,
             token_type: gam::TokenType::App,
-            requested: Point::new(0, if visible { 1 } else { 0 }),
+            requested: Point::new(0, if visible { 1 } else { -1 }),
             granted: None,
         };
         self.gam.set_canvas_bounds_request(&mut req).ok();

@@ -377,10 +377,14 @@ fn wrapped_main() -> ! {
                 if granted.is_some() {
                     // recompute the canvas orders based on the new layout
                     recompute_canvases(&canvases);
-                    // this set of redraw commands is not needed because every context will call redraw after
-                    // it has finished fitting its bounds log::info!("canvas bounds
-                    // redraw"); context_mgr.redraw().expect("can't redraw after new
-                    // canvas bounds");
+                    // An app-token resize needs no redraw command: the app itself asked,
+                    // and repaints once this call returns. A Gam-token resize comes from
+                    // the IME growing/shrinking the input box — that shrinks/restores the
+                    // CONTENT canvas (which resize_height just blanked) out from under the
+                    // app, so the app must be told to repaint it.
+                    if cb.token_type == TokenType::Gam {
+                        context_mgr.redraw().ok();
+                    }
                 }
                 cb.granted = granted;
                 let ret = api::Return::SetCanvasBoundsReturn(cb);

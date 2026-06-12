@@ -129,11 +129,13 @@ impl LayoutApi for ChatLayout {
         let input_canvas = canvases.get(&self.input).expect("couldn't find input canvas");
         let predictive_canvas = canvases.get(&self.predictive).expect("couldn't find predictive canvas");
 
-        // A request of 0 (or less) HIDES the input box entirely — the content
-        // area takes over its space (used by the chat lib's document mode,
-        // where there is nothing to type into). Any positive request keeps
-        // the usual one-line floor.
-        let height: isize = if new_height <= 0 {
+        // A NEGATIVE request HIDES the input box entirely — the content area
+        // takes over its space (used by the chat lib's document mode, where
+        // there is nothing to type into). Zero must NOT hide: the IME resets
+        // with a request of 0 after every send, meaning "snap back to the
+        // smallest default size" — so 0 and small positives clamp to the
+        // one-line floor.
+        let height: isize = if new_height < 0 {
             0
         } else if new_height < self.min_input_height {
             self.min_input_height
