@@ -1823,6 +1823,15 @@ pub(crate) fn broadcast_out(shared: &Arc<Shared>, raw: &[u8]) -> bool {
     hub_ok || auto_ok
 }
 
+/// Whether anything we send can currently go anywhere: the hub connection is
+/// up, or AutoInterface has live peers (a local transport node routes links
+/// and path requests just like the hub does). Atomics only — must never block
+/// behind a stuck write.
+pub(crate) fn any_interface_up(shared: &Arc<Shared>) -> bool {
+    shared.connected.load(core::sync::atomic::Ordering::SeqCst)
+        || (crate::autoiface::enabled(shared) && !plock(&shared.auto).peers.is_empty())
+}
+
 /// Frame and write `raw` to the hub. Returns true only if the bytes were fully
 /// written; false if there is no connection, the writer was busy too long, or
 /// the write failed (callers that need delivery — like the sync state machine —
@@ -1918,11 +1927,11 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         return;
     }
     let now = now_secs();
-    // No hub connection: nothing we send can go anywhere. Wait for the manager
-    // to reconnect (same bounded retry as the no-route case below) instead of
-    // burning the request on writes that go nowhere. Atomic flag, NOT the writer
-    // mutex — this check must never block behind a stuck write.
-    if !shared.connected.load(core::sync::atomic::Ordering::SeqCst) {
+    // No interface up: nothing we send can go anywhere. Wait for the manager
+    // to reconnect / a local peer to appear (same bounded retry as the
+    // no-route case below) instead of burning the request on writes that go
+    // nowhere.
+    if !any_interface_up(shared) {
         let (give_up, first_wait) = {
             let mut s = plock(&shared.sync);
             s.route_tries = s.route_tries.saturating_add(1);
@@ -1935,11 +1944,11 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
             }
         };
         if give_up {
-            sync_finish(shared, chat_cid, "not connected to the hub");
+            sync_finish(shared, chat_cid, "no connection (hub or local peers)");
         } else if first_wait {
             // Once, not every tick — see start_fetch: the connection manager's
             // statuses must stay readable while we wait for it to reconnect.
-            chat::cf_set_status_text_forced(chat_cid, "sync: waiting for hub connection…");
+            chat::cf_set_status_text_forced(chat_cid, "sync: waiting for a connection…");
         }
         return;
     }
@@ -2547,21 +2556,21 @@ fn start_fetch(
             false
         }
     };
-    if !shared.connected.load(core::sync::atomic::Ordering::SeqCst) {
+    if !any_interface_up(shared) {
         let (retrying, first_wait) = {
             let mut b = plock(&shared.browser);
             let ok = rearm(&mut b);
             (ok, b.route_tries == 1)
         };
         if !retrying {
-            browser_finish(shared, chat_cid, "not connected to the hub");
+            browser_finish(shared, chat_cid, "no connection (hub or local peers)");
         } else if first_wait {
             // Say it ONCE. Repeating this every retry tick papered over the
             // connection manager's own statuses (connecting…/connect failed…/
             // link lost — why), which are exactly what diagnoses a reconnect
             // that isn't completing. The fetch resumes by itself once the
             // manager gets the connection back.
-            chat::cf_set_status_text_forced(chat_cid, "page: waiting for hub connection…");
+            chat::cf_set_status_text_forced(chat_cid, "page: waiting for a connection…");
         }
         return;
     }

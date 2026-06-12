@@ -422,8 +422,12 @@ impl<'a> LxmfChat<'a> {
     /// flags the request — the pump thread does the actual link + hub writes, so
     /// this returns immediately and never blocks the UI on a hub write.
     pub fn sync_now(&self) {
-        if !self.shared.hub_enabled.load(core::sync::atomic::Ordering::SeqCst) {
-            self.chat.set_status_text("hub is off — turn it on to sync");
+        // A local transport node routes to the propagation node just like the
+        // hub does — only refuse when no interface is enabled at all.
+        if !self.shared.hub_enabled.load(core::sync::atomic::Ordering::SeqCst)
+            && !autoiface::enabled(&self.shared)
+        {
+            self.chat.set_status_text("all interfaces are off — see menu → Interfaces");
             return;
         }
         net::request_sync(&self.shared);
