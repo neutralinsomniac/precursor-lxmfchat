@@ -103,15 +103,21 @@ impl NetManager {
     /// `UdpSocket::join_multicast_v6` is a stub on Xous). Ok(false) = group
     /// table full.
     pub fn join_multicast_v6(&self, group: core::net::Ipv6Addr) -> Result<bool, xous::Error> {
-        self.multicast_v6_op(Opcode::JoinMulticastV6, group)
+        Ok(self.ipv6_addr_op(Opcode::JoinMulticastV6, group)? == 1)
     }
 
     pub fn leave_multicast_v6(&self, group: core::net::Ipv6Addr) -> Result<bool, xous::Error> {
-        self.multicast_v6_op(Opcode::LeaveMulticastV6, group)
+        Ok(self.ipv6_addr_op(Opcode::LeaveMulticastV6, group)? == 1)
     }
 
-    fn multicast_v6_op(&self, op: Opcode, group: core::net::Ipv6Addr) -> Result<bool, xous::Error> {
-        let o = group.octets();
+    /// Whether the interface currently holds `addr`: 1 = yes, 2 = it has a
+    /// different IPv6 address, 0 = none at all.
+    pub fn has_ipv6_addr(&self, addr: core::net::Ipv6Addr) -> Result<usize, xous::Error> {
+        self.ipv6_addr_op(Opcode::HasIpv6Addr, addr)
+    }
+
+    fn ipv6_addr_op(&self, op: Opcode, addr: core::net::Ipv6Addr) -> Result<usize, xous::Error> {
+        let o = addr.octets();
         let mut words = [0usize; 4];
         for (i, word) in words.iter_mut().enumerate() {
             *word = u32::from_be_bytes([o[i * 4], o[i * 4 + 1], o[i * 4 + 2], o[i * 4 + 3]]) as usize;
@@ -120,7 +126,7 @@ impl NetManager {
             self.netconn.conn(),
             Message::new_blocking_scalar(op.to_usize().unwrap(), words[0], words[1], words[2], words[3]),
         )? {
-            xous::Result::Scalar1(r) => Ok(r == 1),
+            xous::Result::Scalar1(r) => Ok(r),
             _ => Err(xous::Error::InternalError),
         }
     }

@@ -2001,6 +2001,25 @@ fn main() -> ! {
                 let ok = iface.leave_multicast_group_v6(group);
                 xous::return_scalar(msg.sender, if ok { 1 } else { 0 }).ok();
             }),
+            Some(Opcode::HasIpv6Addr) => msg_blocking_scalar_unpack!(msg, a0, a1, a2, a3, {
+                let mut b = [0u8; 16];
+                for (chunk, word) in b.chunks_mut(4).zip([a0, a1, a2, a3]) {
+                    chunk.copy_from_slice(&(word as u32).to_be_bytes());
+                }
+                let target = smoltcp::wire::Ipv6Address::from_bytes(&b);
+                let mut code = 0;
+                for cidr in iface.ip_addrs() {
+                    if let IpAddress::Ipv6(a) = cidr.address() {
+                        if a == target {
+                            code = 1;
+                            break;
+                        }
+                        code = 2;
+                    }
+                }
+                log::info!("HasIpv6Addr {target}: {code} (addrs: {:?})", iface.ip_addrs());
+                xous::return_scalar(msg.sender, code).ok();
+            }),
             Some(Opcode::Reset) => {
                 // reset the DHCP address
                 IPV4_ADDRESS.store(0, Ordering::SeqCst);

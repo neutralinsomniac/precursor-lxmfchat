@@ -368,6 +368,10 @@ pub(crate) enum Opcode {
     JoinMulticastV6 = 48,
     /// Same encoding as JoinMulticastV6.
     LeaveMulticastV6 = 49,
+    /// Does the interface currently hold the given IPv6 address? Same encoding
+    /// as JoinMulticastV6; returns 1 = yes, 2 = it has a different IPv6
+    /// address, 0 = it has none. Diagnostic for the link-local config.
+    HasIpv6Addr = 50,
     // do not use any numbers higher than 0x8000 as that is reserved for the nonblocking flag
 }
 #[allow(dead_code)]

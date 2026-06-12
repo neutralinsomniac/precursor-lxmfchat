@@ -170,6 +170,15 @@ pub fn start(shared: &Arc<Shared>, chat_cid: CID) -> bool {
 
     log::info!("AutoInterface up: ll={our_ll} scope={scope} group={group}");
     chat::cf_set_status_text(chat_cid, "local peer discovery on — listening…");
+    // The netstack must actually hold our fe80 or every v6 send is silently
+    // dropped at source selection — surface that, it's invisible otherwise.
+    #[cfg(target_os = "xous")]
+    match net::NetManager::new().has_ipv6_addr(our_ll) {
+        Ok(1) => {}
+        Ok(0) => chat::cf_set_status_text(chat_cid, "local: netstack has NO IPv6 address!"),
+        Ok(_) => chat::cf_set_status_text(chat_cid, "local: netstack IPv6 addr differs from ours!"),
+        Err(_) => {}
+    }
     true
 }
 
@@ -279,8 +288,13 @@ fn data_rx(shared: Arc<Shared>, chat_cid: CID, sock: UdpSocket) {
     }
 }
 
-fn announce_loop(shared: Arc<Shared>, _chat_cid: CID, group: Ipv6Addr) {
+fn announce_loop(shared: Arc<Shared>, chat_cid: CID, group: Ipv6Addr) {
     let mut last_beacon: u64 = 0;
+    // One status line on the first successful beacon, and on errors (throttled)
+    // — a beacon that the netstack eats silently is otherwise indistinguishable
+    // from a working one.
+    let mut beacon_confirmed = false;
+    let mut last_err_status: u64 = 0;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
         if !enabled(&shared) {
@@ -298,8 +312,20 @@ fn announce_loop(shared: Arc<Shared>, _chat_cid: CID, group: Ipv6Addr) {
         if now_secs().saturating_sub(last_beacon) * 1000 >= ANNOUNCE_INTERVAL_MS {
             last_beacon = now_secs();
             let dest = SocketAddrV6::new(group, DISCOVERY_PORT, 0, scope);
-            if let Err(e) = tx.send_to(&token, dest) {
-                log::warn!("multicast announce failed: {e}");
+            match tx.send_to(&token, dest) {
+                Ok(_) => {
+                    if !beacon_confirmed {
+                        beacon_confirmed = true;
+                        chat::cf_set_status_text(chat_cid, &format!("local: beaconing as {our_ll}"));
+                    }
+                }
+                Err(e) => {
+                    log::warn!("multicast announce failed: {e}");
+                    if now_secs().saturating_sub(last_err_status) > 30 {
+                        last_err_status = now_secs();
+                        chat::cf_set_status_text(chat_cid, &format!("local: beacon failed: {e}"));
+                    }
+                }
             }
         }
 
