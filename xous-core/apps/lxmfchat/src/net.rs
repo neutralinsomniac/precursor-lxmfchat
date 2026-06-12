@@ -718,6 +718,15 @@ fn read_until_closed(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Tr
     // and exits the loop on its own.
     stream.set_read_timeout(Some(std::time::Duration::from_secs(15))).ok();
     loop {
+        // Checked on EVERY iteration, not just the timeout tick: a hub that
+        // floods continuously (a full interface's announce stream) keeps every
+        // read returning data, so the timeout branch alone never runs — a
+        // forced reconnect would never be noticed and the manager could never
+        // dial the new hub (it sat at "reconnecting…" burning CPU on announces).
+        if !shared.connected.load(core::sync::atomic::Ordering::SeqCst) {
+            log::info!("reconnect requested — leaving the read loop");
+            break;
+        }
         match stream.read(&mut buf) {
             Ok(0) => {
                 log::info!("hub connection closed");
@@ -732,17 +741,13 @@ fn read_until_closed(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Tr
                     handle_frame(shared, chat_cid, pddb, trng, &frame);
                 }
             }
+            // Timeout tick: nothing to do — the top-of-loop check decides
+            // whether to keep reading.
             Err(e)
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                if !shared.connected.load(core::sync::atomic::Ordering::SeqCst) {
-                    log::info!("reconnect requested — leaving the read loop");
-                    break;
-                }
-            }
+                ) => {}
             Err(e) => {
                 log::warn!("hub read error: {e}");
                 note_disconnect(shared, format!("read failed: {:?}", e.kind()));
