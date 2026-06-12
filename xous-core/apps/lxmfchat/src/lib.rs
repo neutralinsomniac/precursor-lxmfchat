@@ -891,27 +891,31 @@ impl<'a> LxmfChat<'a> {
     /// F4 while browsing: leave the browser and return to the conversation.
     pub fn browser_exit(&self) { net::browser_exit(&self.shared, self.chat_cid); }
 
-    /// F1 while browsing: the browser menu — bookmarks and page actions.
+    /// The browser menu — navigation, bookmarks, and page actions. Raised by
+    /// F1 while a page is shown, and by the main menu's "Browser" entry from
+    /// the chat (where the page-specific actions are left out: no page yet).
     pub fn browser_menu(&mut self, modals: &modals::Modals) {
-        if !self.browsing() {
-            return;
+        let viewing = self.browsing();
+        let mut items: Vec<&str> = vec!["Bookmarks"];
+        if viewing {
+            items.extend(["Bookmark this page", "Reload page", "Node index"]);
         }
-        let items: Vec<String> =
-            ["Bookmarks", "Bookmark this page", "Remove bookmark", "Reload page", "Node index"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-        match self.pick_from_list(modals, &items, "Browser menu") {
-            Some(0) => self.open_bookmark_interactive(modals),
-            Some(1) => self.bookmark_current_page(),
-            Some(2) => self.remove_bookmark_interactive(modals),
-            Some(3) => {
+        items.extend(["Enter URL", "Browse node", "Browse address", "Rename bookmark", "Remove bookmark"]);
+        let labels: Vec<String> = items.iter().map(|s| s.to_string()).collect();
+        let choice = match self.pick_from_list(modals, &labels, "Browser menu") {
+            Some(i) => items[i],
+            None => return,
+        };
+        match choice {
+            "Bookmarks" => self.open_bookmark_interactive(modals),
+            "Bookmark this page" => self.bookmark_current_page(),
+            "Reload page" => {
                 // Reload: re-fetch the current page in place (no back push).
                 if let Some((node, path, vars)) = net::current_page(&self.shared) {
                     net::request_page(&self.shared, self.chat_cid, node, &path, vars, false);
                 }
             }
-            Some(4) => {
+            "Node index" => {
                 // Jump to the current node's front page.
                 if let Some((node, _, _)) = net::current_page(&self.shared) {
                     net::request_page(
@@ -924,8 +928,98 @@ impl<'a> LxmfChat<'a> {
                     );
                 }
             }
+            "Enter URL" => self.enter_url_interactive(modals),
+            "Browse node" => self.browse_node_interactive(modals),
+            "Browse address" => self.browse_address_interactive(modals),
+            "Rename bookmark" => self.rename_bookmark_interactive(modals),
+            "Remove bookmark" => self.remove_bookmark_interactive(modals),
             _ => {}
         }
+    }
+
+    /// Open a page from a typed URL — the same forms micron links use:
+    /// `<32 hex>:/page/foo.mu`, a bare `<32 hex>` (that node's index page),
+    /// or `:/page/foo.mu` / `/page/foo.mu` (relative to the node on screen).
+    pub fn enter_url_interactive(&mut self, modals: &modals::Modals) {
+        match modals.alert_builder("Page URL (32-hex node, or hex:/page/path.mu)").field(None, None).build()
+        {
+            Ok(p) => {
+                let s = p.first().as_str().trim().to_string();
+                if s.is_empty() {
+                    return;
+                }
+                match micron::resolve_link(&s) {
+                    micron::LinkTarget::OtherNode(node, path) => self.open_page(&node, &path),
+                    micron::LinkTarget::NodeIndex(node) => self.open_page(&node, net::PAGE_PATH_DEFAULT),
+                    micron::LinkTarget::SameNode(path) => match net::current_page(&self.shared) {
+                        Some((node, _, _)) => self.open_page(&node, &path),
+                        None => self
+                            .chat
+                            .set_status_text("relative URL — open a node first, or use hex:/path"),
+                    },
+                    micron::LinkTarget::Lxmf(_) => {
+                        self.chat.set_status_text("that's a messaging address, not a page");
+                    }
+                    micron::LinkTarget::Anchor | micron::LinkTarget::Unsupported => {
+                        self.chat.set_status_text("unrecognized URL (need hex:/page/path.mu)");
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Scan the open conversation for page links and open the picked one in
+    /// the browser. Newest message first. A bare 32-hex token might equally be
+    /// an LXMF messaging address — offering it as a node costs nothing (its
+    /// index fetch just fails if it isn't one).
+    pub fn select_url_interactive(&mut self, modals: &modals::Modals) {
+        let dlg_key = match *plock(&self.shared.current_peer) {
+            Some(p) => hex(&p),
+            None => DIALOGUE_WELCOME.to_string(),
+        };
+        let mut found: Vec<([u8; TRUNCATED_HASHLENGTH], String)> = Vec::new();
+        if let Some(dialogue) = read_dialogue(&self.pddb, DIALOGUE_DICT, &dlg_key) {
+            for post in dialogue.posts().rev() {
+                for hit in scan_page_links(post.text()) {
+                    if !found.contains(&hit) {
+                        found.push(hit);
+                    }
+                }
+            }
+        }
+        found.truncate(ANNOUNCE_LIST_MAX);
+        if found.is_empty() {
+            modals.show_notification("No page links in this conversation.", None).ok();
+            return;
+        }
+        let labels: Vec<String> = found
+            .iter()
+            .map(|(node, path)| {
+                let mut l = format!("{} {}", net::node_label(&self.shared, node), path);
+                l.truncate(60);
+                l
+            })
+            .collect();
+        if let Some(i) = self.pick_from_list(modals, &labels, "Open which link?") {
+            let (node, path) = found[i].clone();
+            self.open_page(&node, &path);
+        }
+    }
+
+    /// Fetch a specific page. Nodes reached this way (URL entry / chat links)
+    /// get listed under a placeholder name when unknown — upgraded to the real
+    /// name by their index page's title, like address-browsed nodes.
+    fn open_page(&mut self, node: &[u8; TRUNCATED_HASHLENGTH], path: &str) {
+        if !plock(&self.shared.saved_nodes).contains_key(node) {
+            let name = plock(&self.shared.nodes_seen)
+                .get(node)
+                .map(|(n, _)| n.clone())
+                .unwrap_or_else(|| format!("{}…", &hex(node)[..8]));
+            plock(&self.shared.saved_nodes).insert(*node, name.clone());
+            persist_node(&self.pddb, node, &name);
+        }
+        net::request_page(&self.shared, self.chat_cid, *node, path, Vec::new(), true);
     }
 
     /// A bookmark's display label: node name + path (+ vars when present).
@@ -979,6 +1073,35 @@ impl<'a> LxmfChat<'a> {
         if let Some(i) = self.pick_from_list(modals, &labels, "Remove which bookmark?") {
             self.pddb.delete_key(BOOKMARKS_DICT, &bookmarks[i].0, None).ok();
             self.chat.set_status_text(&format!("removed: {}", bookmarks[i].1));
+        }
+    }
+
+    /// Pick a bookmark and give it a new label. The stored key is a hash of
+    /// the page address (not the label), so re-persisting under the same
+    /// address overwrites the entry in place.
+    fn rename_bookmark_interactive(&mut self, modals: &modals::Modals) {
+        let bookmarks = load_bookmarks(&self.pddb);
+        if bookmarks.is_empty() {
+            modals.show_notification("No bookmarks to rename.", None).ok();
+            return;
+        }
+        let labels: Vec<String> = bookmarks.iter().map(|(_, l, _)| l.clone()).collect();
+        let i = match self.pick_from_list(modals, &labels, "Rename which bookmark?") {
+            Some(i) => i,
+            None => return,
+        };
+        let (_, current, addr) = bookmarks[i].clone();
+        match modals.alert_builder("New bookmark name").field(Some(current.clone()), None).build() {
+            Ok(p) => {
+                let mut label = p.first().as_str().trim().to_string();
+                label.truncate(60);
+                if label.is_empty() || label == current {
+                    return;
+                }
+                persist_bookmark(&self.pddb, &label, &addr);
+                self.chat.set_status_text(&format!("renamed: {label}"));
+            }
+            Err(_) => {}
         }
     }
 
@@ -1040,6 +1163,33 @@ impl<'a> LxmfChat<'a> {
             false
         }
     }
+}
+
+/// Read a persisted chat dialogue directly from the PDDB (read-only — the chat
+/// server stays the only writer). The app sends DialogueSave after every post,
+/// so the stored copy tracks what's on screen.
+fn read_dialogue(pddb: &Pddb, dict: &str, key: &str) -> Option<chat::dialogue::Dialogue> {
+    let mut k = pddb.get(dict, key, None, false, false, None, None::<fn()>).ok()?;
+    let mut buf = Vec::new();
+    let cap = (chat::dialogue::MAX_BYTES + chat::dialogue::ENVELOPE_HEADER + 2) as u64;
+    (&mut k).take(cap).read_to_end(&mut buf).ok()?;
+    chat::dialogue::decode(&buf).ok()
+}
+
+/// Page links in a chat message: whitespace-split tokens (surrounding
+/// punctuation stripped) that resolve like micron link URLs. Only absolute
+/// targets count — a chat message has no "current node" for relative paths.
+fn scan_page_links(text: &str) -> Vec<([u8; TRUNCATED_HASHLENGTH], String)> {
+    let mut out = Vec::new();
+    for tok in text.split_whitespace() {
+        let tok = tok.trim_matches(|c: char| "()[]<>{}\"'.,;!?".contains(c));
+        match micron::resolve_link(tok) {
+            micron::LinkTarget::OtherNode(node, path) => out.push((node, path)),
+            micron::LinkTarget::NodeIndex(node) => out.push((node, net::PAGE_PATH_DEFAULT.to_string())),
+            _ => {}
+        }
+    }
+    out
 }
 
 pub(crate) fn parse_addr(s: &str) -> Option<[u8; TRUNCATED_HASHLENGTH]> {

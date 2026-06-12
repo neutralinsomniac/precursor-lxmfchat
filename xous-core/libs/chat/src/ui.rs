@@ -240,32 +240,17 @@ impl Ui {
         }
         let pos = buf.len();
 
-        // Validate the envelope (MAGIC | len | crc | body) before trusting any of
-        // it. A failure means the value is legacy (pre-envelope), truncated, or
-        // otherwise corrupt — none of which can be fed to rkyv's unchecked accessor
-        // (it would read a bogus length and abort). On failure we DON'T touch
+        // Validate + decode (envelope, then the rkyv body — see
+        // `dialogue::decode`). On an envelope failure we DON'T touch
         // `self.dialogue` or delete the key: the caller decides — `dialogue_set`
         // overwrites it with a fresh empty thread (delete-then-write), while a
         // post-save read-back simply keeps the (correct) in-memory copy it just
         // saved, so a transient read glitch can't lose data.
-        let valid = pos >= dialogue::ENVELOPE_HEADER && buf[..4] == dialogue::ENVELOPE_MAGIC && {
-            let len = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
-            let crc = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
-            let end = dialogue::ENVELOPE_HEADER + len;
-            end <= pos
-                && len <= dialogue::MAX_BYTES
-                && dialogue::checksum(&buf[dialogue::ENVELOPE_HEADER..end]) == crc
-        };
-        if !valid {
-            log::warn!("Dialogue {dict}:{key} failed envelope validation ({pos} bytes)");
-            return Err(Error::new(ErrorKind::InvalidData, "corrupt dialogue"));
-        }
-
-        let len = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
-        let body = &buf[dialogue::ENVELOPE_HEADER..dialogue::ENVELOPE_HEADER + len];
-        // Safe: the checksum guarantees `body` is exactly what we serialized.
-        let archive = unsafe { rkyv::access_unchecked::<dialogue::ArchivedDialogue>(body) };
-        self.dialogue = match rkyv::deserialize::<Dialogue, rkyv::rancor::Error>(archive) {
+        self.dialogue = match dialogue::decode(&buf) {
+            Err(dialogue::DecodeError::Envelope) => {
+                log::warn!("Dialogue {dict}:{key} failed envelope validation ({pos} bytes)");
+                return Err(Error::new(ErrorKind::InvalidData, "corrupt dialogue"));
+            }
             Ok(mut dialogue) => {
                 // Bubble heights are persisted with the posts, but they depend
                 // on render details that can change between builds (e.g. the
@@ -280,7 +265,7 @@ impl Ui {
                 self.layout_topdown = false;
                 Some(dialogue)
             }
-            Err(e) => {
+            Err(dialogue::DecodeError::Deserialize(e)) => {
                 log::warn!("failed to deserialize Dialogue {}:{} {}", dict, key, e);
                 None
             }

@@ -68,8 +68,8 @@ fn wrapped_main() -> ! {
     chat.menu_add(menu_item("Set peer", MenuOp::SetPeer)).ok();
     chat.menu_add(menu_item("Set hub", MenuOp::SetHub)).ok();
     chat.menu_add(menu_item("Sync messages", MenuOp::Sync)).ok();
-    chat.menu_add(menu_item("Browse node", MenuOp::Browse)).ok();
-    chat.menu_add(menu_item("Browse address", MenuOp::BrowseAddress)).ok();
+    chat.menu_add(menu_item("Browser", MenuOp::Browser)).ok();
+    chat.menu_add(menu_item("Select URL", MenuOp::SelectUrl)).ok();
     chat.menu_add(menu_item("Clear history", MenuOp::ClearHistory)).ok();
     chat.menu_add(menu_item("Close", MenuOp::Noop)).ok();
 
@@ -150,8 +150,8 @@ fn wrapped_main() -> ! {
                         Some(MenuOp::SetHub) => app.set_hub_interactive(&modals),
                         Some(MenuOp::ClearHistory) => app.clear_history_interactive(&modals),
                         Some(MenuOp::Sync) => app.sync_now(),
-                        Some(MenuOp::Browse) => app.browse_node_interactive(&modals),
-                        Some(MenuOp::BrowseAddress) => app.browse_address_interactive(&modals),
+                        Some(MenuOp::Browser) => app.browser_menu(&modals),
+                        Some(MenuOp::SelectUrl) => app.select_url_interactive(&modals),
                         Some(MenuOp::Noop) | None => {}
                     }
                 });

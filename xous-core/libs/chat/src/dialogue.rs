@@ -53,6 +53,39 @@ pub fn checksum(data: &[u8]) -> u32 {
     h
 }
 
+/// Why [`decode`] rejected a stored dialogue value.
+#[derive(Debug)]
+pub enum DecodeError {
+    /// Envelope missing, truncated, or corrupt — the value can't be trusted.
+    Envelope,
+    /// Envelope intact but the rkyv body didn't deserialize (schema drift).
+    Deserialize(String),
+}
+
+/// Decode a stored dialogue value: validate the envelope
+/// (`MAGIC | len(4 BE) | crc(4 BE) | body`) and deserialize the rkyv body.
+/// The envelope check is what makes the *unchecked* rkyv accessor safe — never
+/// feed the body to rkyv without it. Used by the chat UI's own reader, and by
+/// apps that want a read-only look at a dialogue they own (the chat server
+/// remains the only writer).
+pub fn decode(buf: &[u8]) -> Result<Dialogue, DecodeError> {
+    let valid = buf.len() >= ENVELOPE_HEADER && buf[..4] == ENVELOPE_MAGIC && {
+        let len = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+        let crc = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let end = ENVELOPE_HEADER + len;
+        end <= buf.len() && len <= MAX_BYTES && checksum(&buf[ENVELOPE_HEADER..end]) == crc
+    };
+    if !valid {
+        return Err(DecodeError::Envelope);
+    }
+    let len = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+    let body = &buf[ENVELOPE_HEADER..ENVELOPE_HEADER + len];
+    // Safe: the checksum guarantees `body` is exactly what was serialized.
+    let archive = unsafe { rkyv::access_unchecked::<ArchivedDialogue>(body) };
+    rkyv::deserialize::<Dialogue, rkyv::rancor::Error>(archive)
+        .map_err(|e| DecodeError::Deserialize(e.to_string()))
+}
+
 /// A Dialogue is a generic representation of a series of Posts
 /// This might represent a room, group, or direct-message conversation
 #[derive(Archive, Serialize, Deserialize, Debug)]
