@@ -29,8 +29,8 @@ pub enum MenuOp {
     ImportContact,
     /// (Re)connect to the configured hub and announce our address
     Connect,
-    /// Toggle AutoInterface (local-network peering, no hub involved).
-    LocalPeers,
+    /// Submenu: toggle the hub/AutoInterface, set the hub address.
+    Interfaces,
     /// Announce our lxmf.delivery destination on the connected hub
     Announce,
     /// Show our own LXMF address
@@ -39,8 +39,6 @@ pub enum MenuOp {
     SetName,
     /// Manually set the peer by pasting a 32-hex lxmf address (advanced/fallback)
     SetPeer,
-    /// Set the transport hub (host / port)
-    SetHub,
     /// Wipe the message history of the currently-open conversation (keeps the
     /// contact, its key, and any stamp ticket).
     ClearHistory,

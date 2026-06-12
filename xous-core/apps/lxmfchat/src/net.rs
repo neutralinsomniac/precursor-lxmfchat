@@ -350,6 +350,9 @@ pub struct Shared {
     /// The hub to (re)connect to, as `host:port`. Read by the connection manager
     /// each cycle so a "Set hub" takes effect on the next (re)connect.
     pub hub: Mutex<String>,
+    /// When false the connection manager neither dials nor redials (local-only
+    /// operation); the toggle that clears it also tears down the live socket.
+    pub hub_enabled: core::sync::atomic::AtomicBool,
     /// Our own lxmf.delivery destination hash.
     pub our_dh: [u8; TRUNCATED_HASHLENGTH],
     /// The display name we announce (announce app_data, legacy raw-utf8 form).
@@ -560,6 +563,11 @@ pub fn connection_manager(shared: Arc<Shared>, chat_cid: CID) {
     // to diagnose from; this keeps the answer on screen until the next event.
     let mut last_drop: Option<String> = None;
     loop {
+        if !shared.hub_enabled.load(core::sync::atomic::Ordering::SeqCst) {
+            backoff = 2;
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            continue;
+        }
         let hub = plock(&shared.hub).clone();
         let parsed = hub
             .rsplit_once(':')

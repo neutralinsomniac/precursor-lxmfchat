@@ -50,6 +50,8 @@ const KEY_HUB: &str = "hub";
 const KEY_PEER: &str = "peer";
 /// AutoInterface on/off ("1"/"0"). Off by default — it beacons while enabled.
 const KEY_AUTOIFACE: &str = "autoiface";
+/// Hub TCP interface on/off ("1"/"0"). On by default.
+const KEY_HUB_ENABLED: &str = "hub_enabled";
 /// PDDB key for our announced display name.
 const KEY_NAME: &str = "name";
 /// Display name announced when none has been set yet.
@@ -220,6 +222,9 @@ impl<'a> LxmfChat<'a> {
             backchannels: Mutex::new(BTreeMap::new()),
             llio: llio::Llio::new(&xns),
             hub: Mutex::new(hub.clone()),
+            hub_enabled: core::sync::atomic::AtomicBool::new(
+                read_string(&pddb, KEY_HUB_ENABLED).as_deref() != Some("0"),
+            ),
             unread: Mutex::new(unread_map),
             pending: Mutex::new(pending_map),
             tickets: Mutex::new(tickets_map),
@@ -269,35 +274,15 @@ impl<'a> LxmfChat<'a> {
     /// later calls it points the manager at the current hub and forces a fresh
     /// (re)connect so a "Set hub" / explicit "Connect" takes effect immediately.
     pub fn connect(&mut self) {
+        // An explicit Connect always means "I want the hub" — re-enables a
+        // toggled-off hub. (start_networking, the first-focus path, doesn't,
+        // so a persisted hub-off survives a restart.)
+        if !self.shared.hub_enabled.swap(true, core::sync::atomic::Ordering::SeqCst) {
+            write_string(&self.pddb, KEY_HUB_ENABLED, "1");
+        }
         *plock(&self.shared.hub) = self.hub.clone();
         if !self.manager_started {
-            self.manager_started = true;
-            let shared = self.shared.clone();
-            let cid = self.chat_cid;
-            std::thread::spawn(move || net::connection_manager(shared, cid));
-            // One keepalive + stuck-write-watchdog thread for the app's lifetime
-            // (survives reconnects).
-            let ka = self.shared.clone();
-            let ka_cid = self.chat_cid;
-            std::thread::spawn(move || net::keepalive_thread(ka, ka_cid));
-            // One outbox pump thread: drives delivery timeouts + propagation
-            // fallback so sent messages reach a terminal mark (✓/⇪/✗).
-            let pump = self.shared.clone();
-            let pump_cid = self.chat_cid;
-            std::thread::spawn(move || net::outbox_pump_thread(pump, pump_cid));
-            // A SEPARATE thread for propagation-node sync, so a slow outbox op
-            // (a stalled hub write, or PoW-stamp mining) on the pump thread can't
-            // stall the sync request — and vice-versa.
-            let synct = self.shared.clone();
-            let sync_cid = self.chat_cid;
-            std::thread::spawn(move || net::sync_thread(synct, sync_cid));
-            // And one for the node page browser, for the same reason.
-            let browse = self.shared.clone();
-            let browse_cid = self.chat_cid;
-            std::thread::spawn(move || net::browser_thread(browse, browse_cid));
-            if read_string(&self.pddb, KEY_AUTOIFACE).as_deref() == Some("1") {
-                autoiface::start_background(&self.shared, self.chat_cid);
-            }
+            self.start_networking();
             return;
         }
         // Manager already running: force the connection down so it reconnects
@@ -309,6 +294,80 @@ impl<'a> LxmfChat<'a> {
             &format!("reconnecting to {}…", self.hub),
             "reconnect requested",
         );
+    }
+
+    /// Spawn the lifetime network threads (first focus does this; the hub
+    /// dials only if enabled).
+    pub fn start_networking(&mut self) {
+        if self.manager_started {
+            return;
+        }
+        self.manager_started = true;
+        *plock(&self.shared.hub) = self.hub.clone();
+        let shared = self.shared.clone();
+        let cid = self.chat_cid;
+        std::thread::spawn(move || net::connection_manager(shared, cid));
+        // One keepalive + stuck-write-watchdog thread for the app's lifetime
+        // (survives reconnects).
+        let ka = self.shared.clone();
+        let ka_cid = self.chat_cid;
+        std::thread::spawn(move || net::keepalive_thread(ka, ka_cid));
+        // One outbox pump thread: drives delivery timeouts + propagation
+        // fallback so sent messages reach a terminal mark (✓/⇪/✗).
+        let pump = self.shared.clone();
+        let pump_cid = self.chat_cid;
+        std::thread::spawn(move || net::outbox_pump_thread(pump, pump_cid));
+        // A SEPARATE thread for propagation-node sync, so a slow outbox op
+        // (a stalled hub write, or PoW-stamp mining) on the pump thread can't
+        // stall the sync request — and vice-versa.
+        let synct = self.shared.clone();
+        let sync_cid = self.chat_cid;
+        std::thread::spawn(move || net::sync_thread(synct, sync_cid));
+        // And one for the node page browser, for the same reason.
+        let browse = self.shared.clone();
+        let browse_cid = self.chat_cid;
+        std::thread::spawn(move || net::browser_thread(browse, browse_cid));
+        if read_string(&self.pddb, KEY_AUTOIFACE).as_deref() == Some("1") {
+            autoiface::start_background(&self.shared, self.chat_cid);
+        }
+    }
+
+    /// "Interfaces" submenu: toggle the hub TCP interface and AutoInterface,
+    /// set the hub address.
+    pub fn interfaces_menu(&mut self, modals: &modals::Modals) {
+        let hub_on = self.shared.hub_enabled.load(core::sync::atomic::Ordering::SeqCst);
+        let auto_on = autoiface::enabled(&self.shared);
+        let peers = plock(&self.shared.auto).peers.len();
+        let labels: Vec<String> = vec![
+            if hub_on { "Hub: on → off".to_string() } else { "Hub: off → on".to_string() },
+            match (auto_on, peers) {
+                (true, 0) => "Local peers: on → off".to_string(),
+                (true, n) => format!("Local peers: on → off ({n} nearby)"),
+                (false, _) => "Local peers: off → on".to_string(),
+            },
+            format!("Set hub address ({})", self.hub),
+        ];
+        match self.pick_from_list(modals, &labels, "Interfaces") {
+            Some(0) => self.toggle_hub(),
+            Some(1) => self.toggle_local_peers(),
+            Some(2) => self.set_hub_interactive(modals),
+            _ => {}
+        }
+    }
+
+    pub fn toggle_hub(&mut self) {
+        if self.shared.hub_enabled.load(core::sync::atomic::Ordering::SeqCst) {
+            self.shared.hub_enabled.store(false, core::sync::atomic::Ordering::SeqCst);
+            write_string(&self.pddb, KEY_HUB_ENABLED, "0");
+            net::force_reconnect(
+                &self.shared,
+                self.chat_cid,
+                "hub off — local peers only",
+                "hub disabled",
+            );
+        } else {
+            self.connect();
+        }
     }
 
     pub fn toggle_local_peers(&mut self) {
@@ -363,6 +422,10 @@ impl<'a> LxmfChat<'a> {
     /// flags the request — the pump thread does the actual link + hub writes, so
     /// this returns immediately and never blocks the UI on a hub write.
     pub fn sync_now(&self) {
+        if !self.shared.hub_enabled.load(core::sync::atomic::Ordering::SeqCst) {
+            self.chat.set_status_text("hub is off — turn it on to sync");
+            return;
+        }
         net::request_sync(&self.shared);
         self.chat.set_status_text("sync requested…");
     }

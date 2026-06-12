@@ -62,12 +62,11 @@ fn wrapped_main() -> ! {
     chat.menu_add(menu_item("Rename contact", MenuOp::RenameContact)).ok();
     chat.menu_add(menu_item("Import contact", MenuOp::ImportContact)).ok();
     chat.menu_add(menu_item("Connect", MenuOp::Connect)).ok();
-    chat.menu_add(menu_item("Local peers", MenuOp::LocalPeers)).ok();
+    chat.menu_add(menu_item("Interfaces", MenuOp::Interfaces)).ok();
     chat.menu_add(menu_item("Announce", MenuOp::Announce)).ok();
     chat.menu_add(menu_item("My address", MenuOp::MyAddress)).ok();
     chat.menu_add(menu_item("My name", MenuOp::SetName)).ok();
     chat.menu_add(menu_item("Set peer", MenuOp::SetPeer)).ok();
-    chat.menu_add(menu_item("Set hub", MenuOp::SetHub)).ok();
     chat.menu_add(menu_item("Sync messages", MenuOp::Sync)).ok();
     chat.menu_add(menu_item("Browser", MenuOp::Browser)).ok();
     chat.menu_add(menu_item("Select URL", MenuOp::SelectUrl)).ok();
@@ -89,7 +88,7 @@ fn wrapped_main() -> ! {
                         Some(Event::Focus) => {
                             if first_focus {
                                 first_focus = false;
-                                app.connect();
+                                app.start_networking();
                             }
                             app.redraw();
                         }
@@ -140,7 +139,7 @@ fn wrapped_main() -> ! {
                         Some(MenuOp::RenameContact) => app.rename_contact_interactive(&modals),
                         Some(MenuOp::ImportContact) => app.import_contact_interactive(&modals),
                         Some(MenuOp::Connect) => app.connect(),
-                        Some(MenuOp::LocalPeers) => app.toggle_local_peers(),
+                        Some(MenuOp::Interfaces) => app.interfaces_menu(&modals),
                         Some(MenuOp::Announce) => app.announce(),
                         Some(MenuOp::MyAddress) => {
                             modals
@@ -149,7 +148,6 @@ fn wrapped_main() -> ! {
                         }
                         Some(MenuOp::SetName) => app.set_name_interactive(&modals),
                         Some(MenuOp::SetPeer) => app.set_peer_interactive(&modals),
-                        Some(MenuOp::SetHub) => app.set_hub_interactive(&modals),
                         Some(MenuOp::ClearHistory) => app.clear_history_interactive(&modals),
                         Some(MenuOp::Sync) => app.sync_now(),
                         Some(MenuOp::Browser) => app.browser_open(&modals),
