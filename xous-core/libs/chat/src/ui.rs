@@ -678,24 +678,9 @@ impl Ui {
             }
             return;
         }
-        // No further link this screen: page (no-op at the document's edge).
+        // No further link this screen: page instead (doc_page focuses the new
+        // screen's nearest link itself, and no-ops at the document's edge).
         self.doc_page(next);
-        let new_top = match self.document.as_ref() {
-            Some(d) => d.top,
-            None => return,
-        };
-        if new_top == top {
-            return; // already at the edge — keep the cursor where it was
-        }
-        let new_end = (new_top + self.doc_visible_count(new_top)).min(total);
-        let landing = if next {
-            (new_top..new_end).find(|&i| self.doc_is_link(i))
-        } else {
-            (new_top..new_end).rev().find(|&i| self.doc_is_link(i))
-        };
-        if let Some(doc) = self.document.as_mut() {
-            doc.cursor = landing.unwrap_or(new_top);
-        }
     }
 
     /// Scroll the document by one screenful, parking the cursor on the new
@@ -723,9 +708,23 @@ impl Ui {
             }
             i
         };
+        if new_top == top {
+            return; // already at the document's edge
+        }
         if let Some(doc) = self.document.as_mut() {
             doc.top = new_top;
-            doc.cursor = new_top;
+        }
+        // Always a plain screenful — never "scroll to a link". But IF the new
+        // screen has one, focus the nearest in the direction of travel; else
+        // the cursor bar just marks the screen's edge line.
+        let new_end = (new_top + self.doc_visible_count(new_top)).min(total);
+        let landing = if down {
+            (new_top..new_end).find(|&i| self.doc_is_link(i))
+        } else {
+            (new_top..new_end).rev().find(|&i| self.doc_is_link(i))
+        };
+        if let Some(doc) = self.document.as_mut() {
+            doc.cursor = landing.unwrap_or(new_top);
         }
     }
 
