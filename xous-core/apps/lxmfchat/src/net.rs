@@ -1993,7 +1993,8 @@ pub fn start_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
 enum LinkReqOutcome {
     /// A fresh request was framed and fully written to the hub.
     Sent,
-    /// A recent request is still pending an LRPROOF — nothing sent (correct).
+    /// A recent request is still pending an LRPROOF, or the link is already
+    /// established — nothing sent (correct).
     Pending,
     /// No connection, or the hub write failed: nothing went out.
     WriteFailed,
@@ -2002,7 +2003,13 @@ enum LinkReqOutcome {
 /// Send a LINKREQUEST to `target` (a peer or the propagation node) unless one
 /// is already pending and
 /// recent (expired pending entries are pruned by `pending_link_to`, which is what
-/// lets a lost request be retried at all).
+/// lets a lost request be retried at all) — or the link is already up. The
+/// established-link check must live HERE, under the same transport lock that
+/// processes the LRPROOF: the retry ticks sample their phase first and call
+/// this after, so a proof landing in between used to slip past the pending
+/// check (consumed by the proof) and send a duplicate LINKREQUEST — painting
+/// "try 2" right after "requesting message list…" and opening a second link
+/// the node keeps for nothing.
 fn send_link_request(
     shared: &Arc<Shared>,
     trng: &Trng,
@@ -2014,7 +2021,7 @@ fn send_link_request(
     // thread; the pump only calls this while the outbox is non-empty).
     let raw = {
         let mut tp = plock(&shared.transport);
-        if tp.pending_link_to(pn, now) {
+        if tp.pending_link_to(pn, now) || tp.outbound_link_for(pn, now).is_some() {
             None
         } else {
             let mut ex = [0u8; KEY_HALF];
@@ -2440,7 +2447,8 @@ fn browser_tick(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         return;
     }
     // Mid-fetch, still waiting for the link: re-send a lost LINKREQUEST
-    // (no-ops while one is still pending — same recovery as the sync path).
+    // (no-ops while one is still pending or the link is already up — same
+    // recovery, and same phase-sample race, as the sync path).
     let linking = {
         let b = plock(&shared.browser);
         if b.phase == BrowserPhase::Linking { b.node } else { None }
@@ -3229,7 +3237,10 @@ fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
     // Mid-sync, still waiting for the link: if the LINKREQUEST was lost (its
     // pending entry expired with no proof), send a fresh one — otherwise a single
     // lost request used to mean nothing more ever went out and the sync just sat
-    // until the watchdog. `send_link_request` no-ops while one is still pending.
+    // until the watchdog. `send_link_request` no-ops while one is still pending
+    // AND when the link is already up — the proof can land between this phase
+    // sample and the send, and the duplicate request would clobber the status
+    // with a phantom "try N".
     let linking = { plock(&shared.sync).phase == SyncPhase::Linking };
     if linking {
         let known = { plock(&shared.transport).known(&pn).cloned() };
