@@ -131,6 +131,36 @@ against the real typesetter in `libs/ux-api/tests/grow_sim.rs` (run with
   remember a refused request (`grow_refused`) so a height-capped box doesn't
   spam resize/redraw on every keystroke.
 
+### 10. services/net: wildcard UDP binds never receive unicast
+`std_udp_bind` converts the requested address with smoltcp's
+`From<IpEndpoint> for IpListenEndpoint`, which wraps it in `Some(...)`
+unconditionally — so a libstd `UdpSocket::bind("0.0.0.0:p")` binds to the
+*literal* unspecified address. smoltcp's `udp::Socket::accepts` then rejects
+every unicast datagram (`Some(0.0.0.0) != Some(dst)`; only broadcast/multicast
+destinations pass). Any portable code that binds wildcard and expects unicast
+UDP replies silently receives nothing.
+- Local fix: map an unspecified bind address to a true wildcard listen
+  (`IpListenEndpoint { addr: None, .. }`) in `std_udp.rs`.
+- Related additions in this tree (PR material, needed for Reticulum
+  AutoInterface): the interface now gets an EUI-64 IPv6 link-local address
+  (`fe80::…`, derived from the MAC) alongside the DHCP v4 address
+  (`iface-max-addr-count-3`); new `JoinMulticastV6`/`LeaveMulticastV6` net
+  opcodes + `NetManager::{join,leave}_multicast_v6` (libstd's
+  `join_multicast_v6` is an unimplementable stub on Xous, the netstack owns
+  group membership).
+
+## smoltcp 0.11 (vendored at `xous-core/imports/smoltcp`)
+
+smoltcp 0.11's `join_multicast_group` returns `Ipv6NotSupported` and its
+IPv6 RX accept path only admits all-nodes + solicited-node multicast — so
+nothing built on it can *receive* IPv6 multicast (IPv6 multicast landed
+upstream in 0.12, but services/net is written against 0.11 APIs). Vendored
+0.11.0 with a minimal patch: an `ipv6_multicast_groups` table checked in
+`has_multicast_group`, populated via new `join/leave_multicast_group_v6`
+methods. No MLD reports are emitted — fine on WiFi APs and non-snooping
+switches, where multicast is flooded. Long-term the right move is upgrading
+services/net to smoltcp 0.12+.
+
 ## paolobarbolini / bzip2-rs
 
 ### 9. Decoder preallocates by declared block size, not content (OOM on small targets)

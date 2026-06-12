@@ -15,6 +15,7 @@
 //! - [`hdlc`] — TCP-interface framing.
 
 pub mod announce;
+pub mod autointerface;
 pub mod constants;
 pub mod crypto;
 pub mod destination;

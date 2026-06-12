@@ -313,7 +313,7 @@ pub struct Shared {
     pub transport: Mutex<Transport>,
     /// The write half of the hub connection (None until connected).
     ///
-    /// LOCK DISCIPLINE: only [`write_to_hub`] (with a BOUNDED try_lock wait) and
+    /// LOCK DISCIPLINE: only [`hub_write`] (with a BOUNDED try_lock wait) and
     /// the connection manager may take this. A hub write on real hardware can
     /// block indefinitely (the 10 s socket write timeout has been observed not
     /// to save us), and a thread blocking on this mutex forever wedged the sync
@@ -439,6 +439,11 @@ pub struct Shared {
     /// Low-level I/O handle, used to buzz the vibration motor on a new inbound
     /// message. `vibe` is a fire-and-forget scalar, safe to call from any thread.
     pub llio: llio::Llio,
+    /// AutoInterface (local-network peer discovery + UDP data) state.
+    pub auto: Mutex<crate::autoiface::AutoState>,
+    /// Whether AutoInterface is accepting/announcing/sending — an atomic so the
+    /// outbound hot path ([`broadcast_out`]) checks it without taking a lock.
+    pub auto_enabled: core::sync::atomic::AtomicBool,
 }
 
 fn hex(b: &[u8]) -> String { reticulum_core::hex(b) }
@@ -522,7 +527,7 @@ fn now_secs() -> u64 {
 /// a temporary `llio::LocalTime`, whose refcounted Drop severs the very
 /// connection libstd caches for `SystemTime::now()`. Never let the last
 /// `LocalTime` in a process drop.
-fn wait_for_time_server() {
+pub(crate) fn wait_for_time_server() {
     #[cfg(target_os = "xous")]
     {
         let _ = xous::connect(xous::SID::from_bytes(b"timeserverpublic").unwrap());
@@ -789,7 +794,7 @@ fn send_announce(shared: &Arc<Shared>, trng: &Trng) {
         let tp = plock(&shared.transport);
         tp.make_announce_with("lxmf", &["delivery"], name.as_bytes(), &r5, now_secs())
     };
-    write_to_hub(shared, &raw);
+    broadcast_out(shared, &raw);
 }
 
 /// Ask the hub for a route to the configured propagation node (if any), so its
@@ -803,7 +808,7 @@ fn request_propagation_path(shared: &Arc<Shared>, trng: &Trng) {
     }
 }
 
-fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, frame_bytes: &[u8]) {
+pub(crate) fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, frame_bytes: &[u8]) {
     // Fresh per-link ephemeral X25519 key material for answering a link request.
     // Drawn from the TRNG *before* taking the transport lock: a TRNG IPC is a
     // blocking service call, and blocking while holding the transport mutex
@@ -913,7 +918,7 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
         // falling back to its propagation node (sent per packet, including
         // retransmits, before any dedup — mirrors LXMRouter.delivery_packet).
         Event::Data { destination_hash, plaintext, proof } => {
-            write_to_hub(shared, &proof);
+            broadcast_out(shared, &proof);
             let mut lxmf_bytes = destination_hash.to_vec();
             lxmf_bytes.extend_from_slice(&plaintext);
             deliver_lxmf(shared, chat_cid, pddb, trng, &lxmf_bytes, true);
@@ -922,7 +927,7 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
         // starts transmitting the message over the link.
         Event::LinkEstablished { link_id, proof } => {
             log::info!("accepted inbound link {}", hex(&link_id));
-            write_to_hub(shared, &proof);
+            broadcast_out(shared, &proof);
             // Transient status only — NOT a persisted post. A persisted
             // "receiving" line per link was confusing on retransmits (a new link
             // is established each retry, but the message itself is de-duplicated),
@@ -934,7 +939,7 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
         // blob. Send the packet proof back so the sender confirms delivery (and
         // stops retrying / tearing the link down).
         Event::LinkData { link_id, plaintext, proof } => {
-            write_to_hub(shared, &proof);
+            broadcast_out(shared, &proof);
             {
                 // traffic on the link = the backchannel (if any) is alive
                 let mut b = plock(&shared.backchannels);
@@ -984,7 +989,7 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
         // Echo the initiator's keepalive so it doesn't stale the link out —
         // and note the link (hence backchannel) is alive.
         Event::LinkKeepalive { link_id, reply } => {
-            write_to_hub(shared, &reply);
+            broadcast_out(shared, &reply);
             let mut b = plock(&shared.backchannels);
             for (_, (lid, seen)) in b.iter_mut() {
                 if *lid == link_id {
@@ -1006,7 +1011,7 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
             crate::fill_random(trng, &mut iv);
             let rtt = { plock(&shared.transport).make_link_rtt(&link_id, &iv) };
             if let Some(rtt) = rtt {
-                write_to_hub(shared, &rtt);
+                broadcast_out(shared, &rtt);
             }
             // Identify ourselves on links to PEERS (the PN flow identifies
             // during sync) so their replies can ride this link back — the
@@ -1018,7 +1023,7 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
                 crate::fill_random(trng, &mut iiv);
                 let idp = { plock(&shared.transport).make_out_link_identify(&link_id, &iiv) };
                 if let Some(idp) = idp {
-                    write_to_hub(shared, &idp);
+                    broadcast_out(shared, &idp);
                 }
             }
             sync_on_link_up(shared, chat_cid, trng, link_id, target);
@@ -1042,7 +1047,7 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
                 let packets = { plock(&shared.transport).serve_link_resource(&link_id, &plaintext, &iv) };
                 if !packets.is_empty() {
                     for p in packets {
-                        write_to_hub(shared, &p);
+                        broadcast_out(shared, &p);
                     }
                     return;
                 }
@@ -1251,7 +1256,7 @@ fn inbound_resource(
                     // Bind first: don't hold the transport guard across the write.
                     let raw = { plock(&shared.transport).make_in_link_resource_proof(&link_id, &proof) };
                     if let Some(raw) = raw {
-                        write_to_hub(shared, &raw);
+                        broadcast_out(shared, &raw);
                     }
                     deliver_lxmf(shared, chat_cid, pddb, trng, &payload, true);
                 }
@@ -1286,7 +1291,7 @@ fn inbound_resource(
             // Bind first: never hold the transport guard across hub writes.
             let packets = { plock(&shared.transport).serve_link_resource(&link_id, &plaintext, &iv) };
             for p in packets {
-                write_to_hub(shared, &p);
+                broadcast_out(shared, &p);
             }
         }
         _ => log::debug!("inbound link {} resource ctx=0x{context:02x} ignored", hex(&link_id)),
@@ -1314,7 +1319,7 @@ fn make_resource_on_link(
     let made =
         { plock(&shared.transport).make_link_resource(link_id, data, r, prefix, &iv, &adv_iv) };
     let (adv, hash) = made?;
-    write_to_hub(shared, &adv);
+    broadcast_out(shared, &adv);
     Some(hash)
 }
 
@@ -1395,7 +1400,7 @@ fn outlink_resource(
                 Ok((payload, proof)) => {
                     let raw = { plock(&shared.transport).make_out_link_resource_proof(&link_id, &proof) };
                     if let Some(raw) = raw {
-                        write_to_hub(shared, &raw);
+                        broadcast_out(shared, &raw);
                     }
                     deliver_lxmf(shared, chat_cid, pddb, trng, &payload, true);
                 }
@@ -1431,7 +1436,7 @@ fn send_in_link_request(shared: &Arc<Shared>, trng: &Trng, link_id: &[u8; TRUNCA
     crate::fill_random(trng, &mut iv);
     let raw = { plock(&shared.transport).make_in_link_context(link_id, CONTEXT_RESOURCE_REQ, req, &iv) };
     if let Some(raw) = raw {
-        write_to_hub(shared, &raw);
+        broadcast_out(shared, &raw);
     }
 }
 
@@ -1441,7 +1446,7 @@ fn send_out_link_request(shared: &Arc<Shared>, trng: &Trng, link_id: &[u8; TRUNC
     crate::fill_random(trng, &mut iv);
     let raw = { plock(&shared.transport).make_out_link_context(link_id, CONTEXT_RESOURCE_REQ, req, &iv) };
     if let Some(raw) = raw {
-        write_to_hub(shared, &raw);
+        broadcast_out(shared, &raw);
     }
 }
 
@@ -1732,7 +1737,7 @@ pub fn keepalive_thread(shared: Arc<Shared>, chat_cid: CID) {
                 }
             }
             if ticks % KEEPALIVE_TICKS == 0 {
-                write_to_hub(&shared, &[]);
+                broadcast_out(&shared, &[]);
             }
         }
     }
@@ -1761,7 +1766,7 @@ pub fn request_peer_key(shared: &Arc<Shared>, trng: &Trng, target: &[u8; TRUNCAT
     let mut tag = [0u8; TRUNCATED_HASHLENGTH];
     crate::fill_random(trng, &mut tag);
     let raw = { plock(&shared.transport).make_path_request(target, &tag) };
-    let ok = write_to_hub(shared, &raw);
+    let ok = broadcast_out(shared, &raw);
     if ok {
         log::info!("sent path request for {}", hex(target));
     } else {
@@ -1799,6 +1804,23 @@ pub(crate) fn plock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// then shuts the socket down out from under it, erroring the write out.
 const WRITE_STUCK_SECS: u32 = 20;
 
+/// Send a raw RNS packet out every interface we have: HDLC-framed to the hub
+/// TCP connection, and as one UDP datagram to each live AutoInterface peer.
+/// This is the app's single outbound choke point — link proofs, announces,
+/// path requests and data all leave through here, so a packet a local peer is
+/// waiting for (e.g. our LRPROOF to their link request) reaches them even with
+/// no hub connection. Receivers de-duplicate by packet hash, so a peer
+/// reachable both ways getting two copies is fine (normal RNS leaf behavior).
+///
+/// Returns true if at least one interface accepted the bytes. An empty `raw`
+/// is the hub TCP keepalive — meaningless as a datagram, so it skips UDP
+/// (AutoInterface peering has its own liveness: the discovery tokens).
+pub(crate) fn broadcast_out(shared: &Arc<Shared>, raw: &[u8]) -> bool {
+    let hub_ok = hub_write(shared, raw);
+    let auto_ok = crate::autoiface::send_to_peers(shared, raw);
+    hub_ok || auto_ok
+}
+
 /// Frame and write `raw` to the hub. Returns true only if the bytes were fully
 /// written; false if there is no connection, the writer was busy too long, or
 /// the write failed (callers that need delivery — like the sync state machine —
@@ -1808,7 +1830,7 @@ const WRITE_STUCK_SECS: u32 = 20;
 /// wait (a healthy write completes in milliseconds; a longer hold means a wedged
 /// write that the watchdog will kill), and the write itself is marked in
 /// `write_started` so the watchdog can detect and break a hang.
-pub(crate) fn write_to_hub(shared: &Arc<Shared>, raw: &[u8]) -> bool {
+pub(crate) fn hub_write(shared: &Arc<Shared>, raw: &[u8]) -> bool {
     use core::sync::atomic::Ordering;
     let framed = frame(raw);
     let mut guard = None;
@@ -2043,7 +2065,7 @@ fn send_link_request(
     match raw {
         None => LinkReqOutcome::Pending,
         Some((raw, link_id)) => {
-            if write_to_hub(shared, &raw) {
+            if broadcast_out(shared, &raw) {
                 LinkReqOutcome::Sent
             } else {
                 // Nothing went out: drop the pending entry make_link_request
@@ -2087,7 +2109,7 @@ fn sync_send_identify_and_list(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng,
     // hub write below.
     let idp = { plock(&shared.transport).make_out_link_identify(&link_id, &iv) };
     if let Some(idp) = idp {
-        write_to_hub(shared, &idp);
+        broadcast_out(shared, &idp);
     }
     // `/get [None, None]` → list of transient ids.
     sync_send_get(shared, trng, link_id, Value::Array(vec![Value::Nil, Value::Nil]));
@@ -2103,7 +2125,7 @@ fn sync_send_get(shared: &Arc<Shared>, trng: &Trng, link_id: [u8; TRUNCATED_HASH
     // Bind before testing (scrutinee guards outlive the body in edition 2021).
     let raw = { plock(&shared.transport).make_out_link_context(&link_id, CONTEXT_REQUEST, &packed, &iv) };
     if let Some(raw) = raw {
-        write_to_hub(shared, &raw);
+        broadcast_out(shared, &raw);
     }
 }
 
@@ -2225,7 +2247,7 @@ fn sync_on_outlink_data(
                     // Bind first: don't hold the transport guard across the write.
                     let raw = { plock(&shared.transport).make_out_link_resource_proof(&link_id, &proof) };
                     if let Some(raw) = raw {
-                        write_to_hub(shared, &raw);
+                        broadcast_out(shared, &raw);
                     }
                     plock(&shared.sync).receiver = None;
                     if let Some(resp) = parse_rns_response(&payload) {
@@ -2656,7 +2678,7 @@ fn browser_send_request(
     let raw = { plock(&shared.transport).make_out_link_context(&link_id, CONTEXT_REQUEST, &packed, &iv) };
     match raw {
         Some(raw) => {
-            if !write_to_hub(shared, &raw) {
+            if !broadcast_out(shared, &raw) {
                 browser_finish(shared, chat_cid, "hub write failed — try again");
             }
         }
@@ -2776,7 +2798,7 @@ fn browser_on_outlink_data(
                 Ok((payload, proof)) => {
                     let raw = { plock(&shared.transport).make_out_link_resource_proof(&link_id, &proof) };
                     if let Some(raw) = raw {
-                        write_to_hub(shared, &raw);
+                        broadcast_out(shared, &raw);
                     }
                     plock(&shared.browser).receiver = None;
                     if let Some(resp) = parse_rns_response(&payload) {
@@ -3602,7 +3624,7 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                 let sent = { plock(&shared.transport).make_link_data(&link, &blob, &div) };
                 match sent {
                     Some((raw, packet_hash)) => {
-                        write_to_hub(shared, &raw);
+                        broadcast_out(shared, &raw);
                         outbox[i].in_flight = Some(packet_hash);
                         outbox[i].tried_pn = true;
                         outbox[i].next_action = now + PROOF_TIMEOUT;
@@ -3648,7 +3670,7 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                         let made = { plock(&shared.transport).make_link_data(&lid, &outbox[i].packed, &iv) };
                         match made {
                             Some((raw, packet_hash)) => {
-                                write_to_hub(shared, &raw);
+                                broadcast_out(shared, &raw);
                                 outbox[i].in_flight = Some(packet_hash);
                                 outbox[i].attempts += 1;
                                 outbox[i].next_action = now + DELIVERY_RETRY;
@@ -3710,7 +3732,7 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                                             .make_in_link_data(&lid, &outbox[i].packed, &iv)
                                     };
                                     if let Some((raw, packet_hash)) = made {
-                                        write_to_hub(shared, &raw);
+                                        broadcast_out(shared, &raw);
                                         outbox[i].in_flight = Some(packet_hash);
                                         outbox[i].attempts += 1;
                                         outbox[i].next_action = now + DELIVERY_RETRY;

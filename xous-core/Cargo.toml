@@ -152,7 +152,9 @@ exclude = [
   # This directory is dedicated to out-of-tree tests and examples
   "planning/",
   # This is for signing images, and requires dependencies that are incompatible with Xous
-  "signing/fido-signer"
+  "signing/fido-signer",
+  # Vendored smoltcp 0.11.0 with an IPv6 multicast RX patch (see [patch.crates-io])
+  "imports/smoltcp",
 ]
 
 [profile.release]
@@ -191,6 +193,11 @@ branch = "main"
 
 [patch.crates-io.getrandom]
 path = "imports/getrandom"
+
+# Vendored 0.11.0 + IPv6 multicast group RX support (join_multicast_group_v6),
+# needed by the net service for Reticulum AutoInterface discovery.
+[patch.crates-io.smoltcp]
+path = "imports/smoltcp"
 
 [patch.crates-io.ring]
 # path = "../ring-xous" # for local dev only

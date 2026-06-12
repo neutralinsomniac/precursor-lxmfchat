@@ -43,8 +43,15 @@ pub(crate) fn std_udp_bind(
     let handle = sockets.add(udp_socket);
     let udp_socket = sockets.get_mut::<udp::Socket>(handle);
 
-    // Attempt to connect, returning the error if there is one
-    if let Err(e) = udp_socket.bind(IpEndpoint { addr: address, port: local_port }).map_err(|e| match e {
+    // Attempt to connect, returning the error if there is one. An unspecified
+    // address (0.0.0.0 / ::) is a true wildcard listen; `From<IpEndpoint> for
+    // IpListenEndpoint` would instead bind the literal unspecified address,
+    // which never matches a unicast destination in `udp::Socket::accepts`.
+    let listen_endpoint = smoltcp::wire::IpListenEndpoint {
+        addr: if address.is_unspecified() { None } else { Some(address) },
+        port: local_port,
+    };
+    if let Err(e) = udp_socket.bind(listen_endpoint).map_err(|e| match e {
         smoltcp::socket::udp::BindError::InvalidState => NetError::SocketInUse,
         smoltcp::socket::udp::BindError::Unaddressable => NetError::Unaddressable,
     }) {

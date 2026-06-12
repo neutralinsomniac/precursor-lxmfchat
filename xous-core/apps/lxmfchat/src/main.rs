@@ -62,6 +62,7 @@ fn wrapped_main() -> ! {
     chat.menu_add(menu_item("Rename contact", MenuOp::RenameContact)).ok();
     chat.menu_add(menu_item("Import contact", MenuOp::ImportContact)).ok();
     chat.menu_add(menu_item("Connect", MenuOp::Connect)).ok();
+    chat.menu_add(menu_item("Local peers", MenuOp::LocalPeers)).ok();
     chat.menu_add(menu_item("Announce", MenuOp::Announce)).ok();
     chat.menu_add(menu_item("My address", MenuOp::MyAddress)).ok();
     chat.menu_add(menu_item("My name", MenuOp::SetName)).ok();
@@ -139,6 +140,7 @@ fn wrapped_main() -> ! {
                         Some(MenuOp::RenameContact) => app.rename_contact_interactive(&modals),
                         Some(MenuOp::ImportContact) => app.import_contact_interactive(&modals),
                         Some(MenuOp::Connect) => app.connect(),
+                        Some(MenuOp::LocalPeers) => app.toggle_local_peers(),
                         Some(MenuOp::Announce) => app.announce(),
                         Some(MenuOp::MyAddress) => {
                             modals

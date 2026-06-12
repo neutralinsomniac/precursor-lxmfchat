@@ -6,6 +6,7 @@
 //! and posts inbound LXMF messages into the chat UI; the main thread sends
 //! announces and outbound messages.
 
+pub mod autoiface;
 mod net;
 
 use std::collections::BTreeMap;
@@ -47,6 +48,10 @@ const BOOKMARKS_DICT: &str = "lxmf.bookmarks";
 const KEY_IDENTITY: &str = "identity";
 const KEY_HUB: &str = "hub";
 const KEY_PEER: &str = "peer";
+/// Whether AutoInterface (local-network peer discovery, no hub needed) is on
+/// ("1"/"0"). Off by default: it announces multicast every 1.6 s while
+/// enabled, which keeps the radio busier.
+const KEY_AUTOIFACE: &str = "autoiface";
 /// PDDB key for our announced display name.
 const KEY_NAME: &str = "name";
 /// Display name announced when none has been set yet.
@@ -223,6 +228,8 @@ impl<'a> LxmfChat<'a> {
             ticket_pending: Mutex::new(BTreeMap::new()),
             outbox: Mutex::new(Vec::new()),
             delivery_updates: Mutex::new(delivery_map),
+            auto: Mutex::new(autoiface::AutoState::new()),
+            auto_enabled: core::sync::atomic::AtomicBool::new(false),
         });
 
         // Open the last conversation we were in (if any), else a welcome thread.
@@ -290,6 +297,11 @@ impl<'a> LxmfChat<'a> {
             let browse = self.shared.clone();
             let browse_cid = self.chat_cid;
             std::thread::spawn(move || net::browser_thread(browse, browse_cid));
+            // Local peer discovery (AutoInterface), if it was on last run; comes
+            // up in the background once wifi has an address.
+            if read_string(&self.pddb, KEY_AUTOIFACE).as_deref() == Some("1") {
+                autoiface::start_background(&self.shared, self.chat_cid);
+            }
             return;
         }
         // Manager already running: force the connection down so it reconnects
@@ -301,6 +313,19 @@ impl<'a> LxmfChat<'a> {
             &format!("reconnecting to {}…", self.hub),
             "reconnect requested",
         );
+    }
+
+    /// Toggle AutoInterface — zero-conf discovery of (and messaging with)
+    /// Reticulum peers on the local wifi network, hub or no hub. Persisted.
+    pub fn toggle_local_peers(&mut self) {
+        if autoiface::enabled(&self.shared) {
+            autoiface::stop(&self.shared, self.chat_cid);
+            write_string(&self.pddb, KEY_AUTOIFACE, "0");
+        } else if autoiface::start(&self.shared, self.chat_cid) {
+            write_string(&self.pddb, KEY_AUTOIFACE, "1");
+        }
+        // A failed start (no wifi yet) painted its reason; not persisted, so a
+        // user choice is never silently lost across a retry.
     }
 
     /// Announce our lxmf.delivery destination on the hub.
@@ -1159,14 +1184,14 @@ impl<'a> LxmfChat<'a> {
     }
 
     /// Send a raw packet to the hub from the MAIN (UI) thread. Routed through
-    /// `net::write_to_hub`, whose bounded mutex wait + stuck-write watchdog mean
+    /// `net::broadcast_out` (hub + local peers), whose bounded mutex wait + stuck-write watchdog mean
     /// this can delay the UI a couple of seconds at worst, never freeze it.
     fn write_framed(&self, raw: &[u8]) -> bool {
         if !self.shared.connected.load(core::sync::atomic::Ordering::SeqCst) {
             self.chat.set_status_text("not connected (menu → Connect)");
             return false;
         }
-        if net::write_to_hub(&self.shared, raw) {
+        if net::broadcast_out(&self.shared, raw) {
             true
         } else {
             self.chat.set_status_text("send failed (connection resetting…)");

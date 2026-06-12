@@ -62,6 +62,32 @@ enum WaitOp {
     Quit,
 }
 
+/// The EUI-64 link-local IPv6 address (fe80::/64) for the interface's MAC,
+/// required for link-local IPv6 communications (e.g. Reticulum AutoInterface
+/// peer discovery). Derived from the same hardware address the interface was
+/// configured with, which may be a randomized stand-in when the EC's MAC is
+/// bogus.
+fn ipv6_link_local(iface: &Interface) -> Option<IpCidr> {
+    match iface.hardware_addr() {
+        HardwareAddress::Ethernet(mac) => {
+            let m = mac.as_bytes();
+            let mut b = [0u8; 16];
+            b[0] = 0xfe;
+            b[1] = 0x80;
+            b[8] = m[0] ^ 0x02;
+            b[9] = m[1];
+            b[10] = m[2];
+            b[11] = 0xff;
+            b[12] = 0xfe;
+            b[13] = m[3];
+            b[14] = m[4];
+            b[15] = m[5];
+            Some(IpCidr::new(IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from_bytes(&b)), 64))
+        }
+        _ => None,
+    }
+}
+
 /// PingConnection can return a Scalar: because of the simplicity of the return data
 /// we give implementors the option to unpack the Scalar themselves within the main loop
 /// of their event handler, *or* they can create a dedicated server that handles the return
@@ -218,6 +244,11 @@ fn main() -> ! {
     });
     let device_caps = device.capabilities();
     let mut iface = Interface::new(config, &mut device, Instant::from_millis(timer.elapsed_ms() as i64));
+    if let Some(ll) = ipv6_link_local(&iface) {
+        iface.update_ip_addrs(|ip_addrs| {
+            ip_addrs.push(ll).ok();
+        });
+    }
 
     // Create sockets
     let icmp_rx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
@@ -354,6 +385,11 @@ fn main() -> ! {
                             &mut device,
                             Instant::from_millis(timer.elapsed_ms() as i64),
                         );
+                        if let Some(ll) = ipv6_link_local(&iface) {
+                            iface.update_ip_addrs(|ip_addrs| {
+                                ip_addrs.push(ll).ok();
+                            });
+                        }
                         config_valid = true;
                     } else {
                         // else, config_valid stays false, and we try again next time around
@@ -1110,6 +1146,7 @@ fn main() -> ! {
 
                                     if config.addr != [127, 0, 0, 1] {
                                         // note: ARP cache is stale. Maybe that's ok?
+                                        let ll = ipv6_link_local(&iface);
                                         iface.update_ip_addrs(|ip_addrs| {
                                             ip_addrs.clear();
                                             ip_addrs
@@ -1127,6 +1164,10 @@ fn main() -> ! {
                                             ip_addrs
                                                 .push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8))
                                                 .unwrap();
+                                            // ...and the IPv6 link-local address
+                                            if let Some(ll) = ll {
+                                                ip_addrs.push(ll).unwrap();
+                                            }
                                         });
                                     } else {
                                         log::warn!("Attempt to update the loopback interface! Ignoring.");
@@ -1938,6 +1979,29 @@ fn main() -> ! {
                     }
                     _ => (),
                 };
+            }),
+            Some(Opcode::JoinMulticastV6) => msg_blocking_scalar_unpack!(msg, a0, a1, a2, a3, {
+                let mut b = [0u8; 16];
+                for (chunk, word) in b.chunks_mut(4).zip([a0, a1, a2, a3]) {
+                    chunk.copy_from_slice(&(word as u32).to_be_bytes());
+                }
+                let group = smoltcp::wire::Ipv6Address::from_bytes(&b);
+                let ok = iface.join_multicast_group_v6(group);
+                if ok {
+                    log::info!("joined IPv6 multicast group {}", group);
+                } else {
+                    log::warn!("IPv6 multicast group table full, can't join {}", group);
+                }
+                xous::return_scalar(msg.sender, if ok { 1 } else { 0 }).ok();
+            }),
+            Some(Opcode::LeaveMulticastV6) => msg_blocking_scalar_unpack!(msg, a0, a1, a2, a3, {
+                let mut b = [0u8; 16];
+                for (chunk, word) in b.chunks_mut(4).zip([a0, a1, a2, a3]) {
+                    chunk.copy_from_slice(&(word as u32).to_be_bytes());
+                }
+                let group = smoltcp::wire::Ipv6Address::from_bytes(&b);
+                let ok = iface.leave_multicast_group_v6(group);
+                xous::return_scalar(msg.sender, if ok { 1 } else { 0 }).ok();
             }),
             Some(Opcode::Reset) => {
                 // reset the DHCP address

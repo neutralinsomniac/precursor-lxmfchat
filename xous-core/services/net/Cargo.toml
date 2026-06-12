@@ -57,6 +57,9 @@ features = [
   "socket-icmp",
   "socket-udp",
   "socket-tcp",
+  # one extra address slot for the IPv6 link-local (fe80::) address, alongside
+  # the DHCP IPv4 address and the loopback address
+  "iface-max-addr-count-3",
 ]
 
 [features]

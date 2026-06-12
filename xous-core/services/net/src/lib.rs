@@ -99,6 +99,33 @@ impl NetManager {
         .expect("couldn't send reset");
     }
 
+    /// Subscribe the network interface to an IPv6 multicast group so inbound
+    /// packets addressed to it are accepted (libstd's `UdpSocket::join_multicast_v6`
+    /// is a stub on Xous). Returns Ok(false) if the group table is full.
+    pub fn join_multicast_v6(&self, group: core::net::Ipv6Addr) -> Result<bool, xous::Error> {
+        self.multicast_v6_op(Opcode::JoinMulticastV6, group)
+    }
+
+    /// Unsubscribe the network interface from an IPv6 multicast group.
+    pub fn leave_multicast_v6(&self, group: core::net::Ipv6Addr) -> Result<bool, xous::Error> {
+        self.multicast_v6_op(Opcode::LeaveMulticastV6, group)
+    }
+
+    fn multicast_v6_op(&self, op: Opcode, group: core::net::Ipv6Addr) -> Result<bool, xous::Error> {
+        let o = group.octets();
+        let mut words = [0usize; 4];
+        for (i, word) in words.iter_mut().enumerate() {
+            *word = u32::from_be_bytes([o[i * 4], o[i * 4 + 1], o[i * 4 + 2], o[i * 4 + 3]]) as usize;
+        }
+        match send_message(
+            self.netconn.conn(),
+            Message::new_blocking_scalar(op.to_usize().unwrap(), words[0], words[1], words[2], words[3]),
+        )? {
+            xous::Result::Scalar1(r) => Ok(r == 1),
+            _ => Err(xous::Error::InternalError),
+        }
+    }
+
     /// This is the function that the system should be using to check the wifi state -- it will read
     /// the cached value from the connection manager. The direct call to the COM could cause too much
     /// congestion.
