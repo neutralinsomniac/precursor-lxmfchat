@@ -695,7 +695,7 @@ impl Ui {
         } else {
             // Walk backward until another screenful of (cached) heights is
             // behind the old top.
-            let budget = self.vp.layout_screensize.y as u32;
+            let (_, _, budget) = self.doc_metrics();
             let mut used = 0u32;
             let mut i = top;
             while i > 0 {
@@ -800,10 +800,23 @@ impl Ui {
         h
     }
 
-    /// Lines [top..] that fit on screen, by cached heights (no drawing).
+    /// The document's drawable area: (first y, bottom y, height budget).
+    /// Measured against FRESH canvas bounds every time: the IME input box
+    /// GROWS INTO the content canvas when it has held multi-line text (and
+    /// the canvas stays shrunk), so the startup bounds in `vp` can be a full
+    /// line taller than what is actually on screen — paging by the stale
+    /// budget skipped the line hidden under the input box.
+    fn doc_metrics(&self) -> (isize, isize, u32) {
+        let size = self.gam.get_canvas_bounds(self.vp.canvas).unwrap_or(self.vp.total_screensize);
+        let y0 = self.vp.status_height as isize + self.vp.margin.y;
+        let bottom = size.y;
+        (y0, bottom, (bottom - y0).max(0) as u32)
+    }
+
+    /// Lines [top..] that fit FULLY on screen, by cached heights (no drawing).
     fn doc_visible_count(&mut self, top: usize) -> usize {
         let total = self.document.as_ref().map(|d| d.lines.len()).unwrap_or(0);
-        let budget = self.vp.layout_screensize.y as u32;
+        let (_, _, budget) = self.doc_metrics();
         let mut used = 0u32;
         let mut n = 0;
         for i in top..total {
@@ -850,8 +863,10 @@ impl Ui {
             )
             .expect("can't clear canvas area");
 
-        let bottom = self.vp.status_height as isize + self.vp.layout_screensize.y;
-        let mut y = self.vp.status_height as isize + self.vp.margin.y;
+        // Fresh metrics: the draw cutoff must agree with doc_visible_count or
+        // paging diverges from what was actually shown.
+        let (y0, bottom, _) = self.doc_metrics();
+        let mut y = y0;
         for i in top..total {
             if y >= bottom {
                 break;
