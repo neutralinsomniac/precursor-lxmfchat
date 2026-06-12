@@ -648,17 +648,53 @@ impl Ui {
         self.doc_staging = None;
     }
 
-    /// Move the document cursor one line and keep it visible.
+    /// True when document line `i` is a link line.
+    fn doc_is_link(&self, i: usize) -> bool {
+        self.document
+            .as_ref()
+            .and_then(|d| d.lines.get(i))
+            .map(|l| l.kind == DOC_KIND_LINK)
+            .unwrap_or(false)
+    }
+
+    /// Move the document cursor to the adjacent LINK on the current screen;
+    /// with no further link in that direction, page instead and land on the
+    /// nearest link of the new screen (its edge line when it has none). So
+    /// ↑/↓ alone walk a whole page: hop the visible links, then scroll.
     pub(crate) fn doc_cursor(&mut self, next: bool) {
-        let Some(doc) = self.document.as_ref() else { return };
-        if doc.lines.is_empty() {
+        let (top, cursor, total) = match self.document.as_ref() {
+            Some(d) if !d.lines.is_empty() => (d.top, d.cursor, d.lines.len()),
+            _ => return,
+        };
+        let end = (top + self.doc_visible_count(top)).min(total); // exclusive
+        let target = if next {
+            ((cursor + 1).max(top)..end).find(|&i| self.doc_is_link(i))
+        } else {
+            (top..cursor.min(end)).rev().find(|&i| self.doc_is_link(i))
+        };
+        if let Some(i) = target {
+            if let Some(doc) = self.document.as_mut() {
+                doc.cursor = i;
+            }
             return;
         }
-        let last = doc.lines.len() - 1;
-        let cursor = doc.cursor;
-        let cursor = if next { (cursor + 1).min(last) } else { cursor.saturating_sub(1) };
+        // No further link this screen: page (no-op at the document's edge).
+        self.doc_page(next);
+        let new_top = match self.document.as_ref() {
+            Some(d) => d.top,
+            None => return,
+        };
+        if new_top == top {
+            return; // already at the edge — keep the cursor where it was
+        }
+        let new_end = (new_top + self.doc_visible_count(new_top)).min(total);
+        let landing = if next {
+            (new_top..new_end).find(|&i| self.doc_is_link(i))
+        } else {
+            (new_top..new_end).rev().find(|&i| self.doc_is_link(i))
+        };
         if let Some(doc) = self.document.as_mut() {
-            doc.cursor = cursor;
+            doc.cursor = landing.unwrap_or(new_top);
         }
     }
 
