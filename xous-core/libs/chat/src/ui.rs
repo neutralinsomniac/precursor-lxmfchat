@@ -827,11 +827,11 @@ impl Ui {
     }
 
     /// The document's drawable area: (first y, bottom y, height budget).
-    /// Measured against FRESH canvas bounds every time: the IME input box
-    /// GROWS INTO the content canvas when it has held multi-line text (and
-    /// the canvas stays shrunk), so the startup bounds in `vp` can be a full
-    /// line taller than what is actually on screen — paging by the stale
-    /// budget skipped the line hidden under the input box.
+    /// Measured against FRESH canvas bounds every time, because the content
+    /// canvas changes size out from under the startup bounds in `vp`: the
+    /// input box is hidden in document mode (the canvas GROWS past `vp`),
+    /// and outside it the IME can have grown the input into the content
+    /// area. Stale bounds made paging skip lines that were never shown.
     fn doc_metrics(&self) -> (isize, isize, u32) {
         let size = self.gam.get_canvas_bounds(self.vp.canvas).unwrap_or(self.vp.total_screensize);
         let y0 = self.vp.status_height as isize + self.vp.margin.y;
