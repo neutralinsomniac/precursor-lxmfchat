@@ -186,8 +186,13 @@ pub struct SyncState {
     receiver: Option<ResourceReceiver>,
     /// Wall-clock deadline; sync aborts if it stalls past this.
     deadline: u64,
-    /// One-shot guard so we auto-sync only once per app run (on first connect).
+    /// One-shot guard so we auto-sync only once per app run.
     auto_done: bool,
+    /// Earliest time to (re)probe for the propagation node's route while the
+    /// auto-sync is still pending. The hub connect path requests it too, but a
+    /// local-only session has no connect event — the sync thread probes over
+    /// whatever interface is up.
+    pn_probe_at: u64,
     /// Set by [`request_sync`] (the menu, on the main thread) and consumed by the
     /// pump thread, so the actual link + hub writes never run on the main thread
     /// (a blocking hub write there would freeze the whole UI).
@@ -214,6 +219,7 @@ impl SyncState {
             receiver: None,
             deadline: 0,
             auto_done: false,
+            pn_probe_at: 0,
             requested: false,
             next_attempt: 0,
             route_tries: 0,
@@ -1911,6 +1917,8 @@ const SYNC_DEADLINE_SECS: u64 = 120;
 /// (~1 min), then fail visibly.
 const SYNC_ROUTE_RETRY_SECS: u64 = 3;
 const SYNC_ROUTE_TRIES: u8 = 20;
+/// Cadence for the pending-auto-sync route probe (see `SyncState::pn_probe_at`).
+const PN_PROBE_RETRY_SECS: u64 = 30;
 
 /// Begin a propagation-node sync (from the menu or auto on first connect). Ensures
 /// the node's key + route, (re)uses or opens the link, and kicks the exchange.
@@ -3361,19 +3369,36 @@ fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
         start_sync(shared, chat_cid, trng); // handles not-ready / already-running itself
         return;
     }
-    // Auto-sync once per app run, as soon as the node becomes reachable.
+    // Auto-sync once per app run, as soon as the node becomes reachable over
+    // ANY interface.
     if AUTO_SYNC_ON_CONNECT {
         let go = {
             let s = plock(&shared.sync);
             !s.auto_done && s.phase == SyncPhase::Idle
         };
-        let ready = go && {
+        if !go {
+            return;
+        }
+        let ready = {
             let tp = plock(&shared.transport);
             tp.known(&pn).is_some() && tp.has_path(&pn)
         };
         if ready {
             plock(&shared.sync).auto_done = true;
             start_sync(shared, chat_cid, trng);
+        } else if any_interface_up(shared) {
+            let probe = {
+                let mut s = plock(&shared.sync);
+                if now >= s.pn_probe_at {
+                    s.pn_probe_at = now + PN_PROBE_RETRY_SECS;
+                    true
+                } else {
+                    false
+                }
+            };
+            if probe {
+                request_peer_key(shared, trng, &pn);
+            }
         }
     }
 }
