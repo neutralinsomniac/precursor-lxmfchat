@@ -390,6 +390,10 @@ pub(crate) fn recompute_canvases(canvases: &HashMap<Gid, Canvas>) {
                         log::debug!("  -> Restoring previous defacement to avoid thrashing");
                         candidate.do_defaced().unwrap();
                     }
+                    // Not-drawable (and any prior defacement restored) is final for
+                    // this pass; checking further regions can only call do_defaced()
+                    // a second time, which returns DoubleFree and panics the GAM.
+                    break;
                 }
             }
             higher_clipregions.push(candidate);
