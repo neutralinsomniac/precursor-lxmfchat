@@ -39,11 +39,22 @@ const DISCOVERY_PORT: u16 = 29716;
 const UNICAST_DISCOVERY_PORT: u16 = 29717;
 /// Destination port for data (raw RNS packets).
 const DATA_PORT: u16 = 42671;
-/// How often we multicast our discovery token.
-const ANNOUNCE_INTERVAL_MS: u64 = 1600;
+/// How often we multicast our discovery token. The reference beacons every
+/// 1.6 s, but that's a discovery-latency choice for mains-powered nodes, not
+/// a protocol requirement — the contract is only that peers hear *some* token
+/// from us inside their 22 s peering timeout, and after first contact the
+/// unicast reverse-peering tokens (5.2 s) carry that duty. 10 s keeps us
+/// inside every window with a retry to spare (2 beacons per 22 s), matches
+/// the hub keepalive cadence (no extra radio wakeups), and only costs a new
+/// peer up to ~10 s to notice us.
+const ANNOUNCE_INTERVAL_MS: u64 = 10_000;
 /// How often we send reverse-peering tokens to each known peer
-/// (ANNOUNCE_INTERVAL × 3.25, per the reference).
+/// (reference: ANNOUNCE_INTERVAL × 3.25 = 5.2 s — kept at the reference value
+/// since it, not our slower beacon, is what keeps established peers alive).
 const REVERSE_INTERVAL_MS: u64 = 5200;
+/// Housekeeping cadence (peer expiry, reverse-peering checks). A thread
+/// wakeup with no TX is cheap; this just bounds how stale the checks can be.
+const TICK_MS: u64 = 2600;
 /// A peer silent this long is dropped.
 const PEERING_TIMEOUT_SECS: u64 = 22;
 /// Upper bound on tracked peers (a LAN party, not the open internet).
@@ -330,11 +341,13 @@ fn data_rx(shared: Arc<Shared>, chat_cid: CID, sock: UdpSocket) {
     }
 }
 
-/// Multicast our token every 1.6 s; reverse-peer to each known peer every
-/// 5.2 s; expire peers not heard from in 22 s.
+/// Multicast our token every [`ANNOUNCE_INTERVAL_MS`]; reverse-peer to each
+/// known peer every [`REVERSE_INTERVAL_MS`]; expire peers not heard from in
+/// [`PEERING_TIMEOUT_SECS`].
 fn announce_loop(shared: Arc<Shared>, _chat_cid: CID, group: Ipv6Addr) {
+    let mut last_beacon: u64 = 0;
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(ANNOUNCE_INTERVAL_MS));
+        std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
         if !enabled(&shared) {
             continue;
         }
@@ -347,9 +360,12 @@ fn announce_loop(shared: Arc<Shared>, _chat_cid: CID, group: Ipv6Addr) {
             _ => continue,
         };
         let token = discovery_token(GROUP_ID, &our_ll);
-        let dest = SocketAddrV6::new(group, DISCOVERY_PORT, 0, scope);
-        if let Err(e) = tx.send_to(&token, dest) {
-            log::warn!("multicast announce failed: {e}");
+        if now_secs().saturating_sub(last_beacon) * 1000 >= ANNOUNCE_INTERVAL_MS {
+            last_beacon = now_secs();
+            let dest = SocketAddrV6::new(group, DISCOVERY_PORT, 0, scope);
+            if let Err(e) = tx.send_to(&token, dest) {
+                log::warn!("multicast announce failed: {e}");
+            }
         }
 
         let now = now_secs();
