@@ -3357,6 +3357,17 @@ fn compute_pending_pn_blob(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) -> 
 /// or the propagation node once direct delivery has timed out), send it, and on
 /// proof timeout escalate direct→propagation→failed. Idempotent and cheap to call
 /// often (on a timer, on link-up, and right after enqueue).
+/// Status line for a direct link send. Every send paints one — a silent send
+/// looks hung from the bubble's ○ — and retries carry the attempt count so a
+/// stalled delivery shows visible progress instead of nothing for 50 seconds.
+fn send_status(label: &str, attempt: u8) -> String {
+    if attempt > 1 {
+        format!("{label}: sent over link, awaiting confirmation… (try {attempt}/{MAX_ATTEMPTS})")
+    } else {
+        format!("{label}: sent over link, awaiting confirmation…")
+    }
+}
+
 fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
     let pn = crate::propagation_node();
     let now = now_secs();
@@ -3408,7 +3419,19 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                 let label = peer_label(shared, &outbox[i].peer);
                 if !outbox[i].via_pn {
                     if outbox[i].attempts < MAX_ATTEMPTS {
-                        // re-send over the link (falls through to the send below)
+                        // Re-send (falls through to the send below) — but not
+                        // down the same link: no proof inside the window
+                        // usually means the link is dead (a TCP drop on the
+                        // peer's side sends no LINKCLOSE), so forget both
+                        // directions and let the re-send establish fresh.
+                        let peer = outbox[i].peer;
+                        plock(&shared.backchannels).remove(&peer);
+                        {
+                            let mut tp = plock(&shared.transport);
+                            if let Some(lid) = tp.outbound_link_for(&peer, now) {
+                                tp.drop_out_link(&lid);
+                            }
+                        }
                     } else if !outbox[i].tried_pn && pn.is_some() {
                         // Escalate to the propagation node with its OWN fresh time
                         // budget — the direct phase's spent time doesn't count
@@ -3429,6 +3452,18 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                     // budget (re-send / re-establish the link via the via_pn block
                     // below) rather than giving up on the first timeout — the PROP
                     // deadline check above fails it once that budget is exhausted.
+                    // The unproven link is as suspect as in the direct case: forget
+                    // it (unless a sync is mid-flight on it) so the retry
+                    // establishes a fresh one.
+                    if let Some(target) = pn {
+                        let sync_lid = { plock(&shared.sync).link_id };
+                        let mut tp = plock(&shared.transport);
+                        if let Some(lid) = tp.outbound_link_for(&target, now) {
+                            if sync_lid != Some(lid) {
+                                tp.drop_out_link(&lid);
+                            }
+                        }
+                    }
                     chat::cf_set_status_text(chat_cid, &format!("{label}: retrying propagation node…"));
                 }
             } else if now < outbox[i].next_action {
@@ -3562,10 +3597,7 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                                 outbox[i].in_flight = Some(packet_hash);
                                 outbox[i].attempts += 1;
                                 outbox[i].next_action = now + DELIVERY_RETRY;
-                                chat::cf_set_status_text(
-                                    chat_cid,
-                                    &format!("{label}: sent over link, awaiting confirmation…"),
-                                );
+                                chat::cf_set_status_text(chat_cid, &send_status(&label, outbox[i].attempts));
                             }
                             None => {
                                 // The link vanished between the two lock takes
@@ -3627,8 +3659,7 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                                         outbox[i].in_flight = Some(packet_hash);
                                         outbox[i].attempts += 1;
                                         outbox[i].next_action = now + DELIVERY_RETRY;
-                                        // No status line: the ✓ on the bubble is the
-                                        // user-visible signal; this is just transport.
+                                        chat::cf_set_status_text(chat_cid, &send_status(&label, outbox[i].attempts));
                                         log::info!("reply to {label} sent over their link {}", hex(&lid));
                                         i += 1;
                                         continue;
