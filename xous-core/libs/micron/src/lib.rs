@@ -15,6 +15,9 @@
 pub struct Document {
     /// From a `#!c=<seconds>` header line, if present.
     pub cache_secs: Option<u32>,
+    /// The page's de-facto name: micron has no title metadata, so this is the
+    /// text of the first heading line (e.g. ">Aleph Git").
+    pub title: Option<String>,
     pub lines: Vec<Line>,
     pub links: Vec<Link>,
 }
@@ -401,6 +404,12 @@ fn parse_hash(s: &str) -> Option<[u8; 16]> {
 }
 
 fn push_line(doc: &mut Document, text: String, style: Style, align: Align, kind: Kind) {
+    if doc.title.is_none() && matches!(style, Style::Heading(_)) {
+        let t = text.trim();
+        if !t.is_empty() {
+            doc.title = Some(t.to_string());
+        }
+    }
     if doc.lines.len() < MAX_LINES {
         doc.lines.push(Line { text, style, align, kind });
     }
@@ -526,6 +535,7 @@ mod tests {
              `!`[  • mirrors`:/page/group.mu`g=mirrors]`! (14 repositories)\n\
              `a`F666`[Served by rngit 1.3.5`:/page/index.mu] - Generated in 0s`f\n",
         );
+        assert_eq!(doc.title.as_deref(), Some("Aleph Git"));
         assert_eq!(doc.links.len(), 3);
         assert_eq!(
             doc.links[0],

@@ -275,6 +275,8 @@ pub struct BrowserState {
     back: Vec<PageAddr>,
     /// Links of the displayed page, indexed by the DocLine link id.
     pub links: Vec<micron::Link>,
+    /// The displayed page's title (its first heading), for bookmark labels.
+    current_title: Option<String>,
     /// Whether the document view is currently shown (the app's key handling
     /// switches to browser bindings while true).
     pub viewing: bool,
@@ -299,6 +301,7 @@ impl BrowserState {
             pending_pop: false,
             back: Vec::new(),
             links: Vec::new(),
+            current_title: None,
             viewing: false,
         }
     }
@@ -1048,7 +1051,7 @@ fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, f
             if is_sync_link {
                 sync_on_outlink_data(shared, chat_cid, pddb, trng, link_id, context, plaintext);
             } else if is_browser_link {
-                browser_on_outlink_data(shared, chat_cid, trng, link_id, context, plaintext);
+                browser_on_outlink_data(shared, chat_cid, pddb, trng, link_id, context, plaintext);
             } else {
                 outlink_resource(shared, chat_cid, pddb, trng, link_id, context, plaintext);
             }
@@ -2352,6 +2355,11 @@ pub fn current_page(shared: &Arc<Shared>) -> Option<PageAddr> {
     plock(&shared.browser).current.clone()
 }
 
+/// The shown page's title (its first heading), if it has one.
+pub fn current_page_title(shared: &Arc<Shared>) -> Option<String> {
+    plock(&shared.browser).current_title.clone()
+}
+
 /// Short human label for a node (saved/announced name, else a hex prefix).
 pub(crate) fn node_label(shared: &Arc<Shared>, node: &[u8; TRUNCATED_HASHLENGTH]) -> String {
     plock(&shared.saved_nodes)
@@ -2641,6 +2649,7 @@ fn browser_send_request(
 fn browser_on_outlink_data(
     shared: &Arc<Shared>,
     chat_cid: CID,
+    pddb: &Pddb,
     trng: &Trng,
     link_id: [u8; TRUNCATED_HASHLENGTH],
     context: u8,
@@ -2655,7 +2664,7 @@ fn browser_on_outlink_data(
     match context {
         CONTEXT_RESPONSE => {
             if let Some(resp) = parse_rns_response(&plaintext) {
-                page_received(shared, chat_cid, resp);
+                page_received(shared, chat_cid, pddb, resp);
             }
         }
         CONTEXT_RESOURCE_ADV => match ResourceReceiver::accept(&plaintext) {
@@ -2749,7 +2758,7 @@ fn browser_on_outlink_data(
                     }
                     plock(&shared.browser).receiver = None;
                     if let Some(resp) = parse_rns_response(&payload) {
-                        page_received(shared, chat_cid, resp);
+                        page_received(shared, chat_cid, pddb, resp);
                     }
                 }
                 Err(e) => {
@@ -2766,7 +2775,7 @@ fn browser_on_outlink_data(
 /// the chat lib's document view, and update the navigation state. The link is
 /// KEPT for follow-up fetches (page browsing is bursty; `outbound_link_for`
 /// reuses it, and stale links self-heal via LINKCLOSE / connection resets).
-fn page_received(shared: &Arc<Shared>, chat_cid: CID, resp: Value) {
+fn page_received(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, resp: Value) {
     let bytes: Vec<u8> = match &resp {
         Value::Int(code) => {
             let why = match *code {
@@ -2810,6 +2819,7 @@ fn page_received(shared: &Arc<Shared>, chat_cid: CID, resp: Value) {
     }
 
     // Update the navigation state and pull out what the render needs.
+    let page_title = doc.title.clone();
     let (node, path, entering) = {
         let mut b = plock(&shared.browser);
         let node = match b.node {
@@ -2834,6 +2844,7 @@ fn page_received(shared: &Arc<Shared>, chat_cid: CID, resp: Value) {
         }
         b.current = Some((node, path.clone(), vars));
         b.links = doc.links;
+        b.current_title = page_title.clone();
         b.phase = BrowserPhase::Idle;
         b.node = None;
         b.receiver = None;
@@ -2841,6 +2852,30 @@ fn page_received(shared: &Arc<Shared>, chat_cid: CID, resp: Value) {
         b.viewing = true;
         (node, path, entering)
     };
+
+    // An index page's title is the node's de-facto name: upgrade a PLACEHOLDER
+    // (bare-hex) saved-node entry with it, so address-browsed nodes that never
+    // announce where we can hear them still get real names in the pickers and
+    // labels. Announced / manually-meaningful names are sticky (same policy as
+    // contact names).
+    if let Some(t) = page_title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        if path == PAGE_PATH_DEFAULT {
+            let addr_hex = hex(&node);
+            let placeholder = {
+                let nodes = plock(&shared.saved_nodes);
+                match nodes.get(&node) {
+                    Some(name) => *name == addr_hex || *name == format!("{}…", &addr_hex[..8]),
+                    None => false,
+                }
+            };
+            if placeholder {
+                let mut t = t.to_string();
+                t.truncate(crate::DISPLAY_NAME_MAX);
+                plock(&shared.saved_nodes).insert(node, t.clone());
+                crate::persist_node(pddb, &node, &t);
+            }
+        }
+    }
 
     let label = node_label(shared, &node);
     let title = format!("{label}{path}");

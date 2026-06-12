@@ -52,7 +52,7 @@ const KEY_NAME: &str = "name";
 /// Display name announced when none has been set yet.
 const DEFAULT_DISPLAY_NAME: &str = "precursor";
 /// Sanity cap on the announced name (it travels in every announce packet).
-const DISPLAY_NAME_MAX: usize = 32;
+pub(crate) const DISPLAY_NAME_MAX: usize = 32;
 /// Each contact gets its own dialogue (scrollback) stored under this dict,
 /// keyed by the hex of its destination hash. `DIALOGUE_WELCOME` is shown before
 /// any peer is selected.
@@ -931,7 +931,12 @@ impl<'a> LxmfChat<'a> {
     /// A bookmark's display label: node name + path (+ vars when present).
     fn page_label(&self, addr: &net::PageAddr) -> String {
         let (node, path, vars) = addr;
-        let mut label = format!("{} {}", net::node_label(&self.shared, node), path);
+        // Prefer the page's own title (its first heading) when bookmarking the
+        // page on screen; the node name is the fallback. The path/vars stay in
+        // the label so two views of the same node remain distinguishable.
+        let name = net::current_page_title(&self.shared)
+            .unwrap_or_else(|| net::node_label(&self.shared, node));
+        let mut label = format!("{name} {path}");
         if !vars.is_empty() {
             label.push(' ');
             label.push_str(&vars_string(vars));
