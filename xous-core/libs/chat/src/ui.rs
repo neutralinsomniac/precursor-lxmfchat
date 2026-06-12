@@ -635,17 +635,43 @@ impl Ui {
         }
     }
 
-    /// Swap the staged document in and show it from the top.
+    /// Swap the staged document in and show it from the top. The IME input
+    /// box is hidden while a document is up — there is nothing to type into,
+    /// and it otherwise covers a line of the page.
     pub(crate) fn doc_show(&mut self) {
         if let Some(doc) = self.doc_staging.take() {
+            let entering = self.document.is_none();
             self.document = Some(doc);
+            if entering {
+                self.set_input_visible(false);
+            }
         }
     }
 
     /// Leave document mode; the next redraw renders the chat dialogue again.
     pub(crate) fn doc_clear(&mut self) {
-        self.document = None;
+        if self.document.take().is_some() {
+            self.set_input_visible(true);
+        }
         self.doc_staging = None;
+    }
+
+    /// Show or hide the layout's IME input box (0 height = hidden; any
+    /// positive request is clamped up to the one-line minimum). Authorized by
+    /// our app token — the GAM resizes this context's own chat layout.
+    fn set_input_visible(&self, visible: bool) {
+        let mut req = gam::api::SetCanvasBoundsRequest {
+            token: self.token,
+            token_type: gam::TokenType::App,
+            requested: Point::new(0, if visible { 1 } else { 0 }),
+            granted: None,
+        };
+        self.gam.set_canvas_bounds_request(&mut req).ok();
+        if visible {
+            // Repaint the restored input line right away (it would otherwise
+            // stay blank until the next keystroke).
+            self.gam.request_ime_redraw().ok();
+        }
     }
 
     /// True when document line `i` is a link line.
@@ -695,11 +721,11 @@ impl Ui {
         } else {
             // Walk backward until another screenful of (cached) heights is
             // behind the old top.
-            let (_, _, budget) = self.doc_metrics();
+            let (_, bottom, budget) = self.doc_metrics();
             let mut used = 0u32;
             let mut i = top;
             while i > 0 {
-                let h = self.doc_line_height(i - 1) + self.vp.bubble_space as u32;
+                let h = self.doc_line_height(i - 1, bottom) + self.vp.bubble_space as u32;
                 if used + h > budget {
                     break;
                 }
@@ -738,12 +764,12 @@ impl Ui {
     /// Build the TextView for one document line at vertical position `y`.
     /// Must be constructed identically when measuring and when drawing, or
     /// the cached heights go stale (same rule as chat bubbles).
-    fn doc_textview(&self, line: &DocLine, y: isize, highlight: bool) -> TextView {
+    fn doc_textview(&self, line: &DocLine, y: isize, highlight: bool, clip_bottom: isize) -> TextView {
         let width = (self.vp.layout_screensize.x - 2 * self.vp.margin.x) as u16;
         let bounds = match line.align {
             DOC_ALIGN_CENTER => TextBounds::CenteredTop(Rectangle::new(
                 Point::new(self.vp.margin.x, y),
-                Point::new(self.vp.layout_screensize.x - self.vp.margin.x, self.vp.total_screensize.y),
+                Point::new(self.vp.layout_screensize.x - self.vp.margin.x, clip_bottom),
             )),
             DOC_ALIGN_RIGHT => TextBounds::GrowableFromTr(
                 Point::new(self.vp.layout_screensize.x - self.vp.margin.x, y),
@@ -760,7 +786,7 @@ impl Ui {
         };
         tv.clip_rect = Some(Rectangle::new(
             Point::new(0, self.vp.status_height as isize),
-            self.vp.total_screensize,
+            Point::new(self.vp.total_screensize.x, clip_bottom),
         ));
         // Links read as "buttons": always boxed, and fat-bordered under the
         // cursor. (True video-inverse selection isn't available here — the GAM
@@ -779,7 +805,7 @@ impl Ui {
     }
 
     /// Height of document line `i`, measured lazily and cached.
-    fn doc_line_height(&mut self, i: usize) -> u32 {
+    fn doc_line_height(&mut self, i: usize, clip_bottom: isize) -> u32 {
         let Some(doc) = self.document.as_ref() else { return 0 };
         let Some(line) = doc.lines.get(i) else { return 0 };
         if let Some(h) = doc.heights[i] {
@@ -788,7 +814,7 @@ impl Ui {
         let h = if line.kind == DOC_KIND_DIVIDER || line.text.is_empty() {
             DOC_DIVIDER_HEIGHT
         } else {
-            let mut tv = self.doc_textview(line, self.vp.status_height as isize, false);
+            let mut tv = self.doc_textview(line, self.vp.status_height as isize, false, clip_bottom);
             match self.gam.bounds_compute_textview(&mut tv) {
                 Ok(_) => tv.bounds_computed.map(|r| r.height()).unwrap_or(DOC_DIVIDER_HEIGHT),
                 Err(_) => DOC_DIVIDER_HEIGHT,
@@ -816,11 +842,11 @@ impl Ui {
     /// Lines [top..] that fit FULLY on screen, by cached heights (no drawing).
     fn doc_visible_count(&mut self, top: usize) -> usize {
         let total = self.document.as_ref().map(|d| d.lines.len()).unwrap_or(0);
-        let (_, _, budget) = self.doc_metrics();
+        let (_, bottom, budget) = self.doc_metrics();
         let mut used = 0u32;
         let mut n = 0;
         for i in top..total {
-            let h = self.doc_line_height(i) + self.vp.bubble_space as u32;
+            let h = self.doc_line_height(i, bottom) + self.vp.bubble_space as u32;
             if used + h > budget && n > 0 {
                 break;
             }
@@ -851,13 +877,17 @@ impl Ui {
             doc.top = top;
         }
 
-        // Clear everything (status bar included; it is redrawn below).
+        // Clear everything (status bar included; it is redrawn below). The
+        // fresh bottom matters: with the input box hidden the canvas is
+        // TALLER than the startup bounds, and clearing only to the stale size
+        // would leave ghosts in the reclaimed strip.
+        let (y0, bottom, _) = self.doc_metrics();
         self.gam
             .draw_rectangle(
                 self.vp.canvas,
                 Rectangle::new_with_style(
                     Point::new(0, 0),
-                    self.vp.total_screensize,
+                    Point::new(self.vp.total_screensize.x, bottom),
                     DrawStyle { fill_color: Some(PixelColor::Light), stroke_color: None, stroke_width: 0 },
                 ),
             )
@@ -865,7 +895,6 @@ impl Ui {
 
         // Fresh metrics: the draw cutoff must agree with doc_visible_count or
         // paging diverges from what was actually shown.
-        let (y0, bottom, _) = self.doc_metrics();
         let mut y = y0;
         for i in top..total {
             if y >= bottom {
@@ -887,7 +916,7 @@ impl Ui {
                 DOC_DIVIDER_HEIGHT
             } else {
                 let highlight = i == cursor && line.kind == DOC_KIND_LINK;
-                let mut tv = self.doc_textview(&line, y, highlight);
+                let mut tv = self.doc_textview(&line, y, highlight, bottom);
                 match self.gam.post_textview(&mut tv) {
                     Ok(_) => {
                         let h = tv.bounds_computed.map(|r| r.height()).unwrap_or(DOC_DIVIDER_HEIGHT);

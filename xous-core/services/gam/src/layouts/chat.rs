@@ -129,8 +129,17 @@ impl LayoutApi for ChatLayout {
         let input_canvas = canvases.get(&self.input).expect("couldn't find input canvas");
         let predictive_canvas = canvases.get(&self.predictive).expect("couldn't find predictive canvas");
 
-        let height: isize =
-            if new_height < self.min_input_height { self.min_input_height } else { new_height };
+        // A request of 0 (or less) HIDES the input box entirely — the content
+        // area takes over its space (used by the chat lib's document mode,
+        // where there is nothing to type into). Any positive request keeps
+        // the usual one-line floor.
+        let height: isize = if new_height <= 0 {
+            0
+        } else if new_height < self.min_input_height {
+            self.min_input_height
+        } else {
+            new_height
+        };
         let mut new_input_rect = Rectangle::new_v_stack(predictive_canvas.clip_rect(), -height);
         let mut new_content_rect = Rectangle::new_v_span(*status_canvas, new_input_rect);
         if (new_content_rect.br.y - new_content_rect.tl.y) > self.min_content_height {
