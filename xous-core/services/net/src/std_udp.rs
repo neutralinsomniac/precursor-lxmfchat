@@ -8,6 +8,13 @@ use crate::*;
 /// Sockets are stored in the PID/SocketHandle HashMap `process_sockets` (this is shared with TCP)
 /// `recv` requests create `UpdStdState` objects, that are stored in a `udp_rx` Vec.
 
+/// Per-socket buffer sizing. The original 65535-byte rx+tx pair per socket
+/// (with only 2 packet slots!) OOM-aborted the whole net service once a
+/// process bound a few sockets; everything speaking UDP here (DNS, NTP,
+/// Reticulum AutoInterface) moves datagrams of at most ~4 KiB.
+const UDP_BUF_BYTES: usize = 16384;
+const UDP_BUF_SLOTS: usize = 8;
+
 pub(crate) fn std_udp_bind(
     mut msg: xous::MessageEnvelope,
     _iface: &mut Interface,
@@ -36,9 +43,9 @@ pub(crate) fn std_udp_bind(
     };
 
     let udp_rx_buffer =
-        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY, udp::PacketMetadata::EMPTY], vec![0; 65535]);
+        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; UDP_BUF_SLOTS], vec![0; UDP_BUF_BYTES]);
     let udp_tx_buffer =
-        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY, udp::PacketMetadata::EMPTY], vec![0; 65535]);
+        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; UDP_BUF_SLOTS], vec![0; UDP_BUF_BYTES]);
     let udp_socket = udp::Socket::new(udp_rx_buffer, udp_tx_buffer);
     let handle = sockets.add(udp_socket);
     let udp_socket = sockets.get_mut::<udp::Socket>(handle);
