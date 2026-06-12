@@ -140,7 +140,19 @@ impl LayoutApi for ChatLayout {
         } else {
             new_height
         };
-        let mut new_input_rect = Rectangle::new_v_stack(predictive_canvas.clip_rect(), -height);
+        // The hidden case can't go through new_v_stack: -0 takes its `height >= 0`
+        // ("below") branch, which lands the input rect OVER the predictive canvas's
+        // bottom row and stretches the content canvas over the whole predictive
+        // strip — overlapping canvases get defaced/not-drawable on the next
+        // recompute (hatched page, and a DoubleFree panic once a modal raises).
+        // Instead: an empty one-row strip just above the predictive area, so the
+        // content canvas (which v_spans to one row above this) touches nothing.
+        let pred_rect = predictive_canvas.clip_rect();
+        let mut new_input_rect = if height == 0 {
+            Rectangle::new_coords(pred_rect.tl.x, pred_rect.tl.y - 1, pred_rect.br.x, pred_rect.tl.y - 1)
+        } else {
+            Rectangle::new_v_stack(pred_rect, -height)
+        };
         let mut new_content_rect = Rectangle::new_v_span(*status_canvas, new_input_rect);
         if (new_content_rect.br.y - new_content_rect.tl.y) > self.min_content_height {
             {
