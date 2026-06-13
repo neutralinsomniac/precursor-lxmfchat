@@ -581,6 +581,16 @@ impl Com {
         Ok(response)
     }
 
+    pub fn wlan_add_multicast_mac(&self, mac: [u8; 6]) -> Result<(), xous::Error> {
+        let lo = u32::from_le_bytes([mac[0], mac[1], mac[2], mac[3]]) as usize;
+        let hi = u16::from_le_bytes([mac[4], mac[5]]) as usize;
+        send_message(
+            self.conn,
+            Message::new_scalar(Opcode::WlanAddMcastMac.to_usize().unwrap(), lo, hi, 0, 0),
+        )
+        .map(|_| ())
+    }
+
     pub fn wlan_fetch_packet(&self, pkt: &mut [u8]) -> Result<(), xous::Error> {
         if pkt.len() > NET_MTU {
             return Err(xous::Error::OutOfMemory);

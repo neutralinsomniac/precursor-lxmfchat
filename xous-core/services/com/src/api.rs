@@ -297,6 +297,9 @@ pub(crate) enum Opcode {
 
     /// wlan: EC packet filter bin counters
     WlanFilterStats = 50,
+
+    /// wlan: add a multicast MAC to the WF200 RX whitelist
+    WlanAddMcastMac = 51,
 }
 
 /// These enums indicate what kind of callback type we're sending.

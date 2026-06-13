@@ -1204,6 +1204,22 @@ fn main() -> ! {
                     unsafe { Buffer::from_memory_message_mut(msg.body.memory_message_mut().unwrap()) };
                 buffer.replace(stats).unwrap();
             }
+            Some(Opcode::WlanAddMcastMac) => msg_scalar_unpack!(msg, lo, hi, _, _, {
+                // not yet in the pinned com_rs crate; must match betrusted-ec's WLAN_ADD_MCAST_MAC
+                const WLAN_ADD_MCAST_MAC_VERB: u16 = 0x230D;
+                let mac = [
+                    (lo & 0xff) as u8,
+                    ((lo >> 8) & 0xff) as u8,
+                    ((lo >> 16) & 0xff) as u8,
+                    ((lo >> 24) & 0xff) as u8,
+                    (hi & 0xff) as u8,
+                    ((hi >> 8) & 0xff) as u8,
+                ];
+                com.txrx(WLAN_ADD_MCAST_MAC_VERB);
+                for pair in mac.chunks(2) {
+                    com.txrx(u16::from_le_bytes([pair[0], pair[1]]));
+                }
+            }),
             None => {
                 error!("unknown opcode");
                 break;
