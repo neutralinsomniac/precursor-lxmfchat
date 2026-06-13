@@ -19,7 +19,7 @@ use reticulum_core::constants::{KEY_HALF, KEYSIZE, NAME_HASH_LENGTH, RATCHET_SIZ
 use reticulum_core::crypto::truncated_hash;
 use reticulum_core::destination::single_destination_hash;
 use reticulum_core::identity::{PrivateIdentity, PublicIdentity};
-use reticulum_core::transport::{KnownDest, Transport};
+use reticulum_core::transport::{KnownDest, PathIface, Transport};
 use trng::Trng;
 use xous::CID;
 use xous_names::XousNames;
@@ -359,6 +359,10 @@ impl<'a> LxmfChat<'a> {
         if self.shared.hub_enabled.load(core::sync::atomic::Ordering::SeqCst) {
             self.shared.hub_enabled.store(false, core::sync::atomic::Ordering::SeqCst);
             write_string(&self.pddb, KEY_HUB_ENABLED, "0");
+            // Routes learned via the hub now dead-end on a next-hop we can't
+            // reach. Drop them so has_path() stops masking the loss and a send
+            // re-requests a route the local peers can actually answer.
+            plock(&self.shared.transport).drop_paths_on(PathIface::Hub);
             net::force_reconnect(
                 &self.shared,
                 self.chat_cid,
@@ -374,6 +378,9 @@ impl<'a> LxmfChat<'a> {
         if autoiface::enabled(&self.shared) {
             autoiface::stop(&self.shared, self.chat_cid);
             write_string(&self.pddb, KEY_AUTOIFACE, "0");
+            // Routes learned via a local peer are unreachable once peering is
+            // off; drop them so the hub path (or a re-request) is used instead.
+            plock(&self.shared.transport).drop_paths_on(PathIface::Auto);
         } else if autoiface::start(&self.shared, self.chat_cid) {
             write_string(&self.pddb, KEY_AUTOIFACE, "1");
         }

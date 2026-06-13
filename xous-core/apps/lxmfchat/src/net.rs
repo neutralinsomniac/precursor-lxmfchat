@@ -16,7 +16,7 @@ use reticulum_core::constants::{
 use reticulum_core::crypto::{full_hash, truncated_hash};
 use reticulum_core::hdlc::{Deframer, frame};
 use reticulum_core::resource::ResourceReceiver;
-use reticulum_core::transport::{Event, Transport};
+use reticulum_core::transport::{Event, PathIface, Transport};
 use lxmf::msgpack::{self, Value};
 use trng::Trng;
 use xous::CID;
@@ -757,7 +757,7 @@ fn read_until_closed(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Tr
                 // keepalive thread's liveness watchdog.
                 shared.last_inbound.store(now_secs() as u32, core::sync::atomic::Ordering::SeqCst);
                 for frame in deframer.push(&buf[..n]) {
-                    handle_frame(shared, chat_cid, pddb, trng, &frame);
+                    handle_frame(shared, chat_cid, pddb, trng, &frame, PathIface::Hub);
                 }
             }
             // Timeout tick: nothing to do — the top-of-loop check decides
@@ -821,7 +821,14 @@ fn request_propagation_path(shared: &Arc<Shared>, trng: &Trng) {
     }
 }
 
-pub(crate) fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, frame_bytes: &[u8]) {
+pub(crate) fn handle_frame(
+    shared: &Arc<Shared>,
+    chat_cid: CID,
+    pddb: &Pddb,
+    trng: &Trng,
+    frame_bytes: &[u8],
+    iface: PathIface,
+) {
     // Fresh per-link ephemeral X25519 key material for answering a link request.
     // Drawn from the TRNG *before* taking the transport lock: a TRNG IPC is a
     // blocking service call, and blocking while holding the transport mutex
@@ -832,7 +839,7 @@ pub(crate) fn handle_frame(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trn
     let mut gen_ephemeral = || eph;
     let event = {
         let mut tp = plock(&shared.transport);
-        tp.handle_frame(frame_bytes, &mut gen_ephemeral)
+        tp.handle_frame(frame_bytes, &mut gen_ephemeral, iface)
     };
 
     match event {
@@ -2488,11 +2495,18 @@ pub fn browser_thread(shared: Arc<Shared>, chat_cid: CID) {
 fn browser_tick(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
     let now = now_secs();
     // Time out a stuck fetch.
-    let stalled = {
+    let (stalled, never_linked_node) = {
         let b = plock(&shared.browser);
-        b.phase != BrowserPhase::Idle && now > b.deadline
+        let stalled = b.phase != BrowserPhase::Idle && now > b.deadline;
+        (stalled, if b.phase == BrowserPhase::Linking { b.node } else { None })
     };
     if stalled {
+        // Stalled before the link ever came up: expire the node's unresponsive
+        // route so the next fetch re-discovers one (RNS expire_path on a failed
+        // link). Past Linking the link was up and the route is fine.
+        if let Some(node) = never_linked_node {
+            plock(&shared.transport).expire_path(&node);
+        }
         browser_finish(shared, chat_cid, "timed out");
         return;
     }
@@ -3311,11 +3325,18 @@ fn maybe_auto_sync(shared: &Arc<Shared>, chat_cid: CID, trng: &Trng) {
     };
     let now = now_secs();
     // Time out a stuck sync.
-    let stalled = {
+    let (stalled, never_linked) = {
         let s = plock(&shared.sync);
-        s.phase != SyncPhase::Idle && now > s.deadline
+        (s.phase != SyncPhase::Idle && now > s.deadline, s.phase == SyncPhase::Linking)
     };
     if stalled {
+        // Stalled before the link ever came up: the node's cached route is
+        // unresponsive, so expire it (RNS expire_path on a failed link) — the
+        // next sync re-discovers a working route instead of reusing the dead
+        // one. Past Linking the link was up and the route is fine.
+        if never_linked {
+            plock(&shared.transport).expire_path(&pn);
+        }
         sync_finish(shared, chat_cid, "timed out");
         return;
     }
@@ -3521,6 +3542,15 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                 }
                 let m = outbox.remove(i);
                 let why = if m.via_pn {
+                    // Escalated to the node but never managed a send over a link
+                    // to it (tried_pn is set only after a PN send): its route is
+                    // unresponsive, so expire it (RNS expire_path on a failed
+                    // link) — sync and later sends then re-discover it.
+                    if !m.tried_pn {
+                        if let Some(node) = pn {
+                            plock(&shared.transport).expire_path(&node);
+                        }
+                    }
                     "propagation node unconfirmed"
                 } else if m.attempts == 0 && !m.tried_pn {
                     // Nothing was ever sent. Two distinct stories: we never got
@@ -3872,18 +3902,31 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                         // LRPROOF (this hub's RTT runs seconds) isn't cut off
                         // at the next 2 s tick.
                         let pending = { plock(&shared.transport).pending_link_to(&peer, now) };
-                        if !pending
-                            && outbox[i].link_tries >= MAX_LINK_TRIES
-                            && !outbox[i].tried_pn
-                            && pn.is_some()
-                        {
-                            outbox[i].via_pn = true;
-                            outbox[i].deadline = now + PROP_DEADLINE; // fresh budget
-                            outbox[i].next_action = now;
-                            chat::cf_set_status_text(
-                                chat_cid,
-                                &format!("{label}: link won't establish — trying propagation node…"),
-                            );
+                        if !pending && outbox[i].link_tries >= MAX_LINK_TRIES {
+                            // The link won't establish: the cached route leads to
+                            // a next-hop that isn't relaying our LINKREQUEST (or
+                            // the LRPROOF back). Treat it as unresponsive and drop
+                            // it (RNS expire_path on a failed link) so a fresh path
+                            // request can find a working next-hop — e.g. via a
+                            // different interface after a topology change.
+                            plock(&shared.transport).expire_path(&peer);
+                            if !outbox[i].tried_pn && pn.is_some() {
+                                outbox[i].via_pn = true;
+                                outbox[i].deadline = now + PROP_DEADLINE; // fresh budget
+                                outbox[i].next_action = now;
+                                chat::cf_set_status_text(
+                                    chat_cid,
+                                    &format!("{label}: link won't establish — trying propagation node…"),
+                                );
+                                continue;
+                            }
+                            // No propagation node to fall back on: give direct
+                            // delivery a fresh start on a re-discovered route
+                            // (link_tries reset) rather than hammering the dead
+                            // one until the deadline.
+                            outbox[i].link_tries = 0;
+                            outbox[i].next_action = now + 1;
+                            i += 1;
                             continue;
                         }
                         match send_link_request(shared, trng, &peer, &known.identity, now) {

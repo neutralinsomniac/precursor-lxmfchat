@@ -140,6 +140,23 @@ pub struct KnownDest {
 pub struct PathEntry {
     pub next_hop: Option<[u8; TRUNCATED_HASHLENGTH]>,
     pub hops: u8,
+    /// Which local interface taught us this route. When that interface is
+    /// disabled its next-hop becomes unreachable, so the route is dropped (see
+    /// [`Transport::drop_paths_on`]) — mirrors RNS culling path-table entries
+    /// whose `receiving_interface` left `Transport.interfaces` (`RNS/Transport.py`
+    /// jobs()).
+    pub learned_on: PathIface,
+}
+
+/// The local interface an inbound frame arrived on. Tags each learned route so a
+/// route via an interface the user turns off doesn't linger and mask a fresh
+/// route the still-enabled interface could provide.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PathIface {
+    /// The hub TCP interface.
+    Hub,
+    /// AutoInterface local-network peering.
+    Auto,
 }
 
 /// Events produced while handling an inbound frame.
@@ -292,6 +309,33 @@ impl Transport {
         }
     }
 
+    /// Forget every route learned via `iface`. Call when the user disables that
+    /// interface: its next-hops are no longer reachable, and a surviving entry
+    /// would keep [`has_path`](Self::has_path) true and so suppress the fresh
+    /// path request that a still-enabled interface could answer with a working
+    /// route. Learned peers/keys (`known`) are not interface-scoped and survive.
+    /// Mirrors RNS culling path-table entries whose receiving interface left
+    /// `Transport.interfaces` (`RNS/Transport.py` jobs()).
+    pub fn drop_paths_on(&mut self, iface: PathIface) {
+        self.paths.retain(|_, e| e.learned_on != iface);
+        let paths = &self.paths;
+        self.paths_order.retain(|h| paths.contains_key(h));
+    }
+
+    /// Forget the learned route to `hash` (RNS `Transport.expire_path`). Call
+    /// when a link to the destination repeatedly fails to establish: the cached
+    /// next-hop is unresponsive, and dropping it lets a fresh path request find a
+    /// working route (e.g. via a different next-hop after a topology change)
+    /// instead of [`has_path`](Self::has_path) masking the dead one. The
+    /// destination's key (`known`) is kept. Returns whether an entry was removed.
+    pub fn expire_path(&mut self, hash: &[u8; TRUNCATED_HASHLENGTH]) -> bool {
+        let removed = self.paths.remove(hash).is_some();
+        if removed {
+            self.paths_order.retain(|h| h != hash);
+        }
+        removed
+    }
+
     /// True if we have learned a route to `hash` (so an outbound packet can be
     /// correctly addressed — directly or via transport). Callers should request a
     /// path (re-announce) before sending if this is false, mirroring RNS.
@@ -434,6 +478,7 @@ impl Transport {
         &mut self,
         raw: &[u8],
         gen_ephemeral: &mut dyn FnMut() -> [u8; KEY_HALF],
+        iface: PathIface,
     ) -> Event {
         let packet = match Packet::decode(raw) {
             Ok(p) => p,
@@ -699,7 +744,11 @@ impl Transport {
                     // counts the hop into us, so the destination is `hops + 1` away.
                     self.insert_path(
                         destination_hash,
-                        PathEntry { next_hop: packet.transport_id, hops: packet.hops.saturating_add(1) },
+                        PathEntry {
+                            next_hop: packet.transport_id,
+                            hops: packet.hops.saturating_add(1),
+                            learned_on: iface,
+                        },
                     );
                     Event::Announce { destination_hash, info }
                 }
@@ -1262,14 +1311,14 @@ mod tests {
             [counter; KEY_HALF]
         };
 
-        let proof1 = match tp.handle_frame(&req, &mut eph) {
+        let proof1 = match tp.handle_frame(&req, &mut eph, PathIface::Hub) {
             Event::LinkEstablished { proof, .. } => proof,
             _ => panic!("expected link established"),
         };
         // The initiator retransmits the *same* request (slow link, our first proof
         // not yet seen). We must answer with the identical proof so its locked-in
         // session key still matches ours.
-        let proof2 = match tp.handle_frame(&req, &mut eph) {
+        let proof2 = match tp.handle_frame(&req, &mut eph, PathIface::Hub) {
             Event::LinkEstablished { proof, .. } => proof,
             _ => panic!("expected link established on retransmit"),
         };
@@ -1292,7 +1341,7 @@ mod tests {
         // 1. Initiator builds + sends a link request; responder accepts it.
         let peer_pub = PrivateIdentity::from_bytes(&[0x50; KEY_HALF], &[0x51; KEY_HALF]).public().clone();
         let (req, lid) = initiator.make_link_request(&responder_dh, &peer_pub, &[1; KEY_HALF], &[2; KEY_HALF], 1000);
-        let proof = match responder.handle_frame(&req, &mut eph) {
+        let proof = match responder.handle_frame(&req, &mut eph, PathIface::Hub) {
             Event::LinkEstablished { link_id, proof } => {
                 assert_eq!(link_id, lid);
                 proof
@@ -1301,7 +1350,7 @@ mod tests {
         };
 
         // 2. Initiator processes the LRPROOF → outbound link is up.
-        match initiator.handle_frame(&proof, &mut eph) {
+        match initiator.handle_frame(&proof, &mut eph, PathIface::Hub) {
             Event::OutboundLinkUp { link_id, target } => {
                 assert_eq!(link_id, lid);
                 assert_eq!(target, responder_dh);
@@ -1314,7 +1363,7 @@ mod tests {
         // 3. Initiator sends LXMF data over the link; responder decrypts + proves.
         let (data, packet_hash) =
             initiator.make_link_data(&lid, b"direct hello", &[3u8; IV_LENGTH]).expect("link data");
-        let receipt = match responder.handle_frame(&data, &mut eph) {
+        let receipt = match responder.handle_frame(&data, &mut eph, PathIface::Hub) {
             Event::LinkData { plaintext, proof, .. } => {
                 assert_eq!(plaintext, b"direct hello");
                 proof
@@ -1324,7 +1373,7 @@ mod tests {
         };
 
         // 4. Initiator processes the packet proof → delivered.
-        match initiator.handle_frame(&receipt, &mut eph) {
+        match initiator.handle_frame(&receipt, &mut eph, PathIface::Hub) {
             Event::Delivered { packet_hash: ph } => assert_eq!(ph, packet_hash),
             _ => panic!("expected delivered"),
         }
@@ -1335,7 +1384,7 @@ mod tests {
         let key = responder.links[&lid].key; // both sides hold the same session key
         let resp = link::make_link_context_packet(&lid, &key, CONTEXT_RESPONSE, b"sync payload", &[4u8; IV_LENGTH])
             .expect("response packet");
-        match initiator.handle_frame(&resp, &mut eph) {
+        match initiator.handle_frame(&resp, &mut eph, PathIface::Hub) {
             Event::OutLinkData { link_id, context, plaintext } => {
                 assert_eq!(link_id, lid);
                 assert_eq!(context, CONTEXT_RESPONSE);
@@ -1348,7 +1397,7 @@ mod tests {
         //    initiator forgets it instead of reusing a dead link.
         let close = link::make_link_context_packet(&lid, &key, CONTEXT_LINKCLOSE, &lid, &[5u8; IV_LENGTH])
             .expect("close packet");
-        match initiator.handle_frame(&close, &mut eph) {
+        match initiator.handle_frame(&close, &mut eph, PathIface::Hub) {
             Event::OutLinkClosed { link_id } => assert_eq!(link_id, lid),
             other => panic!("expected out-link closed, got {:?}", core::mem::discriminant(&other)),
         }
@@ -1370,11 +1419,11 @@ mod tests {
         let mut eph = || [0xEFu8; KEY_HALF];
         let peer_pub = PrivateIdentity::from_bytes(&[0x70; KEY_HALF], &[0x71; KEY_HALF]).public().clone();
         let (req, lid) = initiator.make_link_request(&responder_dh, &peer_pub, &[1; KEY_HALF], &[2; KEY_HALF], 1000);
-        let proof = match responder.handle_frame(&req, &mut eph) {
+        let proof = match responder.handle_frame(&req, &mut eph, PathIface::Hub) {
             Event::LinkEstablished { proof, .. } => proof,
             _ => panic!("responder should accept the link"),
         };
-        match initiator.handle_frame(&proof, &mut eph) {
+        match initiator.handle_frame(&proof, &mut eph, PathIface::Hub) {
             Event::OutboundLinkUp { .. } => {}
             _ => panic!("expected outbound link up"),
         }
@@ -1411,7 +1460,7 @@ mod tests {
         // Advertisement (link-encrypted) → surfaced decrypted as InLinkData.
         let adv_pkt =
             link::make_link_context_packet(&lid, &key, CONTEXT_RESOURCE_ADV, &adv, &[6u8; IV_LENGTH]).unwrap();
-        let mut rx = match responder.handle_frame(&adv_pkt, &mut eph) {
+        let mut rx = match responder.handle_frame(&adv_pkt, &mut eph, PathIface::Hub) {
             Event::InLinkData { link_id, context, plaintext } => {
                 assert_eq!(link_id, lid);
                 assert_eq!(context, CONTEXT_RESOURCE_ADV);
@@ -1445,7 +1494,7 @@ mod tests {
             for part in batch {
                 let raw =
                     Packet::header1(DEST_LINK, PACKET_DATA, CONTEXT_RESOURCE, lid, part).encode();
-                match responder.handle_frame(&raw, &mut eph) {
+                match responder.handle_frame(&raw, &mut eph, PathIface::Hub) {
                     Event::InLinkData { context, plaintext, .. } => {
                         assert_eq!(context, CONTEXT_RESOURCE);
                         rx.receive_part(&plaintext);
@@ -1486,11 +1535,11 @@ mod tests {
         let mut eph = || [0x77u8; KEY_HALF];
         let peer_pub = PrivateIdentity::from_bytes(&[0x90; KEY_HALF], &[0x91; KEY_HALF]).public().clone();
         let (req, lid) = initiator.make_link_request(&responder_dh, &peer_pub, &[1; KEY_HALF], &[2; KEY_HALF], 1000);
-        let proof = match responder.handle_frame(&req, &mut eph) {
+        let proof = match responder.handle_frame(&req, &mut eph, PathIface::Hub) {
             Event::LinkEstablished { proof, .. } => proof,
             _ => panic!("responder should accept the link"),
         };
-        match initiator.handle_frame(&proof, &mut eph) {
+        match initiator.handle_frame(&proof, &mut eph, PathIface::Hub) {
             Event::OutboundLinkUp { .. } => {}
             _ => panic!("expected outbound link up"),
         }
@@ -1500,7 +1549,7 @@ mod tests {
             .make_link_resource(&lid, &data, [1, 2, 3, 4], [5, 6, 7, 8], &[0x10; IV_LENGTH], &[0x11; IV_LENGTH])
             .expect("resource started");
 
-        let mut rx = match responder.handle_frame(&adv_pkt, &mut eph) {
+        let mut rx = match responder.handle_frame(&adv_pkt, &mut eph, PathIface::Hub) {
             Event::InLinkData { context, plaintext, .. } => {
                 assert_eq!(context, CONTEXT_RESOURCE_ADV);
                 ResourceReceiver::accept(&plaintext).expect("accept our own ADV")
@@ -1516,7 +1565,7 @@ mod tests {
                 .make_in_link_context(&lid, CONTEXT_RESOURCE_REQ, &req, &[0x12; IV_LENGTH])
                 .expect("request packet");
             // The initiator's transport surfaces the REQ decrypted…
-            let req_plain = match initiator.handle_frame(&req_pkt, &mut eph) {
+            let req_plain = match initiator.handle_frame(&req_pkt, &mut eph, PathIface::Hub) {
                 Event::OutLinkData { context, plaintext, .. } => {
                     assert_eq!(context, CONTEXT_RESOURCE_REQ);
                     plaintext
@@ -1525,7 +1574,7 @@ mod tests {
             };
             // …and serve_link_resource answers with parts (+HMU when asked).
             for raw in initiator.serve_link_resource(&lid, &req_plain, &[0x13; IV_LENGTH]) {
-                match responder.handle_frame(&raw, &mut eph) {
+                match responder.handle_frame(&raw, &mut eph, PathIface::Hub) {
                     Event::InLinkData { context: CONTEXT_RESOURCE, plaintext, .. } => {
                         rx.receive_part(&plaintext);
                     }
@@ -1543,12 +1592,12 @@ mod tests {
         let (payload, proof_data) = rx.finish(&stream).expect("finish");
         assert_eq!(payload, data);
         let prf = responder.make_in_link_resource_proof(&lid, &proof_data).expect("proof packet");
-        match initiator.handle_frame(&prf, &mut eph) {
+        match initiator.handle_frame(&prf, &mut eph, PathIface::Hub) {
             Event::Delivered { packet_hash } => assert_eq!(packet_hash, res_hash),
             other => panic!("expected delivered, got {:?}", core::mem::discriminant(&other)),
         }
         // Retired: a replayed proof no longer matches.
-        assert!(!matches!(initiator.handle_frame(&prf, &mut eph), Event::Delivered { .. }));
+        assert!(!matches!(initiator.handle_frame(&prf, &mut eph, PathIface::Hub), Event::Delivered { .. }));
     }
 
     #[test]
@@ -1565,11 +1614,11 @@ mod tests {
         let mut eph = || [0x55u8; KEY_HALF];
         let peer_pub = PrivateIdentity::from_bytes(&[0xB0; KEY_HALF], &[0xB1; KEY_HALF]).public().clone();
         let (req, lid) = initiator.make_link_request(&responder_dh, &peer_pub, &[1; KEY_HALF], &[2; KEY_HALF], 1000);
-        let proof = match responder.handle_frame(&req, &mut eph) {
+        let proof = match responder.handle_frame(&req, &mut eph, PathIface::Hub) {
             Event::LinkEstablished { proof, .. } => proof,
             _ => panic!("responder should accept the link"),
         };
-        assert!(matches!(initiator.handle_frame(&proof, &mut eph), Event::OutboundLinkUp { .. }));
+        assert!(matches!(initiator.handle_frame(&proof, &mut eph, PathIface::Hub), Event::OutboundLinkUp { .. }));
 
         // Before identification, the backchannel is closed: no identity to
         // validate the peer's proofs against.
@@ -1578,7 +1627,7 @@ mod tests {
         // The initiator identifies itself on the link.
         let identify = initiator.make_out_link_identify(&lid, &[3u8; IV_LENGTH]).expect("identify");
         let initiator_pub = PrivateIdentity::from_bytes(&[0xA0; KEY_HALF], &[0xA1; KEY_HALF]).public().clone();
-        match responder.handle_frame(&identify, &mut eph) {
+        match responder.handle_frame(&identify, &mut eph, PathIface::Hub) {
             Event::LinkIdentified { link_id, identity } => {
                 assert_eq!(link_id, lid);
                 assert_eq!(identity.public_key(), initiator_pub.public_key());
@@ -1590,7 +1639,7 @@ mod tests {
         let (reply, reply_hash) =
             responder.make_in_link_data(&lid, b"backchannel reply", &[4u8; IV_LENGTH]).expect("send");
         // …which the initiator receives as plain link data, with a proof out.
-        let reply_proof = match initiator.handle_frame(&reply, &mut eph) {
+        let reply_proof = match initiator.handle_frame(&reply, &mut eph, PathIface::Hub) {
             Event::LinkData { link_id, plaintext, proof } => {
                 assert_eq!(link_id, lid);
                 assert_eq!(plaintext, b"backchannel reply");
@@ -1599,7 +1648,7 @@ mod tests {
             other => panic!("expected link data, got {:?}", core::mem::discriminant(&other)),
         };
         // The proof retires the responder's receipt (its ✓).
-        match responder.handle_frame(&reply_proof, &mut eph) {
+        match responder.handle_frame(&reply_proof, &mut eph, PathIface::Hub) {
             Event::Delivered { packet_hash } => assert_eq!(packet_hash, reply_hash),
             other => panic!("expected delivered, got {:?}", core::mem::discriminant(&other)),
         }
@@ -1608,14 +1657,14 @@ mod tests {
         let key = responder.links[&lid].key;
         let ka = link::make_link_context_packet(&lid, &key, CONTEXT_KEEPALIVE, &[0xFF], &[5u8; IV_LENGTH])
             .unwrap();
-        let echo = match responder.handle_frame(&ka, &mut eph) {
+        let echo = match responder.handle_frame(&ka, &mut eph, PathIface::Hub) {
             Event::LinkKeepalive { link_id, reply } => {
                 assert_eq!(link_id, lid);
                 reply
             }
             other => panic!("expected keepalive, got {:?}", core::mem::discriminant(&other)),
         };
-        match initiator.handle_frame(&echo, &mut eph) {
+        match initiator.handle_frame(&echo, &mut eph, PathIface::Hub) {
             Event::OutLinkData { context, plaintext, .. } => {
                 assert_eq!(context, CONTEXT_KEEPALIVE);
                 assert_eq!(plaintext, [0xFE]);
@@ -1626,7 +1675,7 @@ mod tests {
         // LINKCLOSE tears the inbound link (and so the backchannel) down.
         let close =
             link::make_link_context_packet(&lid, &key, CONTEXT_LINKCLOSE, &lid, &[6u8; IV_LENGTH]).unwrap();
-        assert!(matches!(responder.handle_frame(&close, &mut eph), Event::InLinkClosed { .. }));
+        assert!(matches!(responder.handle_frame(&close, &mut eph, PathIface::Hub), Event::InLinkClosed { .. }));
         assert!(responder.make_in_link_data(&lid, b"late", &[7u8; IV_LENGTH]).is_none());
     }
 
@@ -1648,13 +1697,13 @@ mod tests {
         let eph_ed25519 = [2u8; KEY_HALF];
         let (req, lid) =
             initiator.make_link_request(&responder_dh, &peer_pub, &[1; KEY_HALF], &eph_ed25519, 1000);
-        let proof = match responder.handle_frame(&req, &mut eph) {
+        let proof = match responder.handle_frame(&req, &mut eph, PathIface::Hub) {
             Event::LinkEstablished { proof, .. } => proof,
             _ => panic!("responder should accept the link"),
         };
-        assert!(matches!(initiator.handle_frame(&proof, &mut eph), Event::OutboundLinkUp { .. }));
+        assert!(matches!(initiator.handle_frame(&proof, &mut eph, PathIface::Hub), Event::OutboundLinkUp { .. }));
         let identify = initiator.make_out_link_identify(&lid, &[3u8; IV_LENGTH]).expect("identify");
-        assert!(matches!(responder.handle_frame(&identify, &mut eph), Event::LinkIdentified { .. }));
+        assert!(matches!(responder.handle_frame(&identify, &mut eph, PathIface::Hub), Event::LinkIdentified { .. }));
 
         let (reply, reply_hash) =
             responder.make_in_link_data(&lid, b"needs the right key", &[4u8; IV_LENGTH]).expect("send");
@@ -1664,13 +1713,13 @@ mod tests {
         // behavior) must be rejected…
         let forged = link::prove_packet(&initiator_id, &lid, &reply_packet);
         assert!(
-            !matches!(responder.handle_frame(&forged, &mut eph), Event::Delivered { .. }),
+            !matches!(responder.handle_frame(&forged, &mut eph, PathIface::Hub), Event::Delivered { .. }),
             "identity-signed proof must not retire a backchannel receipt"
         );
 
         // …while the link-ephemeral-signed proof retires the receipt.
         let real = link::prove_packet_ephemeral(&eph_ed25519, &lid, &reply_packet);
-        match responder.handle_frame(&real, &mut eph) {
+        match responder.handle_frame(&real, &mut eph, PathIface::Hub) {
             Event::Delivered { packet_hash } => assert_eq!(packet_hash, reply_hash),
             other => panic!("expected delivered, got {:?}", core::mem::discriminant(&other)),
         }
@@ -1691,11 +1740,11 @@ mod tests {
         let mut eph = || [0x44u8; KEY_HALF];
         let peer_pub = PrivateIdentity::from_bytes(&[0xD0; KEY_HALF], &[0xD1; KEY_HALF]).public().clone();
         let (req, lid) = initiator.make_link_request(&responder_dh, &peer_pub, &[1; KEY_HALF], &[2; KEY_HALF], 1000);
-        let proof = match responder.handle_frame(&req, &mut eph) {
+        let proof = match responder.handle_frame(&req, &mut eph, PathIface::Hub) {
             Event::LinkEstablished { proof, .. } => proof,
             _ => panic!("responder should accept the link"),
         };
-        assert!(matches!(initiator.handle_frame(&proof, &mut eph), Event::OutboundLinkUp { .. }));
+        assert!(matches!(initiator.handle_frame(&proof, &mut eph, PathIface::Hub), Event::OutboundLinkUp { .. }));
 
         // Responder starts a resource on the INBOUND link.
         let data: Vec<u8> = (0..4000u32).map(|i| (i * 17) as u8).collect();
@@ -1705,7 +1754,7 @@ mod tests {
 
         // The initiator sees the ADV on its out-link and pumps the download;
         // its requests reach the responder as InLinkData(RESOURCE_REQ).
-        let mut rx = match initiator.handle_frame(&adv, &mut eph) {
+        let mut rx = match initiator.handle_frame(&adv, &mut eph, PathIface::Hub) {
             Event::OutLinkData { context: CONTEXT_RESOURCE_ADV, plaintext, .. } => {
                 ResourceReceiver::accept(&plaintext).expect("accept")
             }
@@ -1716,12 +1765,12 @@ mod tests {
             let req = rx.next_request().expect("next step");
             let req_pkt =
                 initiator.make_out_link_context(&lid, CONTEXT_RESOURCE_REQ, &req, &[0x22; IV_LENGTH]).unwrap();
-            let req_plain = match responder.handle_frame(&req_pkt, &mut eph) {
+            let req_plain = match responder.handle_frame(&req_pkt, &mut eph, PathIface::Hub) {
                 Event::InLinkData { context: CONTEXT_RESOURCE_REQ, plaintext, .. } => plaintext,
                 other => panic!("expected REQ, got {:?}", core::mem::discriminant(&other)),
             };
             for raw in responder.serve_link_resource(&lid, &req_plain, &[0x23; IV_LENGTH]) {
-                match initiator.handle_frame(&raw, &mut eph) {
+                match initiator.handle_frame(&raw, &mut eph, PathIface::Hub) {
                     Event::OutLinkData { context: CONTEXT_RESOURCE, plaintext, .. } => {
                         rx.receive_part(&plaintext);
                     }
@@ -1738,7 +1787,7 @@ mod tests {
         let (payload, proof_data) = rx.finish(&stream).expect("finish");
         assert_eq!(payload, data);
         let prf = initiator.make_out_link_resource_proof(&lid, &proof_data).expect("proof packet");
-        match responder.handle_frame(&prf, &mut eph) {
+        match responder.handle_frame(&prf, &mut eph, PathIface::Hub) {
             Event::Delivered { packet_hash } => assert_eq!(packet_hash, res_hash),
             other => panic!("expected delivered, got {:?}", core::mem::discriminant(&other)),
         }
@@ -1756,11 +1805,11 @@ mod tests {
         let mut eph = || [0xCDu8; KEY_HALF];
         let peer_pub = PrivateIdentity::from_bytes(&[0x52; KEY_HALF], &[0x53; KEY_HALF]).public().clone();
         let (req, lid) = initiator.make_link_request(&responder_dh, &peer_pub, &[1; KEY_HALF], &[2; KEY_HALF], now);
-        let proof = match responder.handle_frame(&req, &mut eph) {
+        let proof = match responder.handle_frame(&req, &mut eph, PathIface::Hub) {
             Event::LinkEstablished { proof, .. } => proof,
             _ => panic!("responder should accept the link"),
         };
-        match initiator.handle_frame(&proof, &mut eph) {
+        match initiator.handle_frame(&proof, &mut eph, PathIface::Hub) {
             Event::OutboundLinkUp { .. } => {}
             _ => panic!("expected outbound link up"),
         }
@@ -1845,7 +1894,7 @@ mod tests {
         let mut eph = || [0u8; KEY_HALF];
         let mut recipient = Transport::new(id(0x60));
         recipient.register_destination(recipient_dh);
-        let proof = match recipient.handle_frame(&raw, &mut eph) {
+        let proof = match recipient.handle_frame(&raw, &mut eph, PathIface::Hub) {
             Event::Data { plaintext, proof, .. } => {
                 assert_eq!(plaintext, b"payload");
                 proof
@@ -1853,12 +1902,12 @@ mod tests {
             _ => panic!("expected data at the recipient"),
         };
 
-        match sender.handle_frame(&proof, &mut eph) {
+        match sender.handle_frame(&proof, &mut eph, PathIface::Hub) {
             Event::Delivered { packet_hash } => assert_eq!(packet_hash, full_hash),
             _ => panic!("expected delivered"),
         }
         // A second copy of the proof no longer matches (receipt consumed).
-        assert!(!matches!(sender.handle_frame(&proof, &mut eph), Event::Delivered { .. }));
+        assert!(!matches!(sender.handle_frame(&proof, &mut eph, PathIface::Hub), Event::Delivered { .. }));
     }
 
     #[test]
@@ -1871,7 +1920,7 @@ mod tests {
         let bob_announce = Transport::new(id(0x20))
             .make_announce("lxmf", &["delivery"], b"bob", &mut OsRng, 1_700_000_000);
         let mut eph = || [0u8; KEY_HALF];
-        match alice_tp.handle_frame(&bob_announce, &mut eph) {
+        match alice_tp.handle_frame(&bob_announce, &mut eph, PathIface::Hub) {
             Event::Announce { destination_hash, .. } => assert_eq!(destination_hash, bob_dh),
             _ => panic!("expected announce"),
         }
@@ -1883,7 +1932,7 @@ mod tests {
 
         let mut bob_tp = Transport::new(id(0x20));
         bob_tp.register_destination(bob_dh);
-        match bob_tp.handle_frame(&pkt, &mut eph) {
+        match bob_tp.handle_frame(&pkt, &mut eph, PathIface::Hub) {
             Event::Data { destination_hash, plaintext, proof } => {
                 assert_eq!(destination_hash, bob_dh);
                 assert_eq!(plaintext, b"secret payload");
@@ -1918,7 +1967,7 @@ mod tests {
 
         let mut alice = Transport::new(id(0x11));
         let mut eph = || [0u8; KEY_HALF];
-        match alice.handle_frame(&relayed, &mut eph) {
+        match alice.handle_frame(&relayed, &mut eph, PathIface::Hub) {
             Event::Announce { destination_hash, .. } => assert_eq!(destination_hash, bob_dh),
             _ => panic!("expected announce"),
         }
@@ -1942,12 +1991,57 @@ mod tests {
         // A directly-reachable destination (HEADER_1 announce) stays HEADER_1.
         let carol_dh = single_destination_hash("lxmf", &["delivery"], &id(0x23).hash());
         let carol_ann = Transport::new(id(0x23)).make_announce("lxmf", &["delivery"], b"carol", &mut OsRng, 1_700_000_000);
-        alice.handle_frame(&carol_ann, &mut eph);
+        alice.handle_frame(&carol_ann, &mut eph, PathIface::Hub);
         let carol = alice.known(&carol_dh).unwrap().clone();
         let (raw2, _) = alice.make_opportunistic_tracked(
             &carol_dh, &carol.identity, None, b"hi", &[7u8; KEY_HALF], &[8u8; IV_LENGTH],
         );
         assert_eq!(Packet::decode(&raw2).unwrap().header_type, HeaderType::One, "direct dest stays HEADER_1");
+    }
+
+    #[test]
+    fn drop_paths_on_forgets_only_that_interfaces_routes() {
+        // A route learned via the hub and one via a local peer. Disabling the
+        // hub must drop the hub route (so a send re-requests one the local peer
+        // can answer) while leaving the local route and all learned keys intact.
+        let hub_dh = single_destination_hash("lxmf", &["delivery"], &id(0x31).hash());
+        let auto_dh = single_destination_hash("lxmf", &["delivery"], &id(0x32).hash());
+        let hub_ann = Transport::new(id(0x31)).make_announce("lxmf", &["delivery"], b"hub", &mut OsRng, 1_700_000_000);
+        let auto_ann = Transport::new(id(0x32)).make_announce("lxmf", &["delivery"], b"loc", &mut OsRng, 1_700_000_000);
+
+        let mut alice = Transport::new(id(0x11));
+        let mut eph = || [0u8; KEY_HALF];
+        alice.handle_frame(&hub_ann, &mut eph, PathIface::Hub);
+        alice.handle_frame(&auto_ann, &mut eph, PathIface::Auto);
+        assert!(alice.has_path(&hub_dh));
+        assert!(alice.has_path(&auto_dh));
+
+        alice.drop_paths_on(PathIface::Hub);
+
+        assert!(!alice.has_path(&hub_dh), "hub route must be dropped");
+        assert!(alice.has_path(&auto_dh), "local route must survive");
+        // Keys (known) are not interface-scoped and must survive both.
+        assert!(alice.known(&hub_dh).is_some(), "hub peer's key must survive");
+        assert!(alice.known(&auto_dh).is_some());
+        // The eviction-order mirror must not retain the dropped entry.
+        assert_eq!(alice.paths_order.iter().filter(|h| **h == hub_dh).count(), 0);
+    }
+
+    #[test]
+    fn expire_path_forgets_one_route_keeping_the_key() {
+        let bob_dh = single_destination_hash("lxmf", &["delivery"], &id(0x41).hash());
+        let ann = Transport::new(id(0x41)).make_announce("lxmf", &["delivery"], b"bob", &mut OsRng, 1_700_000_000);
+
+        let mut alice = Transport::new(id(0x11));
+        let mut eph = || [0u8; KEY_HALF];
+        alice.handle_frame(&ann, &mut eph, PathIface::Hub);
+        assert!(alice.has_path(&bob_dh));
+
+        assert!(alice.expire_path(&bob_dh), "first expiry removes the entry");
+        assert!(!alice.has_path(&bob_dh), "route is gone so a fresh path can be requested");
+        assert!(alice.known(&bob_dh).is_some(), "the peer's key must survive expiry");
+        assert_eq!(alice.paths_order.iter().filter(|h| **h == bob_dh).count(), 0);
+        assert!(!alice.expire_path(&bob_dh), "expiring an unknown route is a no-op");
     }
 
     #[test]
@@ -1968,7 +2062,7 @@ mod tests {
 
         let mut alice = Transport::new(id(0x11));
         let mut eph = || [0u8; KEY_HALF];
-        alice.handle_frame(&relayed, &mut eph);
+        alice.handle_frame(&relayed, &mut eph, PathIface::Hub);
         assert_eq!(alice.path_hops(&bob_dh), Some(7));
 
         let now = 1_000u64;
@@ -1988,7 +2082,7 @@ mod tests {
         // A destination with no known path keeps the flat floor.
         let carol_dh = single_destination_hash("lxmf", &["delivery"], &id(0x23).hash());
         let carol_ann = Transport::new(id(0x23)).make_announce("lxmf", &["delivery"], b"carol", &mut OsRng, 1_700_000_000);
-        alice.handle_frame(&carol_ann, &mut eph);
+        alice.handle_frame(&carol_ann, &mut eph, PathIface::Hub);
         let carol = alice.known(&carol_dh).unwrap().clone();
         let _ = alice.make_link_request(&carol_dh, &carol.identity, &[1; KEY_HALF], &[2; KEY_HALF], now);
         assert!(alice.pending_link_to(&carol_dh, now + PENDING_LINK_EXPIRY_SECS - 1));

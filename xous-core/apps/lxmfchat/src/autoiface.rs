@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use reticulum_core::autointerface::{discovery_token, group_discovery_address};
+use reticulum_core::transport::PathIface;
 use xous::CID;
 
 use crate::net::{Shared, plock};
@@ -298,7 +299,7 @@ fn data_rx(shared: Arc<Shared>, chat_cid: CID, sock: UdpSocket) {
             log::debug!("data from undiscovered {src_ip}, ignoring");
             continue;
         }
-        crate::net::handle_frame(&shared, chat_cid, &pddb, &trng, &buf[..n]);
+        crate::net::handle_frame(&shared, chat_cid, &pddb, &trng, &buf[..n], PathIface::Auto);
     }
 }
 
