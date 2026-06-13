@@ -3502,6 +3502,23 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
             }
             // 0b. The current phase's independent time budget is up.
             if now > outbox[i].deadline {
+                // Backstop: if the direct phase ran out of time before its
+                // per-stage escalations fired — a distant peer whose link
+                // windows (6 s/hop) outlast the 90 s direct budget, common when
+                // a local transport node routes onto a multi-hop backbone — fall
+                // back to the propagation node rather than giving up outright.
+                if !outbox[i].via_pn && !outbox[i].tried_pn && pn.is_some() {
+                    let label = peer_label(shared, &outbox[i].peer);
+                    outbox[i].via_pn = true;
+                    outbox[i].deadline = now + PROP_DEADLINE;
+                    outbox[i].next_action = now;
+                    chat::cf_set_status_text(
+                        chat_cid,
+                        &format!("{label}: direct delivery timed out — trying propagation node…"),
+                    );
+                    i += 1;
+                    continue;
+                }
                 let m = outbox.remove(i);
                 let why = if m.via_pn {
                     "propagation node unconfirmed"
