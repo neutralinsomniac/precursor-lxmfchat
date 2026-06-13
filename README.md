@@ -83,6 +83,11 @@ App (`apps/lxmfchat`, the **default boot app**):
 - Networking: waits for wifi (DHCP) before dialing, auto-reconnects with
   capped backoff, 30 s keepalives, and a stuck-write watchdog that resets the
   socket if a hub write wedges (Xous write timeouts are not reliable).
+- **Local peering over wifi (RNS AutoInterface)** — zero-conf IPv6 link-local
+  multicast peer discovery, so the device messages other local Reticulum nodes
+  (another Precursor, or `rnsd`/NomadNet) with **no hub**; a local transport
+  node routes onward just like a hub. Toggle under **Interfaces → Local peers**.
+  Requires patched EC firmware — see [Local peering](#local-peering-over-wifi-autointerface).
 
 ## Hardware crypto caveats (Precursor)
 
@@ -182,6 +187,83 @@ syncs from the propagation node. Menu: **Announces**, **Contacts** (pick a
 thread; unread badges), **Connect**, **Announce**, **My address**, **Set
 peer**, **Set hub**, **Sync messages**, **Clear history**. Type to send —
 direct first, propagation fallback, with the delivery mark updating in place.
+
+## Local peering over wifi (AutoInterface)
+
+`apps/lxmfchat` can reach other Reticulum nodes on the same wifi with **no hub**
+via RNS **AutoInterface** — zero-conf IPv6 link-local multicast peer discovery.
+Toggle it on-device under **Interfaces → Local peers**; any local node running
+an AutoInterface (`rnsd`/NomadNet, or another Precursor) becomes reachable, and
+a local transport node routes onward exactly like a hub.
+
+This needs **patched EC firmware**: the stock EC↔SoC bridge drops every IPv6
+frame, so multicast discovery never reaches Xous. The fix is one commit on top
+of the in-tree v0.9.15 EC image — it forwards IPv6 (ethertype `0x86DD`) across
+the bridge (dropping only the noisy mDNS/LLMNR/SSDP link-local groups) and
+**leaves the WF200 multicast RX filter at its power-on default (accept all)**.
+That last part is counterintuitive: adding *any* address to that filter — even
+the FMAC-documented broadcast "allow-all" — flips this firmware into a whitelist
+mode it implements unreliably, dropping even all-nodes traffic. (Full diagnosis
+in `UPSTREAM.md`.)
+
+- Fork: <https://github.com/neutralinsomniac/betrusted-ec>
+
+### Build `ec_fw.bin`
+
+The EC is a separate RISC-V softcore image, built from the betrusted-ec tree:
+
+```
+git clone https://github.com/neutralinsomniac/betrusted-ec
+cd betrusted-ec
+git submodule update --init --recursive
+rustup target add riscv32i-unknown-none-elf
+cargo update -p openssl-sys          # 0.9.58 can't parse OpenSSL 3 headers
+```
+
+The build invokes the toolchain as `riscv-none-elf-*`, but nixpkgs ships it as
+`riscv32-none-elf-*`. Bridge the names with a shim dir on `PATH`:
+
+```
+mkdir -p /tmp/ecbin
+for t in ar as gcc ld objcopy objdump; do
+  printf '#!/bin/sh\nexec riscv32-none-elf-%s "$@"\n' "$t" > /tmp/ecbin/riscv-none-elf-$t
+  chmod +x /tmp/ecbin/riscv-none-elf-$t
+done
+```
+
+Then build (NixOS — the shell supplies the cross-gcc, pkg-config, and openssl):
+
+```
+nix-shell -p pkg-config openssl pkgsCross.riscv32-embedded.buildPackages.gcc \
+  --run "PATH=/tmp/ecbin:\$PATH cargo xtask hw-image"
+```
+
+The USB-update package lands at `precursors/ec_fw.bin` (`bt-ec.bin` is the JTAG
+variant).
+
+### Flash
+
+Stage the EC package, then apply it from the device:
+
+```
+# from this repo — reuses flash.sh's python + libusb env. This also rewrites
+# the kernel, which is harmless.
+scripts/flash.sh -e /path/to/betrusted-ec/precursors/ec_fw.bin
+```
+
+Then on the device: **main menu → "Force EC update"**, and let it reboot. The EC
+staging slot sits inside the `--erase-pddb` wipe range, so re-stage if you ever
+wipe the PDDB. Verify under **Interfaces → Local peers** — it should find a peer
+within a few seconds of any local AutoInterface node beaconing.
+
+### Peer-side (`rnsd`/NomadNet) config
+
+The Precursor is a leaf node. To also **see announces** from a local transport
+node, that node's AutoInterface must not be in `access_point` mode — RNS
+deliberately blocks the announce stream (even the node's own announce) onto
+access-point interfaces. Use `mode = gateway` or `mode = full` for the firehose;
+in `access_point` mode the Precursor still messages on demand via path requests,
+just without a browsable announce directory.
 
 ## Known limitations
 
