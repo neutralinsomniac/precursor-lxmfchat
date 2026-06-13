@@ -1112,6 +1112,13 @@ impl<'a> LxmfChat<'a> {
     /// get listed under a placeholder name when unknown — upgraded to the real
     /// name by their index page's title, like address-browsed nodes.
     fn open_page(&mut self, node: &[u8; TRUNCATED_HASHLENGTH], path: &str) {
+        // NomadNet appends request fields after a backtick on the URL —
+        // `/page/x.mu`g=openbsd|r=src.git` — that travel as request data, not as
+        // part of the path. Split them off so the node sees the real path.
+        let (path, vars) = match path.split_once('`') {
+            Some((p, fields)) => (p, parse_vars(fields)),
+            None => (path, Vec::new()),
+        };
         if !plock(&self.shared.saved_nodes).contains_key(node) {
             let name = plock(&self.shared.nodes_seen)
                 .get(node)
@@ -1120,7 +1127,7 @@ impl<'a> LxmfChat<'a> {
             plock(&self.shared.saved_nodes).insert(*node, name.clone());
             persist_node(&self.pddb, node, &name);
         }
-        net::request_page(&self.shared, self.chat_cid, *node, path, Vec::new(), true);
+        net::request_page(&self.shared, self.chat_cid, *node, path, vars, true);
     }
 
     /// A bookmark's display label: node name + path (+ vars when present).
