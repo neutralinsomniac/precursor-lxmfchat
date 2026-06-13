@@ -249,6 +249,8 @@ fn main() -> ! {
             ip_addrs.push(ll).ok();
         });
     }
+    // memberships requested by clients; must survive Interface rebuilds on wifi reconnect
+    let mut v6_groups: Vec<smoltcp::wire::Ipv6Address> = Vec::new();
 
     // Create sockets
     let icmp_rx_buffer = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY], vec![0; 256]);
@@ -389,6 +391,9 @@ fn main() -> ! {
                             iface.update_ip_addrs(|ip_addrs| {
                                 ip_addrs.push(ll).ok();
                             });
+                        }
+                        for group in &v6_groups {
+                            iface.join_multicast_group_v6(*group);
                         }
                         config_valid = true;
                     } else {
@@ -1988,6 +1993,9 @@ fn main() -> ! {
                 let group = smoltcp::wire::Ipv6Address::from_bytes(&b);
                 let ok = iface.join_multicast_group_v6(group);
                 if ok {
+                    if !v6_groups.contains(&group) {
+                        v6_groups.push(group);
+                    }
                     log::info!("joined IPv6 multicast group {}", group);
                 } else {
                     log::warn!("IPv6 multicast group table full, can't join {}", group);
@@ -2001,6 +2009,7 @@ fn main() -> ! {
                 }
                 let group = smoltcp::wire::Ipv6Address::from_bytes(&b);
                 let ok = iface.leave_multicast_group_v6(group);
+                v6_groups.retain(|g| g != &group);
                 xous::return_scalar(msg.sender, if ok { 1 } else { 0 }).ok();
             }),
             Some(Opcode::GetMulticastTxCount) => msg_blocking_scalar_unpack!(msg, _, _, _, _, {
