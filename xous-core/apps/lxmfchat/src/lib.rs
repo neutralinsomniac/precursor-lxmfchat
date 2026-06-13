@@ -443,7 +443,7 @@ impl<'a> LxmfChat<'a> {
                 }
                 *plock(&self.shared.display_name) = name.clone();
                 write_string(&self.pddb, KEY_NAME, &name);
-                if self.shared.connected.load(core::sync::atomic::Ordering::SeqCst) {
+                if net::any_interface_up(&self.shared) {
                     self.announce(); // tell the network right away
                 } else {
                     self.chat.set_status_text(&format!("name set: {name} (announced on connect)"));
@@ -1281,8 +1281,8 @@ impl<'a> LxmfChat<'a> {
     /// `net::broadcast_out` (hub + local peers), whose bounded mutex wait + stuck-write watchdog mean
     /// this can delay the UI a couple of seconds at worst, never freeze it.
     fn write_framed(&self, raw: &[u8]) -> bool {
-        if !self.shared.connected.load(core::sync::atomic::Ordering::SeqCst) {
-            self.chat.set_status_text("not connected (menu → Connect)");
+        if !net::any_interface_up(&self.shared) {
+            self.chat.set_status_text("no connection (hub or local peers)");
             return false;
         }
         if net::broadcast_out(&self.shared, raw) {
