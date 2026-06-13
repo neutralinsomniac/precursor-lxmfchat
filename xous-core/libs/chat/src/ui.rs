@@ -114,6 +114,12 @@ pub(crate) struct DocState {
     top: usize,
     /// cursor line; when it is a link line it renders highlighted
     cursor: usize,
+    /// first line at/after `top` that the last draw did NOT render fully (a
+    /// partially-clipped bottom line, or the first undrawn line). Recorded by
+    /// `layout_document` from the real draw so page-down lands here instead of
+    /// recomputing a fits-count that can disagree with what was drawn and skip
+    /// a line. `total` means the whole tail fit (page-down is a no-op).
+    next_top: usize,
 }
 
 #[allow(dead_code)]
@@ -620,6 +626,7 @@ impl Ui {
             heights: Vec::new(),
             top: 0,
             cursor: 0,
+            next_top: 0,
         });
     }
 
@@ -737,12 +744,18 @@ impl Ui {
     /// Scroll the document by one screenful, parking the cursor on the new
     /// top line (so paging and line-stepping compose predictably).
     pub(crate) fn doc_page(&mut self, down: bool) {
-        let (top, total) = match self.document.as_ref() {
-            Some(d) if !d.lines.is_empty() => (d.top, d.lines.len()),
+        let (top, total, next_top) = match self.document.as_ref() {
+            Some(d) if !d.lines.is_empty() => (d.top, d.lines.len(), d.next_top),
             _ => return,
         };
         let new_top = if down {
-            (top + self.doc_visible_count(top)).min(total - 1)
+            // Land on the first line the last draw couldn't show in full (see
+            // `next_top`); `max(top + 1)` still advances when a single line is
+            // taller than the whole viewport, so paging never gets stuck.
+            if next_top >= total {
+                return; // whole tail already on screen
+            }
+            next_top.max(top + 1).min(total - 1)
         } else {
             // Walk backward until another screenful of (cached) heights is
             // behind the old top.
@@ -918,11 +931,16 @@ impl Ui {
             )
             .expect("can't clear canvas area");
 
-        // Fresh metrics: the draw cutoff must agree with doc_visible_count or
-        // paging diverges from what was actually shown.
+        // Fresh metrics. As we draw, record the first line that does NOT fit
+        // fully (a partially-clipped bottom line, or the first undrawn line):
+        // that is where page-down must land so the cut line is read in full.
+        // Deriving it from the real draw — rather than a separate fits-count —
+        // is what keeps paging from skipping a line. `total` => the tail fit.
+        let mut next_top = total;
         let mut y = y0;
         for i in top..total {
             if y >= bottom {
+                next_top = i;
                 break;
             }
             let line = match self.document.as_ref().and_then(|d| d.lines.get(i)) {
@@ -953,6 +971,11 @@ impl Ui {
                     Err(_) => DOC_DIVIDER_HEIGHT,
                 }
             };
+            // First line whose bottom edge runs past the viewport: it is drawn
+            // (clipped) but not fully readable, so the next page starts here.
+            if next_top == total && y + drawn_h as isize > bottom {
+                next_top = i;
+            }
             if i == cursor {
                 // The cursor bar: a solid strip at the left edge of the cursor
                 // line, so your place on the page is visible even when the
@@ -974,6 +997,9 @@ impl Ui {
                     .ok();
             }
             y += drawn_h as isize + self.vp.bubble_space;
+        }
+        if let Some(doc) = self.document.as_mut() {
+            doc.next_top = next_top;
         }
 
         // Status bar on top, exactly like the chat layout.
