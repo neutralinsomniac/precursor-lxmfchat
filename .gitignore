@@ -1,5 +1,9 @@
 target/
 
+# dev environment (nix + direnv + python venv)
+/.venv/
+/.direnv/
+
 # vendored xous-core: exclude upstream test/emulation blobs (not needed to build)
 xous-core/precursors/*.wav
 xous-core/emulation/versatile-vmlinux

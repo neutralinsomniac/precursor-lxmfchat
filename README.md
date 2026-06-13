@@ -24,7 +24,7 @@ xous-core/                         # vendored betrusted-io/xous-core (the OS)
 host-client/                       # std host client (live testing + reference for the app)
 reference/                         # RNS/LXMF Python sources + oracle/test scripts
 scripts/                           # interop.sh, sync_test.sh, flash.sh, run-hosted.sh, …
-.venv/                             # Python rns + lxmf for interop testing
+shell.nix / .envrc                 # dev environment (direnv); requirements.txt for the venv
 ```
 
 `reticulum-core` and `lxmf` are deliberately **sans-IO** (no sockets, timers,
@@ -32,6 +32,28 @@ RNG or Xous dependencies): randomness, time, storage and the transport socket
 are injected by the caller. This makes them unit- and interop-testable with
 plain `cargo test` on the host, and lets the Xous app and the host client share
 the exact same protocol code.
+
+## Development environment
+
+The build/flash/test scripts need a few non-Rust pieces — X11 (hosted GUI),
+libusb (flashing), a riscv32 cross-toolchain + openssl (EC firmware), and a
+Python venv with RNS/LXMF. These are provided declaratively by `shell.nix`, with
+[direnv](https://direnv.net/) loading it automatically:
+
+```
+direnv allow            # once — then the env loads on cd into the repo
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # one-time
+```
+
+(No direnv? `nix-shell` drops you into the same environment.) Rust itself stays
+on **rustup**, which owns the Xous targets:
+
+```
+rustup target add riscv32imac-unknown-xous-elf riscv32imac-unknown-none-elf
+```
+
+With the shell active, the scripts and `cargo xtask` commands below Just Work —
+no per-command `nix-build`/`LD_LIBRARY_PATH` wrangling.
 
 ## What works (validated against Python RNS 1.3.5 / LXMF 1.0.1, and on hardware)
 
@@ -116,9 +138,10 @@ cargo test -p reticulum-core -p lxmf
 Python reference (announces, tokens, LXMF messages, tickets, stamps, RFC 8032
 / RFC 7748 vectors, Resource reassembly incl. bz2).
 
-### Live interop harness (host, requires the venv)
+### Live interop harness (host)
+From inside the dev shell with the venv created (see
+[Development environment](#development-environment)):
 ```
-python3 -m venv .venv && . .venv/bin/activate && pip install rns lxmf
 ./scripts/interop.sh        # announces, tokens, LXMF both directions vs Python
 ./scripts/sync_test.sh      # propagation-node sync vs a real-rns node
 ```
@@ -126,7 +149,6 @@ python3 -m venv .venv && . .venv/bin/activate && pip install rns lxmf
 ### Live end-to-end over a real Reticulum hub
 Start a local `rnsd` transport hub with a TCP server interface:
 ```
-. .venv/bin/activate
 mkdir -p /tmp/rns-hub && cat > /tmp/rns-hub/config <<'EOF'
 [reticulum]
   enable_transport = Yes
@@ -166,9 +188,9 @@ Build-time configuration (baked in via `option_env!`):
 
 Targets:
 
-- **Hosted mode** (dev machine, minifb window):
-  `cd xous-core && cargo xtask run lxmfchat`
-  On **NixOS** use `scripts/run-hosted.sh` (puts X11 libs on `LD_LIBRARY_PATH`).
+- **Hosted mode** (dev machine, minifb window): `scripts/run-hosted.sh` (or
+  `cd xous-core && cargo xtask run lxmfchat` — the dev shell already has X11 on
+  `LD_LIBRARY_PATH`).
 - **Compile-check the hosted image:** `cargo xtask hosted-ci lxmfchat`
 - **Hardware image** (the vendored tree is a shallow clone with no tags, so
   pass an explicit version for image signing):
@@ -177,10 +199,9 @@ Targets:
       --git-describe v0.9.8-792-g2005a801 \
       --git-rev 2005a801c917753175d3826446ce1352c119e020
   ```
-- **Flash:** `scripts/flash.sh` (wraps `tools/usb_update.py` with the right
-  python env + libusb path; takes ~14 minutes; do not interrupt the write).
-  `--erase-pddb` additionally wipes the PDDB — this regenerates the LXMF
-  identity, i.e. a **new address**.
+- **Flash:** `scripts/flash.sh` (wraps `tools/usb_update.py`; takes ~14 minutes;
+  do not interrupt the write). `--erase-pddb` additionally wipes the PDDB — this
+  regenerates the LXMF identity, i.e. a **new address**.
 
 On device: the app connects automatically once wifi is up, announces, and
 syncs from the propagation node. Menu: **Announces**, **Contacts** (pick a
@@ -210,7 +231,8 @@ in `UPSTREAM.md`.)
 
 ### Build `ec_fw.bin`
 
-The EC is a separate RISC-V softcore image, built from the betrusted-ec tree:
+The EC is a separate RISC-V softcore image, built from the betrusted-ec tree.
+One-time setup:
 
 ```
 git clone https://github.com/neutralinsomniac/betrusted-ec
@@ -220,34 +242,28 @@ rustup target add riscv32i-unknown-none-elf
 cargo update -p openssl-sys          # 0.9.58 can't parse OpenSSL 3 headers
 ```
 
-The build invokes the toolchain as `riscv-none-elf-*`, but nixpkgs ships it as
-`riscv32-none-elf-*`. Bridge the names with a shim dir on `PATH`:
+This repo's `shell.nix` supplies the cross-toolchain and openssl (the build
+calls the toolchain as `riscv-none-elf-*`, which `shell.nix` provides as
+wrappers over nixpkgs' `riscv32-none-elf-*`). Build the EC from inside that
+shell — `nix-shell` keeps the env across the `cd`, so point it at this repo's
+`shell.nix`:
 
 ```
-mkdir -p /tmp/ecbin
-for t in ar as gcc ld objcopy objdump; do
-  printf '#!/bin/sh\nexec riscv32-none-elf-%s "$@"\n' "$t" > /tmp/ecbin/riscv-none-elf-$t
-  chmod +x /tmp/ecbin/riscv-none-elf-$t
-done
+nix-shell /path/to/precursor-reticulum/shell.nix \
+  --run "cd /path/to/betrusted-ec && cargo xtask hw-image"
 ```
 
-Then build (NixOS — the shell supplies the cross-gcc, pkg-config, and openssl):
-
-```
-nix-shell -p pkg-config openssl pkgsCross.riscv32-embedded.buildPackages.gcc \
-  --run "PATH=/tmp/ecbin:\$PATH cargo xtask hw-image"
-```
-
-The USB-update package lands at `precursors/ec_fw.bin` (`bt-ec.bin` is the JTAG
-variant).
+(Or drop a copy of `shell.nix` + `.envrc` into your betrusted-ec fork and let
+direnv handle it.) The USB-update package lands at `precursors/ec_fw.bin`
+(`bt-ec.bin` is the JTAG variant).
 
 ### Flash
 
 Stage the EC package, then apply it from the device:
 
 ```
-# from this repo — reuses flash.sh's python + libusb env. This also rewrites
-# the kernel, which is harmless.
+# from this repo, inside the dev shell. This also rewrites the kernel, which is
+# harmless.
 scripts/flash.sh -e /path/to/betrusted-ec/precursors/ec_fw.bin
 ```
 

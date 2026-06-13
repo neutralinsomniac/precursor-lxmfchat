@@ -12,7 +12,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 LOG=/tmp/page_node.log
-PY="$ROOT/.venv/bin/python3"
+PY="python3"
 HC="$ROOT/host-client/target/debug/reticulum-host-client"
 
 [ -x "$HC" ] || { echo "build host-client first: (cd host-client && cargo build)"; exit 1; }

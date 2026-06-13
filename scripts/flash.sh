@@ -10,11 +10,9 @@
 # Set FLASH_LOADER=1 to also flash the loader (needed the first time, or after a
 # loader/bootloader change).
 #
-# pyusb needs a libusb backend; on NixOS libusb-1.0.so isn't on the default loader
-# path, so we resolve it via nix-build and put it on LD_LIBRARY_PATH. USB access
-# usually needs root: if you get a permission/access error, re-run as
-# `sudo scripts/flash.sh` (this script re-sets the lib path internally, so sudo
-# stripping the environment is fine).
+# Run from within the repo's dev environment (direnv / nix-shell — see shell.nix),
+# which puts libusb on LD_LIBRARY_PATH and the venv's python on PATH. USB access
+# needs a udev rule for the Precursor; with that in place no root is required.
 #
 # Extra args are passed through to usb_update.py (e.g. --force, --erase-pddb).
 set -euo pipefail
@@ -27,9 +25,6 @@ KERNEL="$REL/xous.img"
 LOADER="$REL/loader.bin"
 [ -f "$KERNEL" ] || { echo "missing $KERNEL — build with 'cargo xtask app-image lxmfchat …' first" >&2; exit 1; }
 
-LIBUSB="$(nix-build --no-out-link '<nixpkgs>' -A libusb1 2>/dev/null)/lib"
-export LD_LIBRARY_PATH="${LIBUSB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-
 LOADER_ARGS=()
 if [ "${FLASH_LOADER:-0}" = "1" ]; then
   LOADER_ARGS=(-l "$LOADER")
@@ -38,5 +33,4 @@ else
   echo "flashing kernel only (set FLASH_LOADER=1 to also flash the loader)"
 fi
 
-PY="$ROOT/.venv/bin/python3"
-exec "$PY" xous-core/tools/usb_update.py -k "$KERNEL" "${LOADER_ARGS[@]}" "$@"
+exec python3 xous-core/tools/usb_update.py -k "$KERNEL" "${LOADER_ARGS[@]}" "$@"

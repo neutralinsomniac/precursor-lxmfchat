@@ -2,15 +2,13 @@
 # Live interop harness: cross-checks the Rust reticulum-core/lxmf implementation
 # against the Python Reticulum reference (RNS) using the fixed reference identity.
 #
-# Prereqs: ./.venv with `rns` + `lxmf` installed (see README), and the cloned
-# xous-core workspace. Run from the repository root:
+# Prereqs: the repo's dev environment (direnv / nix-shell — see shell.nix) with
+# the .venv created (rns + lxmf; see requirements.txt). Run from the repo root:
 #     scripts/interop.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-# shellcheck disable=SC1091
-source .venv/bin/activate
 
 PRV="$(python3 -c "print(('05'*32)+('06'*32))")"
 PROBE=(cargo run --quiet --manifest-path xous-core/libs/reticulum-core/Cargo.toml --example interop_probe --)
