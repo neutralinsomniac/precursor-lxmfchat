@@ -3703,6 +3703,7 @@ version = "0.1.0"
 dependencies = [
  "blitstr2",
  "chat",
+ "com",
  "gam",
  "llio",
  "log",

@@ -346,13 +346,46 @@ impl<'a> LxmfChat<'a> {
                 (false, _) => "Local peers: off → on".to_string(),
             },
             format!("Set hub address ({})", self.hub),
+            "Net stats".to_string(),
         ];
         match self.pick_from_list(modals, &labels, "Interfaces") {
             Some(0) => self.toggle_hub(),
             Some(1) => self.toggle_local_peers(),
             Some(2) => self.set_hub_interactive(modals),
+            Some(3) => self.show_net_stats(modals),
             _ => {}
         }
+    }
+
+    #[cfg(target_os = "xous")]
+    pub fn show_net_stats(&self, modals: &modals::Modals) {
+        let xns = XousNames::new().unwrap();
+        match com::Com::new(&xns) {
+            Ok(com) => {
+                let f = com.wlan_filter_stats().map(|s| s.bins).unwrap_or([0u16; 13]);
+                let (tx_errs, drops) =
+                    com.wlan_debug().map(|d| (d.tx_errs, d.drops)).unwrap_or((u32::MAX, u32::MAX));
+                let radio_tx = ::net::NetManager::new().multicast_tx_count().unwrap_or(usize::MAX);
+                modals
+                    .show_notification(
+                        &format!(
+                            "EC filter bins (since assoc)\nfwd {}  arp {}  icmp {}  dhcp {}  udp {}\ndrops: multi {}  etype {}  noise {}\nproto {}  frag {}  ipck {}  udpck {}  dhcp {}\nEC tx_errs {}  drops {}\nSoC mcast tx {}",
+                            f[12], f[8], f[9], f[10], f[11], f[3], f[1], f[0], f[4], f[5], f[6],
+                            f[7], f[2], tx_errs, drops, radio_tx
+                        ),
+                        None,
+                    )
+                    .ok();
+            }
+            Err(_) => {
+                modals.show_notification("COM unavailable", None).ok();
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "xous"))]
+    pub fn show_net_stats(&self, modals: &modals::Modals) {
+        modals.show_notification("EC stats only available on hardware", None).ok();
     }
 
     pub fn toggle_hub(&mut self) {

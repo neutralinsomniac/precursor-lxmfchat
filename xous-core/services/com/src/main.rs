@@ -1192,6 +1192,18 @@ fn main() -> ! {
                 };
                 buffer.replace(debug).unwrap();
             }
+            Some(Opcode::WlanFilterStats) => {
+                // not yet in the pinned com_rs crate; must match betrusted-ec's WLAN_FILTER_STATS
+                const WLAN_FILTER_STATS_VERB: u16 = 0x230C;
+                com.txrx(WLAN_FILTER_STATS_VERB);
+                let mut stats = WlanFilterStats::default();
+                for bin in stats.bins.iter_mut() {
+                    *bin = com.wait_txrx(ComState::LINK_READ.verb, Some(STD_TIMEOUT));
+                }
+                let mut buffer =
+                    unsafe { Buffer::from_memory_message_mut(msg.body.memory_message_mut().unwrap()) };
+                buffer.replace(stats).unwrap();
+            }
             None => {
                 error!("unknown opcode");
                 break;

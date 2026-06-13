@@ -572,6 +572,15 @@ impl Com {
         Ok(response)
     }
 
+    pub fn wlan_filter_stats(&self) -> Result<WlanFilterStats, xous::Error> {
+        let prealloc = WlanFilterStats::default();
+        let mut buf = Buffer::into_buf(prealloc).or(Err(xous::Error::InternalError))?;
+        buf.lend_mut(self.conn, Opcode::WlanFilterStats.to_u32().expect("WlanFilterStats failed"))
+            .or(Err(xous::Error::InternalError))?;
+        let response = buf.to_original().expect("Couldn't convert WlanFilterStats buffer");
+        Ok(response)
+    }
+
     pub fn wlan_fetch_packet(&self, pkt: &mut [u8]) -> Result<(), xous::Error> {
         if pkt.len() > NET_MTU {
             return Err(xous::Error::OutOfMemory);
