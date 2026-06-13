@@ -124,14 +124,6 @@ impl WlanStatus {
     }
 }
 
-/// EC packet filter bin counters, in the EC's FilterStats field order:
-/// drop_noise, drop_etype, drop_dhcp, drop_multi, drop_proto, drop_frag,
-/// drop_ipck, drop_udpck, arp, icmp, dhcp, udp, com_fwd
-#[derive(Debug, Copy, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Default)]
-pub struct WlanFilterStats {
-    pub bins: [u16; 13],
-}
-
 #[derive(Debug, Copy, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Default)]
 pub struct WlanDebug {
     pub tx_errs: u32,
@@ -294,12 +286,6 @@ pub(crate) enum Opcode {
 
     /// gets more details on the latest interrupt
     IntFetchVector = 49,
-
-    /// wlan: EC packet filter bin counters
-    WlanFilterStats = 50,
-
-    /// wlan: add a multicast MAC to the WF200 RX whitelist
-    WlanAddMcastMac = 51,
 }
 
 /// These enums indicate what kind of callback type we're sending.

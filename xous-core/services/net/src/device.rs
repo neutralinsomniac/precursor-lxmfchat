@@ -12,7 +12,7 @@ use smoltcp::wire::{
     Ipv4Packet, Ipv4Repr, /* IpProtocol, TcpPacket, TcpRepr, IpAddress, UdpPacket, UdpRepr */
 };
 
-use crate::{IPV4_ADDRESS, MAC_ADDRESS_LSB, MAC_ADDRESS_MSB, MCAST_RX_COUNT, MCAST_TX_COUNT};
+use crate::{IPV4_ADDRESS, MAC_ADDRESS_LSB, MAC_ADDRESS_MSB};
 
 pub struct NetPhy {
     rx_buffer: [u8; NET_MTU],
@@ -128,9 +128,6 @@ impl<'a, 'c> phy::RxToken for NetPhyRxToken<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        if self.buf.len() >= 2 && self.buf[0] == 0x33 && self.buf[1] == 0x33 {
-            MCAST_RX_COUNT.fetch_add(1, Ordering::SeqCst);
-        }
         let result = f(&mut self.buf);
         //log::info!("rx: {:x?}", self.buf);
         result
@@ -400,13 +397,6 @@ impl<'a> phy::TxToken for NetPhyTxToken<'a> {
         }
         // forward the packet on if it's not a loopback (loopback will call return early and exit before
         // getting to this line)
-        //
-        // Diagnostic: count multicast (non-broadcast) frames actually handed to
-        // the EC — distinguishes "smoltcp dropped it" from "the radio ate it"
-        // when multicast TX goes missing on air.
-        if self.buf[0] & 0x01 == 1 && self.buf[..6] != [0xffu8; 6] {
-            MCAST_TX_COUNT.fetch_add(1, Ordering::SeqCst);
-        }
         self.com.wlan_send_packet(&self.buf[..len]).expect("driver error sending WLAN packet");
 
         result

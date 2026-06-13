@@ -21,7 +21,6 @@ ux-api = { path = "../../libs/ux-api" }
 blitstr2 = { path = "../../libs/blitstr2" }
 trng = { path = "../../services/trng" }
 net = { path = "../../services/net" }
-com = { path = "../../services/com" }
 pddb = { path = "../../services/pddb" }
 modals = { path = "../../services/modals" }
 chat = { path = "../../libs/chat" }

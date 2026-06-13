@@ -28,6 +28,9 @@ const TICK_MS: u64 = 2600;
 const PEERING_TIMEOUT_SECS: u64 = 22;
 const MAX_PEERS: usize = 16;
 const HW_MTU: usize = 1196;
+/// How often to re-assert the multicast join while peerless (recovers from a
+/// wifi reconnect that dropped the netstack's group membership).
+const REJOIN_INTERVAL_SECS: u64 = 15;
 
 pub struct AutoState {
     pub started: bool,
@@ -100,6 +103,17 @@ fn join_group(_sock: &UdpSocket, group: &Ipv6Addr, _scope: u32) -> bool {
 fn join_group(sock: &UdpSocket, group: &Ipv6Addr, scope: u32) -> bool {
     sock.join_multicast_v6(group, scope).is_ok()
 }
+
+/// Re-assert membership without the socket (it lives in the rx thread). On Xous
+/// the join is iface-level, so this is enough; libstd needs the socket, but a
+/// reconnect there doesn't drop a host-OS membership, so it's a no-op.
+#[cfg(target_os = "xous")]
+fn rejoin_group(group: &Ipv6Addr) {
+    net::NetManager::new().join_multicast_v6(*group).ok();
+}
+
+#[cfg(not(target_os = "xous"))]
+fn rejoin_group(_group: &Ipv6Addr) {}
 
 /// Idempotent. Returns false (reason on the status bar) when there's no
 /// link-local address yet, i.e. wifi isn't up.
@@ -290,14 +304,8 @@ fn data_rx(shared: Arc<Shared>, chat_cid: CID, sock: UdpSocket) {
 
 fn announce_loop(shared: Arc<Shared>, chat_cid: CID, group: Ipv6Addr) {
     let mut last_beacon: u64 = 0;
-    // Status on the first beacons (with the count of multicast frames that
-    // actually reached the radio), and on errors (throttled) — a beacon the
-    // netstack eats after the socket queue is otherwise indistinguishable
-    // from a working one.
-    let mut beacons_sent: u32 = 0;
     let mut last_err_status: u64 = 0;
-    #[cfg(target_os = "xous")]
-    let netmgr = net::NetManager::new();
+    let mut last_rejoin: u64 = 0;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
         if !enabled(&shared) {
@@ -311,33 +319,25 @@ fn announce_loop(shared: Arc<Shared>, chat_cid: CID, group: Ipv6Addr) {
             (Some(a), Some(t)) => (a, t),
             _ => continue,
         };
+        // A wifi reconnect can rebuild the netstack interface and silently drop
+        // our multicast-group membership, leaving discovery one-way until a
+        // manual toggle. While we have no peers, periodically re-assert the join
+        // (idempotent); once peers are present it's clearly intact, so stay quiet.
+        if plock(&shared.auto).peers.is_empty()
+            && now_secs().saturating_sub(last_rejoin) >= REJOIN_INTERVAL_SECS
+        {
+            last_rejoin = now_secs();
+            rejoin_group(&group);
+        }
         let token = discovery_token(GROUP_ID, &our_ll);
         if now_secs().saturating_sub(last_beacon) * 1000 >= ANNOUNCE_INTERVAL_MS {
             last_beacon = now_secs();
             let dest = SocketAddrV6::new(group, DISCOVERY_PORT, 0, scope);
-            match tx.send_to(&token, dest) {
-                Ok(_) => {
-                    beacons_sent += 1;
-                    if beacons_sent <= 3 {
-                        // Let the netstack's pump dispatch the queued datagram
-                        // before sampling the radio counter.
-                        std::thread::sleep(std::time::Duration::from_millis(1000));
-                        #[cfg(target_os = "xous")]
-                        let radio = netmgr.multicast_tx_count().unwrap_or(0);
-                        #[cfg(not(target_os = "xous"))]
-                        let radio = beacons_sent as usize;
-                        chat::cf_set_status_text(
-                            chat_cid,
-                            &format!("local: beacon {beacons_sent} as {our_ll} — radio tx {radio}"),
-                        );
-                    }
-                }
-                Err(e) => {
-                    log::warn!("multicast announce failed: {e}");
-                    if now_secs().saturating_sub(last_err_status) > 30 {
-                        last_err_status = now_secs();
-                        chat::cf_set_status_text(chat_cid, &format!("local: beacon failed: {e}"));
-                    }
+            if let Err(e) = tx.send_to(&token, dest) {
+                log::warn!("multicast announce failed: {e}");
+                if now_secs().saturating_sub(last_err_status) > 30 {
+                    last_err_status = now_secs();
+                    chat::cf_set_status_text(chat_cid, &format!("local: beacon failed: {e}"));
                 }
             }
         }

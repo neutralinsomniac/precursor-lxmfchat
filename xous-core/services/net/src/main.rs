@@ -43,8 +43,6 @@ use xous_ipc::Buffer;
 // 0 indicates no address is currently assigned
 pub static IPV4_ADDRESS: AtomicU32 = AtomicU32::new(0);
 /// Multicast (non-broadcast) ethernet frames handed to the EC for transmit.
-pub static MCAST_TX_COUNT: AtomicU32 = AtomicU32::new(0);
-pub static MCAST_RX_COUNT: AtomicU32 = AtomicU32::new(0);
 // stash the MAC address for inserstion as a loopback target. Coded as big-end bytes.
 pub static MAC_ADDRESS_LSB: AtomicU32 = AtomicU32::new(0);
 pub static MAC_ADDRESS_MSB: AtomicU16 = AtomicU16::new(0);
@@ -395,8 +393,6 @@ fn main() -> ! {
                         }
                         for group in &v6_groups {
                             iface.join_multicast_group_v6(*group);
-                            let o = group.0;
-                            com.wlan_add_multicast_mac([0x33, 0x33, o[12], o[13], o[14], o[15]]).ok();
                         }
                         config_valid = true;
                     } else {
@@ -1999,9 +1995,6 @@ fn main() -> ! {
                     if !v6_groups.contains(&group) {
                         v6_groups.push(group);
                     }
-                    // the WF200 RX whitelist filters by L2 MAC; the IPv6 group's
-                    // 33:33:xx:xx:xx:xx mapping must be added or the radio drops it
-                    com.wlan_add_multicast_mac([0x33, 0x33, b[12], b[13], b[14], b[15]]).ok();
                     log::info!("joined IPv6 multicast group {}", group);
                 } else {
                     log::warn!("IPv6 multicast group table full, can't join {}", group);
@@ -2017,12 +2010,6 @@ fn main() -> ! {
                 let ok = iface.leave_multicast_group_v6(group);
                 v6_groups.retain(|g| g != &group);
                 xous::return_scalar(msg.sender, if ok { 1 } else { 0 }).ok();
-            }),
-            Some(Opcode::GetMulticastRxCount) => msg_blocking_scalar_unpack!(msg, _, _, _, _, {
-                xous::return_scalar(msg.sender, MCAST_RX_COUNT.load(Ordering::SeqCst) as usize).ok();
-            }),
-            Some(Opcode::GetMulticastTxCount) => msg_blocking_scalar_unpack!(msg, _, _, _, _, {
-                xous::return_scalar(msg.sender, MCAST_TX_COUNT.load(Ordering::SeqCst) as usize).ok();
             }),
             Some(Opcode::HasIpv6Addr) => msg_blocking_scalar_unpack!(msg, a0, a1, a2, a3, {
                 let mut b = [0u8; 16];
