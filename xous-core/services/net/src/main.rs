@@ -44,6 +44,7 @@ use xous_ipc::Buffer;
 pub static IPV4_ADDRESS: AtomicU32 = AtomicU32::new(0);
 /// Multicast (non-broadcast) ethernet frames handed to the EC for transmit.
 pub static MCAST_TX_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static MCAST_RX_COUNT: AtomicU32 = AtomicU32::new(0);
 // stash the MAC address for inserstion as a loopback target. Coded as big-end bytes.
 pub static MAC_ADDRESS_LSB: AtomicU32 = AtomicU32::new(0);
 pub static MAC_ADDRESS_MSB: AtomicU16 = AtomicU16::new(0);
@@ -2016,6 +2017,9 @@ fn main() -> ! {
                 let ok = iface.leave_multicast_group_v6(group);
                 v6_groups.retain(|g| g != &group);
                 xous::return_scalar(msg.sender, if ok { 1 } else { 0 }).ok();
+            }),
+            Some(Opcode::GetMulticastRxCount) => msg_blocking_scalar_unpack!(msg, _, _, _, _, {
+                xous::return_scalar(msg.sender, MCAST_RX_COUNT.load(Ordering::SeqCst) as usize).ok();
             }),
             Some(Opcode::GetMulticastTxCount) => msg_blocking_scalar_unpack!(msg, _, _, _, _, {
                 xous::return_scalar(msg.sender, MCAST_TX_COUNT.load(Ordering::SeqCst) as usize).ok();

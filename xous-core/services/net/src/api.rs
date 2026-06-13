@@ -375,6 +375,10 @@ pub(crate) enum Opcode {
     /// How many multicast frames have been handed to the radio for transmit.
     /// Blocking scalar, no args. Diagnostic.
     GetMulticastTxCount = 51,
+
+    /// How many IPv6 multicast frames (33:33:* dst MAC) have been received from
+    /// the radio. Blocking scalar, no args. Diagnostic.
+    GetMulticastRxCount = 52,
     // do not use any numbers higher than 0x8000 as that is reserved for the nonblocking flag
 }
 #[allow(dead_code)]

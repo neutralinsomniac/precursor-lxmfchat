@@ -365,13 +365,15 @@ impl<'a> LxmfChat<'a> {
                 let f = com.wlan_filter_stats().map(|s| s.bins).unwrap_or([0u16; 13]);
                 let (tx_errs, drops) =
                     com.wlan_debug().map(|d| (d.tx_errs, d.drops)).unwrap_or((u32::MAX, u32::MAX));
-                let radio_tx = ::net::NetManager::new().multicast_tx_count().unwrap_or(usize::MAX);
+                let nm = ::net::NetManager::new();
+                let radio_tx = nm.multicast_tx_count().unwrap_or(usize::MAX);
+                let radio_rx = nm.multicast_rx_count().unwrap_or(usize::MAX);
                 modals
                     .show_notification(
                         &format!(
-                            "EC filter bins (since assoc)\nfwd {}  arp {}  icmp {}  dhcp {}  udp {}\ndrops: multi {}  etype {}  noise {}\nproto {}  frag {}  ipck {}  udpck {}  dhcp {}\nEC tx_errs {}  drops {}\nSoC mcast tx {}",
+                            "EC filter bins (since assoc)\nfwd {}  arp {}  icmp {}  dhcp {}  udp {}\ndrops: multi {}  etype {}  noise {}\nproto {}  frag {}  ipck {}  udpck {}  dhcp {}\nEC tx_errs {}  drops {}\nSoC mcast tx {}  rx {}",
                             f[12], f[8], f[9], f[10], f[11], f[3], f[1], f[0], f[4], f[5], f[6],
-                            f[7], f[2], tx_errs, drops, radio_tx
+                            f[7], f[2], tx_errs, drops, radio_tx, radio_rx
                         ),
                         None,
                     )
