@@ -2337,11 +2337,13 @@ fn handle_sync_response(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: 
                 // `/get [None, haves]` → node deletes the messages we received.
                 sync_send_get(shared, trng, link_id, Value::Array(vec![Value::Nil, Value::Array(haves)]));
             }
+            sync_finish(shared, chat_cid, &format!("synced {count} message(s)"));
             if count > 0 {
                 // One buzz for the whole synced batch (deliver_lxmf didn't per-msg).
+                // Buzz LAST, after the status line is painted, so the user reads
+                // the result before feeling the notification.
                 shared.llio.vibe(llio::VibePattern::Long).ok();
             }
-            sync_finish(shared, chat_cid, &format!("synced {count} message(s)"));
         }
         _ => {}
     }
