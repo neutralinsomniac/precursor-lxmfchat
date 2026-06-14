@@ -709,6 +709,10 @@ impl Ui {
             granted: None,
         };
         self.gam.set_canvas_bounds_request(&mut req).ok();
+        // Stop keystrokes reaching the IME while the input box is hidden, so
+        // document-mode keys (j/k/g/G scrolling) don't pile into the compose
+        // line behind the page; resume when it comes back.
+        self.gam.set_imef_suspend(self.token, !visible).ok();
         if visible {
             // Repaint the restored input line right away (it would otherwise
             // stay blank until the next keystroke).
@@ -795,6 +799,53 @@ impl Ui {
         };
         if let Some(doc) = self.document.as_mut() {
             doc.cursor = landing.unwrap_or(new_top);
+        }
+    }
+
+    /// Step the document one line (j/k). The cursor drives the scroll —
+    /// `layout_document` pulls `top` along to keep the cursor on screen — so
+    /// moving it line-by-line scrolls once it reaches the screen edge.
+    pub(crate) fn doc_line(&mut self, down: bool) {
+        let total = match self.document.as_ref() {
+            Some(d) if !d.lines.is_empty() => d.lines.len(),
+            _ => return,
+        };
+        if let Some(doc) = self.document.as_mut() {
+            doc.cursor = if down { (doc.cursor + 1).min(total - 1) } else { doc.cursor.saturating_sub(1) };
+        }
+    }
+
+    /// Jump the document to the top (g) or bottom (G). For the top the cursor
+    /// alone suffices; for the bottom we also pre-set `top` to the final
+    /// screenful (walking back from the end by one viewport of cached heights)
+    /// so `layout_document` doesn't have to scan the whole document forward to
+    /// reveal the last line.
+    pub(crate) fn doc_edge(&mut self, bottom: bool) {
+        let total = match self.document.as_ref() {
+            Some(d) if !d.lines.is_empty() => d.lines.len(),
+            _ => return,
+        };
+        if !bottom {
+            if let Some(doc) = self.document.as_mut() {
+                doc.top = 0;
+                doc.cursor = 0;
+            }
+            return;
+        }
+        let (_, clip_bottom, budget) = self.doc_metrics();
+        let mut used = 0u32;
+        let mut i = total;
+        while i > 0 {
+            let h = self.doc_line_height(i - 1, clip_bottom) + self.vp.bubble_space as u32;
+            if used + h > budget && i < total {
+                break; // keep at least the final line, even if it overflows alone
+            }
+            used += h;
+            i -= 1;
+        }
+        if let Some(doc) = self.document.as_mut() {
+            doc.top = i;
+            doc.cursor = total - 1;
         }
     }
 

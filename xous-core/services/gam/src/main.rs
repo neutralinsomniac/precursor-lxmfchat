@@ -624,6 +624,11 @@ fn wrapped_main() -> ! {
                 let token = [t1 as u32, t2 as u32, t3 as u32, t4 as u32];
                 context_mgr.toggle_menu_mode(token);
             }),
+            Some(Opcode::SetImefSuspend) => {
+                let buffer = unsafe { Buffer::from_memory_message(msg.body.memory_message().unwrap()) };
+                let req = buffer.to_original::<ImefSuspend, _>().unwrap();
+                context_mgr.set_imef_suspend(req.token, req.suspend);
+            }
             Some(Opcode::RevertFocus) => match context_mgr.revert_focus(&gfx, &mut canvases) {
                 Ok(_) => xous::return_scalar(msg.sender, 0).expect("couldn't unblock caller"),
                 _ => xous::return_scalar(msg.sender, 1).expect("couldn't unblock caller"),

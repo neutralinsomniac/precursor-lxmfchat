@@ -404,6 +404,16 @@ impl Gam {
         .map(|_| ())
     }
 
+    /// Suspend or resume IME key delivery for the context owning `token`. Used
+    /// to silence the input line while a full-screen view (e.g. the chat
+    /// document viewer) owns the keyboard for navigation. Scoped by token so a
+    /// background app firing this never disturbs whoever currently has focus.
+    pub fn set_imef_suspend(&self, token: [u32; 4], suspend: bool) -> Result<(), xous::Error> {
+        let req = ImefSuspend { token, suspend };
+        let buf = Buffer::into_buf(req).or(Err(xous::Error::InternalError))?;
+        buf.lend(self.conn, Opcode::SetImefSuspend.to_u32().unwrap()).map(|_| ())
+    }
+
     /// this indicates to the GAM that the currently running app no longer wants to be the focus of attention
     /// we might respect that. or maybe not. depends on the GAM's policies.
     pub fn relinquish_focus(&self) -> Result<(), xous::Error> {

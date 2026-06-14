@@ -593,6 +593,25 @@ pub fn server(
                             }
                             ui.event(Event::Right);
                         }
+                        // Document-viewer scroll keys (the IME is suspended while
+                        // a page is up, so these don't also type into the compose
+                        // line): j/k step a line, g/G jump to top/bottom.
+                        'j' if ui.doc_active() => {
+                            ui.doc_line(true);
+                            ui.redraw().expect("failed to redraw document");
+                        }
+                        'k' if ui.doc_active() => {
+                            ui.doc_line(false);
+                            ui.redraw().expect("failed to redraw document");
+                        }
+                        'g' if ui.doc_active() => {
+                            ui.doc_edge(false);
+                            ui.redraw().expect("failed to redraw document");
+                        }
+                        'G' if ui.doc_active() => {
+                            ui.doc_edge(true);
+                            ui.redraw().expect("failed to redraw document");
+                        }
                         _ => {
                             ui.set_menu_mode(false); // → moves the input cursor
                         }

@@ -97,6 +97,9 @@ pub(crate) struct UxContext {
     pub focuschange_id: Option<u32>,
     /// sets the behavior of the IMEF
     pub imef_menu_mode: bool,
+    /// when true, keystrokes are not delivered to the IMEF (the app has hidden
+    /// its input box and is consuming keys for navigation instead)
+    pub imef_suspended: bool,
 }
 pub(crate) const BOOT_CONTEXT_TRUSTLEVEL: u8 = 254;
 
@@ -193,6 +196,7 @@ impl ContextManager {
                         rawkeys_id: registration.rawkeys_id,
                         vibe: false,
                         imef_menu_mode: false,
+                        imef_suspended: false,
                         // this gets initialized on the first attempt to change predictors, not here
                         pred_token: None,
                     };
@@ -222,6 +226,7 @@ impl ContextManager {
                         rawkeys_id: registration.rawkeys_id,
                         vibe: false,
                         imef_menu_mode: false,
+                        imef_suspended: false,
                         pred_token: None,
                     };
 
@@ -259,6 +264,7 @@ impl ContextManager {
                         rawkeys_id: registration.rawkeys_id,
                         vibe: false,
                         imef_menu_mode: false,
+                        imef_suspended: false,
                         pred_token: None,
                     };
                     self.contexts.insert(token, ux_context);
@@ -294,6 +300,7 @@ impl ContextManager {
                         rawkeys_id: registration.rawkeys_id,
                         vibe: false,
                         imef_menu_mode: false,
+                        imef_suspended: false,
                         pred_token: None,
                     };
                     self.contexts.insert(token, ux_context);
@@ -760,7 +767,11 @@ impl ContextManager {
             }
         }
 
-        if self.imef_active {
+        // Skip the IMEF when the focused context has suspended it (its input box
+        // is hidden and it's consuming keys for navigation), so those keys don't
+        // accumulate in the hidden input line.
+        let imef_suspended = self.focused_context().map(|c| c.imef_suspended).unwrap_or(false);
+        if self.imef_active && !imef_suspended {
             // use the IMEF
             self.imef.send_keyevent(keys).expect("couldn't send keys to the IMEF");
         }
@@ -809,6 +820,15 @@ impl ContextManager {
         if let Some(context) = self.contexts.get_mut(&token) {
             context.imef_menu_mode = !context.imef_menu_mode;
             log::debug!("menu mode for token {:?} is now {}", token, context.imef_menu_mode);
+        }
+    }
+
+    /// Suspend/resume IME key delivery for the context named by `token` (see
+    /// `key_event`). Scoped by token, not focus, so a background app hiding its
+    /// input box never silences whoever currently holds focus.
+    pub(crate) fn set_imef_suspend(&mut self, token: [u32; 4], suspend: bool) {
+        if let Some(context) = self.contexts.get_mut(&token) {
+            context.imef_suspended = suspend;
         }
     }
 

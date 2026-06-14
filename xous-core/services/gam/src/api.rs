@@ -70,6 +70,12 @@ pub struct SetAudioOpcode {
     pub opcode: u32,
 }
 
+#[derive(Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Copy, Clone)]
+pub struct ImefSuspend {
+    pub token: [u32; 4],
+    pub suspend: bool,
+}
+
 #[derive(Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone)]
 pub struct SwitchToApp {
     pub token: [u32; 4],
@@ -224,6 +230,12 @@ pub(crate) enum Opcode {
     /// Allow main menu activation. Used by the PDDB to turn ungate the main menu once it is mounted.
     /// This resolves race conditions that depend upon the PDDB configurations.
     AllowMainMenu = 33,
+
+    /// Suspend or resume IME key delivery for the context named by the
+    /// `ImefSuspend` token. An app suspends while its input box is hidden (e.g. a
+    /// full-screen document) so raw keystrokes used for navigation don't also
+    /// accumulate in the IME line.
+    SetImefSuspend = 35,
 
     /// Register a name that can acquire a token. This is only intended to be used with pre-registered apps
     #[cfg(feature = "unsafe-app-loading")]
