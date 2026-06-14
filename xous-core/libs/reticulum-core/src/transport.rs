@@ -218,6 +218,13 @@ pub enum Event {
     /// A packet we recognised but is not for us (its destination hash matched
     /// neither an established link nor one of our own destinations).
     Unhandled { destination_hash: [u8; TRUNCATED_HASHLENGTH], packet_type: u8, context: u8 },
+    /// A path request for one of our own destinations: the network is asking us
+    /// to (re-)announce so it can learn our key and route. Answer with a
+    /// path-response announce on the interface it arrived on. Without this, a
+    /// peer that has expired or never caught our single announce (common on an
+    /// autoiface-only link, where we proactively announce just once per peer)
+    /// can never reach us again until our peer table happens to churn.
+    PathRequest { destination_hash: [u8; TRUNCATED_HASHLENGTH] },
     /// A packet that failed to decode or validate.
     Dropped(&'static str),
 }
@@ -754,6 +761,35 @@ impl Transport {
                 }
                 None => Event::Dropped("invalid announce"),
             },
+            // A path request (DATA to the well-known `rnstransport.path.request`
+            // PLAIN destination). RNS answers a request for a local destination
+            // by re-announcing it (`Transport.path_request` → `announce`); as a
+            // leaf we can only answer for our own. The payload is
+            // `target_hash(16) [|| transport_id(16)] || tag`, so the first 16
+            // bytes are the destination being sought.
+            PACKET_DATA
+                if packet.destination_hash
+                    == crate::destination::plain_destination_hash(
+                        "rnstransport",
+                        &["path", "request"],
+                    ) =>
+            {
+                if packet.data.len() < TRUNCATED_HASHLENGTH {
+                    return Event::Dropped("short path request");
+                }
+                let mut target = [0u8; TRUNCATED_HASHLENGTH];
+                target.copy_from_slice(&packet.data[..TRUNCATED_HASHLENGTH]);
+                if self.our_dests.contains(&target) {
+                    Event::PathRequest { destination_hash: target }
+                } else {
+                    // Not one of ours, and a leaf holds no routes to answer from.
+                    Event::Unhandled {
+                        destination_hash: packet.destination_hash,
+                        packet_type: packet.packet_type,
+                        context: packet.context,
+                    }
+                }
+            }
             _ if self.our_dests.contains(&packet.destination_hash) => {
                 // A packet addressed to one of our destinations.
                 match packet.packet_type {
@@ -850,6 +886,24 @@ impl Transport {
     ) -> Vec<u8> {
         let rh = random_hash(random5, unix_time);
         build_announce(&self.identity, app_name, aspects, app_data, &rh, None).encode()
+    }
+
+    /// Like [`Transport::make_announce_with`] but tagged `PATH_RESPONSE` — the
+    /// answer to a path request (RNS `Destination.announce(path_response=True)`).
+    /// The bytes are otherwise an ordinary announce, so the requester learns our
+    /// key and route exactly as it would from a flooded one.
+    pub fn make_path_response_with(
+        &self,
+        app_name: &str,
+        aspects: &[&str],
+        app_data: &[u8],
+        random5: &[u8; 5],
+        unix_time: u64,
+    ) -> Vec<u8> {
+        let rh = random_hash(random5, unix_time);
+        let mut p = build_announce(&self.identity, app_name, aspects, app_data, &rh, None);
+        p.context = CONTEXT_PATH_RESPONSE;
+        p.encode()
     }
 
     /// Build a path request for `target` — asks the network (any transport node
@@ -2042,6 +2096,42 @@ mod tests {
         assert!(alice.known(&bob_dh).is_some(), "the peer's key must survive expiry");
         assert_eq!(alice.paths_order.iter().filter(|h| **h == bob_dh).count(), 0);
         assert!(!alice.expire_path(&bob_dh), "expiring an unknown route is a no-op");
+    }
+
+    #[test]
+    fn path_request_for_our_destination_is_surfaced() {
+        // A peer that lost our route asks the network how to reach us. As the
+        // destination owner we must recognise the request and answer with an
+        // announce — otherwise an autoiface peer can never re-resolve us.
+        let mut me = Transport::new(id(0x11));
+        let our_dh = single_destination_hash("lxmf", &["delivery"], &id(0x11).hash());
+        me.register_destination(our_dh);
+
+        // A request for US → PathRequest carrying our own destination hash.
+        let mut tag = [0u8; TRUNCATED_HASHLENGTH];
+        OsRng.fill_bytes(&mut tag);
+        let req = Transport::new(id(0x22)).make_path_request(&our_dh, &tag);
+        let mut eph = || [0u8; KEY_HALF];
+        match me.handle_frame(&req, &mut eph, PathIface::Auto) {
+            Event::PathRequest { destination_hash } => assert_eq!(destination_hash, our_dh),
+            other => panic!("expected PathRequest, got {:?}", core::mem::discriminant(&other)),
+        }
+
+        // The path-response announce we'd send back must parse as a valid
+        // announce for our destination (so the requester learns our key).
+        let resp = me.make_path_response_with("lxmf", &["delivery"], b"me", &[7u8; 5], 1_700_000_000);
+        let pkt = crate::packet::Packet::decode(&resp).expect("decode path response");
+        assert_eq!(pkt.context, CONTEXT_PATH_RESPONSE);
+        let parsed = parse_and_validate(&pkt).expect("valid announce");
+        assert_eq!(parsed.destination_hash, our_dh);
+
+        // A request for somebody ELSE is not ours to answer (we hold no routes).
+        let other_dh = single_destination_hash("lxmf", &["delivery"], &id(0x33).hash());
+        let req2 = Transport::new(id(0x22)).make_path_request(&other_dh, &tag);
+        match me.handle_frame(&req2, &mut eph, PathIface::Auto) {
+            Event::Unhandled { .. } => {}
+            other => panic!("expected Unhandled, got {:?}", core::mem::discriminant(&other)),
+        }
     }
 
     #[test]

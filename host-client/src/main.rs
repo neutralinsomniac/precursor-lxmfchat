@@ -30,7 +30,7 @@ use reticulum_core::destination::single_destination_hash;
 use reticulum_core::hdlc::{Deframer, frame};
 use reticulum_core::identity::PrivateIdentity;
 use reticulum_core::resource::ResourceReceiver;
-use reticulum_core::transport::{Event, Transport};
+use reticulum_core::transport::{Event, PathIface, Transport};
 
 fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() }
 
@@ -145,7 +145,7 @@ fn main() {
                     rand_core::RngCore::fill_bytes(&mut OsRng, &mut b);
                     b
                 };
-                match tp.handle_frame(&raw, &mut gen) {
+                match tp.handle_frame(&raw, &mut gen, PathIface::Hub) {
                     Event::LinkEstablished { link_id, proof } => {
                         println!("LINK ESTABLISHED {} — sending proof", reticulum_core::hex(&link_id));
                         writer.write_all(&frame(&proof)).ok();
@@ -392,6 +392,14 @@ fn main() {
                     }
                     Event::OutLinkClosed { link_id } => {
                         println!("outbound link {} closed by responder", reticulum_core::hex(&link_id));
+                    }
+                    Event::PathRequest { destination_hash } => {
+                        println!("path request for {} — answering with path response", reticulum_core::hex(&destination_hash));
+                        let mut r5 = [0u8; 5];
+                        rand_core::RngCore::fill_bytes(&mut OsRng, &mut r5);
+                        let resp = tp.make_path_response_with("lxmf", &["delivery"], b"host-client", &r5, now());
+                        writer.write_all(&frame(&resp)).ok();
+                        writer.flush().ok();
                     }
                     Event::Unhandled { packet_type, context, .. } => {
                         log::debug!("unhandled packet type={} ctx={}", packet_type, context);

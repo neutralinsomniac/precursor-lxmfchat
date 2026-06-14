@@ -808,6 +808,16 @@ pub(crate) fn build_announce(shared: &Arc<Shared>, trng: &Trng) -> Vec<u8> {
     tp.make_announce_with("lxmf", &["delivery"], name.as_bytes(), &r5, now_secs())
 }
 
+/// Build a raw (unframed) PATH_RESPONSE announce for our lxmf.delivery
+/// destination — the answer to a path request asking how to reach us.
+pub(crate) fn build_path_response(shared: &Arc<Shared>, trng: &Trng) -> Vec<u8> {
+    let mut r5 = [0u8; 5];
+    crate::fill_random(trng, &mut r5);
+    let name = plock(&shared.display_name).clone();
+    let tp = plock(&shared.transport);
+    tp.make_path_response_with("lxmf", &["delivery"], name.as_bytes(), &r5, now_secs())
+}
+
 fn send_announce(shared: &Arc<Shared>, trng: &Trng) {
     let raw = build_announce(shared, trng);
     broadcast_out(shared, &raw);
@@ -1132,6 +1142,22 @@ pub(crate) fn handle_frame(
                 "link {} addressed-but-unhandled type={} ctx=0x{:02x}",
                 hex(&destination_hash), packet_type, context
             );
+        }
+        Event::PathRequest { destination_hash } => {
+            // Someone wants a route to us. Re-announce as a path response on the
+            // interface it arrived on (RNS answers a local destination's path
+            // request by announcing). This is what lets a peer that expired or
+            // missed our one-shot autoiface announce reach us again on demand.
+            log::info!("answering path request for {} on {:?}", hex(&destination_hash), iface);
+            let raw = build_path_response(shared, trng);
+            match iface {
+                PathIface::Hub => {
+                    hub_write(shared, &raw);
+                }
+                PathIface::Auto => {
+                    crate::autoiface::send_to_peers(shared, &raw);
+                }
+            }
         }
         Event::Unhandled { destination_hash, packet_type, context } => {
             log::debug!(
