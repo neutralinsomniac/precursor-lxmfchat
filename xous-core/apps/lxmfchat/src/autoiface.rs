@@ -26,6 +26,13 @@ const DATA_PORT: u16 = 42671;
 const ANNOUNCE_INTERVAL_MS: u64 = 10_000;
 const REVERSE_INTERVAL_MS: u64 = 5200;
 const TICK_MS: u64 = 2600;
+/// Wait one reverse-peering cycle after first hearing a peer before sending it
+/// our RNS announce. A peer we just heard via one-way multicast hasn't peered
+/// *us* yet, and its data_rx drops packets from un-peered sources — so an
+/// announce fired on first contact is silently lost. By this point it has had
+/// our reverse-peering token and will accept it. Without this the network never
+/// learns our key on an autoiface-only link (we don't answer path requests).
+const ANNOUNCE_AFTER_SECS: u64 = 6;
 const PEERING_TIMEOUT_SECS: u64 = 22;
 const MAX_PEERS: usize = 16;
 const HW_MTU: usize = 1196;
@@ -40,8 +47,18 @@ pub struct AutoState {
     /// 0 on Xous (single interface).
     pub scope: u32,
     pub tx: Option<UdpSocket>,
-    /// peer address → (last heard secs, last token sent secs).
-    pub peers: BTreeMap<Ipv6Addr, (u64, u64)>,
+    pub peers: BTreeMap<Ipv6Addr, Peer>,
+}
+
+pub struct Peer {
+    /// Last secs we heard any token from this peer (drives timeout eviction).
+    pub heard: u64,
+    /// Last secs we sent this peer a reverse-peering token.
+    pub token_sent: u64,
+    /// Secs we first heard this peer (fixed; gates the deferred announce).
+    pub discovered: u64,
+    /// Whether we've sent this peer our RNS announce since discovering it.
+    pub announced: bool,
 }
 
 impl AutoState {
@@ -255,11 +272,14 @@ fn discovery_rx(shared: Arc<Shared>, chat_cid: CID, sock: UdpSocket) {
         let now = now_secs();
         let is_new = !st.peers.contains_key(&src_ip);
         if is_new && st.peers.len() >= MAX_PEERS {
-            if let Some(oldest) = st.peers.iter().min_by_key(|(_, (heard, _))| *heard).map(|(a, _)| *a) {
+            if let Some(oldest) = st.peers.iter().min_by_key(|(_, p)| p.heard).map(|(a, _)| *a) {
                 st.peers.remove(&oldest);
             }
         }
-        st.peers.entry(src_ip).and_modify(|(heard, _)| *heard = now).or_insert((now, 0));
+        st.peers
+            .entry(src_ip)
+            .and_modify(|p| p.heard = now)
+            .or_insert(Peer { heard: now, token_sent: 0, discovered: now, announced: false });
         let count = st.peers.len();
         drop(st);
         if is_new {
@@ -304,6 +324,13 @@ fn data_rx(shared: Arc<Shared>, chat_cid: CID, sock: UdpSocket) {
 }
 
 fn announce_loop(shared: Arc<Shared>, chat_cid: CID, group: Ipv6Addr) {
+    let trng = match xous_names::XousNames::new().ok().and_then(|xns| trng::Trng::new(&xns).ok()) {
+        Some(t) => t,
+        None => {
+            log::error!("AutoInterface announce thread: TRNG init failed");
+            return;
+        }
+    };
     let mut last_beacon: u64 = 0;
     let mut last_err_status: u64 = 0;
     let mut last_rejoin: u64 = 0;
@@ -344,12 +371,12 @@ fn announce_loop(shared: Arc<Shared>, chat_cid: CID, group: Ipv6Addr) {
         }
 
         let now = now_secs();
-        let (expired, reverse): (Vec<Ipv6Addr>, Vec<Ipv6Addr>) = {
+        let (expired, reverse, due): (Vec<Ipv6Addr>, Vec<Ipv6Addr>, Vec<Ipv6Addr>) = {
             let mut st = plock(&shared.auto);
             let expired: Vec<Ipv6Addr> = st
                 .peers
                 .iter()
-                .filter(|(_, (heard, _))| now > heard + PEERING_TIMEOUT_SECS)
+                .filter(|(_, p)| now > p.heard + PEERING_TIMEOUT_SECS)
                 .map(|(a, _)| *a)
                 .collect();
             for a in &expired {
@@ -358,13 +385,24 @@ fn announce_loop(shared: Arc<Shared>, chat_cid: CID, group: Ipv6Addr) {
             let reverse: Vec<Ipv6Addr> = st
                 .peers
                 .iter_mut()
-                .filter(|(_, (_, out))| now.saturating_sub(*out) * 1000 >= REVERSE_INTERVAL_MS)
-                .map(|(a, (_, out))| {
-                    *out = now;
+                .filter(|(_, p)| now.saturating_sub(p.token_sent) * 1000 >= REVERSE_INTERVAL_MS)
+                .map(|(a, p)| {
+                    p.token_sent = now;
                     *a
                 })
                 .collect();
-            (expired, reverse)
+            // Peers discovered long enough ago to have peered us back: send our
+            // announce now (once), so they learn our key without a path request.
+            let due: Vec<Ipv6Addr> = st
+                .peers
+                .iter_mut()
+                .filter(|(_, p)| !p.announced && now >= p.discovered + ANNOUNCE_AFTER_SECS)
+                .map(|(a, p)| {
+                    p.announced = true;
+                    *a
+                })
+                .collect();
+            (expired, reverse, due)
         };
         for a in expired {
             log::info!("local peer timed out: {a}");
@@ -372,6 +410,15 @@ fn announce_loop(shared: Arc<Shared>, chat_cid: CID, group: Ipv6Addr) {
         for a in reverse {
             let dest = SocketAddrV6::new(a, UNICAST_DISCOVERY_PORT, 0, scope);
             tx.send_to(&token, dest).ok();
+        }
+        if !due.is_empty() {
+            let raw = crate::net::build_announce(&shared, &trng);
+            for a in due {
+                let dest = SocketAddrV6::new(a, DATA_PORT, 0, scope);
+                if tx.send_to(&raw, dest).is_ok() {
+                    log::info!("announced to local peer {a}");
+                }
+            }
         }
     }
 }

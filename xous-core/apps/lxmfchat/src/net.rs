@@ -799,14 +799,17 @@ fn fmt_duration(secs: u64) -> String {
 }
 
 /// Announce our lxmf.delivery destination on the current connection.
-fn send_announce(shared: &Arc<Shared>, trng: &Trng) {
+/// Build a raw (unframed) announce for our lxmf.delivery destination.
+pub(crate) fn build_announce(shared: &Arc<Shared>, trng: &Trng) -> Vec<u8> {
     let mut r5 = [0u8; 5];
     crate::fill_random(trng, &mut r5);
     let name = plock(&shared.display_name).clone();
-    let raw = {
-        let tp = plock(&shared.transport);
-        tp.make_announce_with("lxmf", &["delivery"], name.as_bytes(), &r5, now_secs())
-    };
+    let tp = plock(&shared.transport);
+    tp.make_announce_with("lxmf", &["delivery"], name.as_bytes(), &r5, now_secs())
+}
+
+fn send_announce(shared: &Arc<Shared>, trng: &Trng) {
+    let raw = build_announce(shared, trng);
     broadcast_out(shared, &raw);
 }
 
