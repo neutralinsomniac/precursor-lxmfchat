@@ -35,25 +35,34 @@ the exact same protocol code.
 
 ## Development environment
 
-The build/flash/test scripts need a few non-Rust pieces — X11 (hosted GUI),
-libusb (flashing), a riscv32 cross-toolchain + openssl (EC firmware), and a
-Python venv with RNS/LXMF. These are provided declaratively by `shell.nix`, with
-[direnv](https://direnv.net/) loading it automatically:
+The build/flash/test scripts need a Rust toolchain plus a few non-Rust pieces —
+X11 (hosted GUI), libusb (flashing), a riscv32 cross-toolchain + openssl (EC
+firmware), and a Python venv with RNS/LXMF. These are all provided declaratively
+by `shell.nix` (including `rustup`), with [direnv](https://direnv.net/) loading
+it automatically:
 
 ```
 direnv allow            # once — then the env loads on cd into the repo
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # one-time
 ```
 
-(No direnv? `nix-shell` drops you into the same environment.) Rust itself stays
-on **rustup**, which owns the Xous targets:
+(No direnv? `nix-shell` drops you into the same environment.) The shell ships
+**rustup** rather than a fixed Rust, because the Xous target is a custom prebuilt
+sysroot that `cargo xtask` installs into the rustup toolchain. With the shell
+active, do the one-time bootstrap (rustup downloads run on NixOS via nix-ld):
 
 ```
-rustup target add riscv32imac-unknown-xous-elf riscv32imac-unknown-none-elf
+rustup default stable                                   # base toolchain
+rustup target add riscv32imac-unknown-none-elf          # the kernel/loader target
+(cd xous-core && cargo xtask install-toolkit --force)   # the xous sysroot
+
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # the venv
 ```
 
-With the shell active, the scripts and `cargo xtask` commands below Just Work —
-no per-command `nix-build`/`LD_LIBRARY_PATH` wrangling.
+(Note `riscv32imac-unknown-xous-elf` is *not* a `rustup target add` target — it's
+the custom sysroot the `install-toolkit` step installs.) The shell prints these
+hints until each piece is in place. After that, the scripts and `cargo xtask`
+commands below Just Work — no per-command `nix-build`/`LD_LIBRARY_PATH`
+wrangling.
 
 ## What works (validated against Python RNS 1.3.5 / LXMF 1.0.1, and on hardware)
 
