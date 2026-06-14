@@ -395,7 +395,9 @@ impl Ui {
     /// # Arguments
     ///
     /// * `item` - an item action not handled by the Chat UI
-    pub fn menu_add(&self, item: MenuItem) { self.menu_mgr.add_item(item); }
+    pub fn menu_add(&self, item: MenuItem) {
+        self.menu_mgr.add_item(item);
+    }
 
     /// Relabel one F1-F4 helper-tray slot and repaint the tray, so a
     /// background change (e.g. a new unread badge) shows without a keypress.
@@ -459,7 +461,9 @@ impl Ui {
     /// the active dialogue. Returns true if found.
     pub fn post_update(&mut self, author: &str, timestamp: u64, text: &str) -> bool {
         match &mut self.dialogue {
-            Some(ref mut dialogue) => dialogue.post_update(author, timestamp, text, Some((&self.vp, &self.gam))),
+            Some(ref mut dialogue) => {
+                dialogue.post_update(author, timestamp, text, Some((&self.vp, &self.gam)))
+            }
             None => false,
         }
     }
@@ -534,9 +538,13 @@ impl Ui {
         }
     }
 
-    pub fn get_menu_mode(&self) -> bool { self.menu_mode }
+    pub fn get_menu_mode(&self) -> bool {
+        self.menu_mode
+    }
 
-    pub fn set_menu_mode(&mut self, menu_mode: bool) { self.menu_mode = menu_mode; }
+    pub fn set_menu_mode(&mut self, menu_mode: bool) {
+        self.menu_mode = menu_mode;
+    }
 
     /// Send a xous scalar message with an Event to the Chat App cid/opcode
     ///
@@ -615,7 +623,9 @@ impl Ui {
 
     // ------------------------- document mode -------------------------
 
-    pub(crate) fn doc_active(&self) -> bool { self.document.is_some() }
+    pub(crate) fn doc_active(&self) -> bool {
+        self.document.is_some()
+    }
 
     /// Start staging a new document. The current view (chat or a previous
     /// document) keeps rendering until `doc_show` swaps the staged one in.
@@ -708,11 +718,7 @@ impl Ui {
 
     /// True when document line `i` is a link line.
     fn doc_is_link(&self, i: usize) -> bool {
-        self.document
-            .as_ref()
-            .and_then(|d| d.lines.get(i))
-            .map(|l| l.kind == DOC_KIND_LINK)
-            .unwrap_or(false)
+        self.document.as_ref().and_then(|d| d.lines.get(i)).map(|l| l.kind == DOC_KIND_LINK).unwrap_or(false)
     }
 
     /// Move the document cursor to the adjacent LINK on the current screen;
@@ -940,7 +946,9 @@ impl Ui {
         let mut y = y0;
         for i in top..total {
             if y >= bottom {
-                next_top = i;
+                if next_top == total {
+                    next_top = i;
+                }
                 break;
             }
             let line = match self.document.as_ref().and_then(|d| d.lines.get(i)) {
@@ -1032,7 +1040,9 @@ impl Ui {
     }
 
     /// Returns `true` if the status bar is currently set for the busy animation
-    pub(crate) fn is_busy(&self) -> bool { self.status_tv.busy_animation_state.is_some() }
+    pub(crate) fn is_busy(&self) -> bool {
+        self.status_tv.busy_animation_state.is_some()
+    }
 
     /// Set the status bar text. Forces an immediate repaint: discrete status text
     /// must always show, unlike the busy *animation* (whose rapid updates go
@@ -1041,8 +1051,11 @@ impl Ui {
     pub(crate) fn set_status_text(&mut self, msg: &str) {
         self.status_tv.clear_str();
         write!(self.status_tv, "{}", msg).ok();
-        xous::send_message(self.self_cid, xous::Message::new_scalar(ChatOp::UpdateBusyForced as usize, 0, 0, 0, 0))
-            .ok();
+        xous::send_message(
+            self.self_cid,
+            xous::Message::new_scalar(ChatOp::UpdateBusyForced as usize, 0, 0, 0, 0),
+        )
+        .ok();
     }
 
     /// Sets the status bar to animate the busy animation
@@ -1065,7 +1078,9 @@ impl Ui {
 
     /// Set the default idle text. Does *not* cause a redraw. If you need
     /// an instant re-draw, call `set_status_text()`
-    pub(crate) fn set_status_idle_text(&mut self, msg: &str) { self.status_idle_text = msg.to_owned(); }
+    pub(crate) fn set_status_idle_text(&mut self, msg: &str) {
+        self.status_idle_text = msg.to_owned();
+    }
 
     /// Layout the post bubbles on the screen.
     ///
