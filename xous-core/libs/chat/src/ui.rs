@@ -930,7 +930,15 @@ impl Ui {
     fn doc_metrics(&self) -> (isize, isize, u32) {
         let size = self.gam.get_canvas_bounds(self.vp.canvas).unwrap_or(self.vp.total_screensize);
         let y0 = self.vp.status_height as isize + self.vp.margin.y;
-        let bottom = size.y;
+        // The IMEF helper-bar (F1-F4 tray) sits at the very bottom of the
+        // screen and the content canvas runs underneath it, so the bottom row
+        // of the canvas is physically covered. Hold the visible bottom above
+        // the tray (its predictive canvas is `Tall glyph + 2*margin` tall, per
+        // the GAM chat layout): otherwise a fully-covered last line counts as
+        // visible and page-down skips it (a merely partly-cut line is caught
+        // by the clip test in `layout_document`, but a hidden one isn't).
+        let tray = blitstr2::glyph_height_hint(GlyphStyle::Tall) as isize + 2 * self.vp.margin.y;
+        let bottom = (size.y - tray).max(y0 + 1);
         (y0, bottom, (bottom - y0).max(0) as u32)
     }
 
@@ -972,17 +980,19 @@ impl Ui {
             doc.top = top;
         }
 
-        // Clear everything (status bar included; it is redrawn below). The
-        // fresh bottom matters: with the input box hidden the canvas is
-        // TALLER than the startup bounds, and clearing only to the stale size
-        // would leave ghosts in the reclaimed strip.
+        // Clear everything (status bar included; it is redrawn below). Clear to
+        // the FULL canvas height, not the (tray-reduced) layout bottom: with the
+        // input box hidden the canvas is taller than the startup bounds, and
+        // clearing only to the stale/reduced size would leave ghosts in the
+        // reclaimed strip (incl. the part under the helper bar between redraws).
         let (y0, bottom, _) = self.doc_metrics();
+        let clear_bottom = self.gam.get_canvas_bounds(self.vp.canvas).map(|s| s.y).unwrap_or(bottom);
         self.gam
             .draw_rectangle(
                 self.vp.canvas,
                 Rectangle::new_with_style(
                     Point::new(0, 0),
-                    Point::new(self.vp.total_screensize.x, bottom),
+                    Point::new(self.vp.total_screensize.x, clear_bottom),
                     DrawStyle { fill_color: Some(PixelColor::Light), stroke_color: None, stroke_width: 0 },
                 ),
             )
