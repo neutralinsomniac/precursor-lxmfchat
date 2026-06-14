@@ -2738,6 +2738,14 @@ fn browser_on_outlink_data(
             return;
         }
     }
+    // Any data on the active fetch link is forward progress, so push the
+    // deadline out: it's a stall timeout, not a fixed budget. A large page
+    // arrives as a multi-part Resource fetched in growing windows — each window
+    // a round-trip plus on-device decryption — which legitimately runs past the
+    // initial budget over a slow link. Without this, big (typically dynamic,
+    // param-bearing) pages get killed mid-download while small single-packet
+    // pages return inside the budget and never trip it.
+    plock(&shared.browser).deadline = now_secs() + PAGE_DEADLINE_SECS;
     match context {
         CONTEXT_RESPONSE => {
             if let Some(resp) = parse_rns_response(&plaintext) {
