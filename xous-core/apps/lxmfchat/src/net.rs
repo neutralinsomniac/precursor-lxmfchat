@@ -1633,7 +1633,6 @@ fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, l
             // after it (restored scrollback never re-runs this scan).
             crate::persist_found_addrs(pddb, &found);
             drop(found);
-            chat::cf_set_status_text(chat_cid, "address received — menu \u{2192} Import contact");
         }
     }
 
