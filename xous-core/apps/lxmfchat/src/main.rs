@@ -95,34 +95,34 @@ fn wrapped_main() -> ! {
                         // While the page browser is on screen the keys rebind
                         // (the icontray hints say so): ← back, → follow the
                         // selected link, F1 browser menu, F2/F3 page up/down,
-                        // F4 exit. Otherwise the chat bindings apply, where
-                        // Left/Right are no-ops (the chat lib already handled
-                        // menus before forwarding them) and F4 stays unbound
-                        // (it doubles as the power key).
+                        // F4 exit. Otherwise the chat bindings apply: F1 is the
+                        // app menu (raised by the chat lib before forwarding, so
+                        // nothing to do here), F2 next-unread, F3 jump-back,
+                        // F4 sync. Left/Right are no-ops on the chat screen.
                         Some(Event::F1) => {
                             if app.browsing() {
                                 app.browser_menu(&modals)
-                            } else {
-                                app.jump_to_unread()
                             }
                         }
                         Some(Event::F2) => {
                             if app.browsing() {
                                 app.browser_page(false)
                             } else {
-                                app.jump_back()
+                                app.jump_to_unread()
                             }
                         }
                         Some(Event::F3) => {
                             if app.browsing() {
                                 app.browser_page(true)
                             } else {
-                                app.sync_now()
+                                app.jump_back()
                             }
                         }
                         Some(Event::F4) => {
                             if app.browsing() {
                                 app.browser_exit()
+                            } else {
+                                app.sync_now()
                             }
                         }
                         Some(Event::Left) => app.browser_back(),

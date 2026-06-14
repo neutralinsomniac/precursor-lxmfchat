@@ -534,8 +534,14 @@ pub fn server(
                     log::info!("got Chat UI RawKey :{}:{}:{}:{}:", k1, k2, k3, k4);
                     match core::char::from_u32(k1 as u32).unwrap_or('\u{0000}') {
                         F1 => {
-                            log::info!("click F1 : pull request welcome!");
-                            ui.event(Event::F1);
+                            // F1 raises the app menu. A document/browser claims
+                            // F1 for its own menu, so doc mode passes the event
+                            // through to the app instead of opening ours.
+                            if ui.doc_active() {
+                                ui.event(Event::F1);
+                            } else {
+                                ui.raise_app_menu();
+                            }
                         }
                         F2 => {
                             log::info!("click F2 : pull request welcome!");
@@ -556,7 +562,7 @@ pub fn server(
                                 ui.doc_cursor(false);
                                 ui.redraw().expect("failed to redraw document");
                             } else {
-                                ui.set_menu_mode(true); // ← & → activate menus
+                                ui.set_menu_mode(true); // → activates the msg menu
                                 ui.post_select(POST_SELECTED_PREV);
                                 ui.redraw().expect("failed to redraw chat");
                             }
@@ -574,13 +580,10 @@ pub fn server(
                             ui.event(Event::Down);
                         }
                         '←' => {
-                            log::info!("click ← : raise app menu");
-                            // document mode: never the menu — ←/→ are forwarded
-                            // to the app, reserved for document navigation
-                            // (e.g. future horizontal scrolling)
-                            if !ui.doc_active() && ui.get_menu_mode() {
-                                ui.raise_app_menu();
-                            }
+                            log::info!("click ← : forward to app");
+                            // ← no longer raises a menu (F1 does); it's forwarded
+                            // to the app, which uses it for document navigation
+                            // (e.g. browser back).
                             ui.event(Event::Left);
                         }
                         '→' => {
@@ -591,7 +594,7 @@ pub fn server(
                             ui.event(Event::Right);
                         }
                         _ => {
-                            ui.set_menu_mode(false); // ← & → move input cursor
+                            ui.set_menu_mode(false); // → moves the input cursor
                         }
                     }
                 });

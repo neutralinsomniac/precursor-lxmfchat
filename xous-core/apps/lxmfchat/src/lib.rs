@@ -238,10 +238,11 @@ impl<'a> LxmfChat<'a> {
         // Open the last conversation we were in (if any), else a welcome thread.
         let initial_key = current_peer.map(|p| hex(&p)).unwrap_or_else(|| DIALOGUE_WELCOME.to_string());
         chat.dialogue_set(DIALOGUE_DICT, Some(&initial_key)).ok();
-        // F3 is a fixed action; F1/F2 labels are kept current by
-        // refresh_idle_status. Unread badges were restored from the PDDB, so
-        // surface the F1 jump hint right away.
-        chat::cf_icontray_set(chat_cid, 2, "sync");
+        // F1 (menu) and F4 (sync) are fixed actions; F2/F3 labels are kept
+        // current by refresh_idle_status. Unread badges were restored from the
+        // PDDB, so surface the F2 jump hint right away.
+        chat::cf_icontray_set(chat_cid, 0, "menu");
+        chat::cf_icontray_set(chat_cid, 3, "sync");
         net::refresh_idle_status(&shared, chat_cid);
 
         // One-shot crypto self-test + sign/verify timing, LOG-ONLY (it posted a
@@ -335,23 +336,28 @@ impl<'a> LxmfChat<'a> {
     /// "Interfaces" submenu: toggle the hub TCP interface and AutoInterface,
     /// set the hub address.
     pub fn interfaces_menu(&mut self, modals: &modals::Modals) {
-        let hub_on = self.shared.hub_enabled.load(core::sync::atomic::Ordering::SeqCst);
-        let auto_on = autoiface::enabled(&self.shared);
-        let peers = plock(&self.shared.auto).peers.len();
-        let labels: Vec<String> = vec![
-            if hub_on { "Hub: on → off".to_string() } else { "Hub: off → on".to_string() },
-            match (auto_on, peers) {
-                (true, 0) => "Local peers: on → off".to_string(),
-                (true, n) => format!("Local peers: on → off ({n} nearby)"),
-                (false, _) => "Local peers: off → on".to_string(),
-            },
-            format!("Set hub address ({})", self.hub),
-        ];
-        match self.pick_from_list(modals, &labels, "Interfaces") {
-            Some(0) => self.toggle_hub(),
-            Some(1) => self.toggle_local_peers(),
-            Some(2) => self.set_hub_interactive(modals),
-            _ => {}
+        // Re-show the menu after each action so toggling several interfaces
+        // doesn't mean re-opening the menu each time; the labels rebuild every
+        // pass so they reflect the new state. Cancel closes it.
+        loop {
+            let hub_on = self.shared.hub_enabled.load(core::sync::atomic::Ordering::SeqCst);
+            let auto_on = autoiface::enabled(&self.shared);
+            let peers = plock(&self.shared.auto).peers.len();
+            let labels: Vec<String> = vec![
+                if hub_on { "Hub: on → off".to_string() } else { "Hub: off → on".to_string() },
+                match (auto_on, peers) {
+                    (true, 0) => "Local peers: on → off".to_string(),
+                    (true, n) => format!("Local peers: on → off ({n} nearby)"),
+                    (false, _) => "Local peers: off → on".to_string(),
+                },
+                format!("Set hub address ({})", self.hub),
+            ];
+            match self.pick_from_list(modals, &labels, "Interfaces") {
+                Some(0) => self.toggle_hub(),
+                Some(1) => self.toggle_local_peers(),
+                Some(2) => self.set_hub_interactive(modals),
+                _ => return,
+            }
         }
     }
 
@@ -599,8 +605,8 @@ impl<'a> LxmfChat<'a> {
         if self.browsing() {
             net::browser_fkey_hints(self.chat_cid);
         } else {
-            chat::cf_icontray_set(self.chat_cid, 2, "sync");
-            chat::cf_icontray_set(self.chat_cid, 3, "");
+            chat::cf_icontray_set(self.chat_cid, 0, "menu");
+            chat::cf_icontray_set(self.chat_cid, 3, "sync");
             net::refresh_idle_status(&self.shared, self.chat_cid);
         }
     }
@@ -632,8 +638,8 @@ impl<'a> LxmfChat<'a> {
         {
             let mut cur = plock(&self.shared.current_peer);
             if *cur != Some(*addr) {
-                // Remember where we came from, so F2 can jump back (and a
-                // second F2 returns — this records the swap each time).
+                // Remember where we came from, so F3 can jump back (and a
+                // second F3 returns — this records the swap each time).
                 *plock(&self.shared.prev_peer) = *cur;
             }
             *cur = Some(*addr);
@@ -664,15 +670,15 @@ impl<'a> LxmfChat<'a> {
         // it wasn't the active one — now that it's open, swap the bubbles.
         net::apply_delivery_updates(&self.shared, self.chat_cid, &self.pddb, addr);
         // Show who this conversation is with in the status bar (persists while
-        // idle, with the F1 next-unread hint), so it's always clear which
+        // idle, with the F2 next-unread hint), so it's always clear which
         // thread you're in.
         self.chat.set_status_text(&format!("\u{25c9} {}", self.peer_name(addr)));
         net::refresh_idle_status(&self.shared, self.chat_cid);
     }
 
-    /// F1: open the chat that's been waiting longest with unread messages.
+    /// F2: open the chat that's been waiting longest with unread messages.
     /// Opening it clears its badge, so the next press moves on to the next
-    /// unread chat; the status bar always shows where F1 goes.
+    /// unread chat; the status bar always shows where F2 goes.
     pub fn jump_to_unread(&self) {
         match net::first_unread(&self.shared) {
             Some((addr, _)) => self.activate_peer(&addr),
@@ -680,7 +686,7 @@ impl<'a> LxmfChat<'a> {
         }
     }
 
-    /// F2: jump back to the conversation you were in before this one.
+    /// F3: jump back to the conversation you were in before this one.
     /// Pressing it again returns — activate_peer records each swap.
     pub fn jump_back(&self) {
         let prev = *plock(&self.shared.prev_peer);

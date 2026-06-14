@@ -381,8 +381,8 @@ pub struct Shared {
     /// The peer we are currently messaging (set by a picker, or auto-set to the
     /// sender of an inbound message when none is selected).
     pub current_peer: Mutex<Option<[u8; TRUNCATED_HASHLENGTH]>>,
-    /// The conversation we were in before the current one — F2 jumps back to
-    /// it (and `activate_peer` records the swap, so F2 toggles between two).
+    /// The conversation we were in before the current one — F3 jumps back to
+    /// it (and `activate_peer` records the swap, so F3 toggles between two).
     pub prev_peer: Mutex<Option<[u8; TRUNCATED_HASHLENGTH]>>,
     /// Recently delivered LXMF message ids, to drop duplicate retransmissions.
     pub recent_msg_ids: Mutex<Vec<[u8; 32]>>,
@@ -476,7 +476,7 @@ fn peer_label(shared: &Arc<Shared>, peer: &[u8; TRUNCATED_HASHLENGTH]) -> String
 }
 
 /// The next conversation to catch up on: the unread chat whose oldest held
-/// message arrived earliest, so repeated F1 presses walk the unread chats in
+/// message arrived earliest, so repeated F2 presses walk the unread chats in
 /// the order the messages came in. Returns its address and unread count.
 pub fn first_unread(shared: &Arc<Shared>) -> Option<([u8; TRUNCATED_HASHLENGTH], u32)> {
     // Snapshot, then consult `pending` — never hold both locks at once.
@@ -495,9 +495,10 @@ fn slot_label(shared: &Arc<Shared>, peer: &[u8; TRUNCATED_HASHLENGTH], max: usiz
 }
 
 /// Recompose the persistent status line ("◉ <who you're talking to>") and the
-/// F-key helper tray: F1 shows the next unread chat and its count ("✉bob 2"),
-/// F2 the conversation it jumps back to ("↩alice"); blank when idle. Call
-/// whenever any of that changes (peer switch, message held, unread flushed).
+/// F-key helper tray: F2 shows the next unread chat and its count ("✉bob 2"),
+/// F3 the conversation it jumps back to ("↩alice"); blank when idle (F1 is the
+/// app menu, F4 sync — both static, set by `restore_fkey_hints`). Call whenever
+/// any of that changes (peer switch, message held, unread flushed).
 pub fn refresh_idle_status(shared: &Arc<Shared>, chat_cid: CID) {
     // While the page browser is on screen the tray belongs to it (back/open/
     // exit) and the idle status shows the page — a message arriving mid-browse
@@ -511,16 +512,16 @@ pub fn refresh_idle_status(shared: &Arc<Shared>, chat_cid: CID) {
         None => String::new(),
     };
     chat::cf_set_status_idle_text(chat_cid, &line);
-    let f1 = match first_unread(shared) {
+    let unread = match first_unread(shared) {
         Some((peer, n)) => format!("\u{2709}{} {n}", slot_label(shared, &peer, 8)),
         None => String::new(),
     };
-    chat::cf_icontray_set(chat_cid, 0, &f1);
-    let f2 = match *plock(&shared.prev_peer) {
+    chat::cf_icontray_set(chat_cid, 1, &unread);
+    let jump_back = match *plock(&shared.prev_peer) {
         Some(p) if current != Some(p) => format!("\u{21a9}{}", slot_label(shared, &p, 10)),
         _ => String::new(),
     };
-    chat::cf_icontray_set(chat_cid, 1, &f2);
+    chat::cf_icontray_set(chat_cid, 2, &jump_back);
 }
 
 fn now_secs() -> u64 {
@@ -1673,7 +1674,7 @@ fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, l
             crate::persist_pending(pddb, &src_hash, list);
         }
         *plock(&shared.unread).entry(src_hash).or_default() += 1;
-        // The persistent line picks up the F1 jump hint; the transient one
+        // The persistent line picks up the F2 jump hint; the transient one
         // announces the arrival.
         refresh_idle_status(shared, chat_cid);
         chat::cf_set_status_text(chat_cid, &format!("\u{2709} new message from {author}"));
@@ -3122,8 +3123,8 @@ pub fn browser_suspend(shared: &Arc<Shared>, chat_cid: CID) {
         plock(&shared.transport).drop_out_link(&lid);
     }
     chat::cf_document_suspend(chat_cid);
-    chat::cf_icontray_set(chat_cid, 2, "sync");
-    chat::cf_icontray_set(chat_cid, 3, ""); // F4 is unbound outside the browser
+    chat::cf_icontray_set(chat_cid, 0, "menu");
+    chat::cf_icontray_set(chat_cid, 3, "sync");
     refresh_idle_status(shared, chat_cid);
     // refresh_idle_status only recomposes the *idle* text — the visible status
     // line would keep showing the page title. Bring the conversation back.
