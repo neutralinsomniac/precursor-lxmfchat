@@ -30,13 +30,15 @@ const MAX_PENDING_OUT: usize = 32;
 const MAX_RECEIPTS: usize = 64;
 /// A LINKREQUEST that hasn't been proven within its patience window is
 /// considered lost; `pending_link_to` stops reporting it so the caller sends a
-/// fresh request. The window scales with the destination's hop count, like the
-/// reference (RNS Link.py: first-hop timeout + 6 s/hop establishment timeout)
-/// — a node 7 hops into a slow mesh can legitimately take ~45 s to prove, and
-/// a flat 20 s window made us forget the pending entry (and churn a fresh
-/// link_id on retry) right before the proof arrived. This floor covers the
-/// 1-hop hub case; `pending_expiry_secs` adds the per-hop allowance.
-const PENDING_LINK_EXPIRY_SECS: u64 = 20;
+/// fresh request. The window scales with the destination's hop count to match
+/// RNS exactly: the reference initiator's `establishment_timeout` is
+/// `get_first_hop_timeout` (6 s, `DEFAULT_PER_HOP_TIMEOUT`, when latency is
+/// unknown) + `ESTABLISHMENT_TIMEOUT_PER_HOP` (6 s) × `max(1, hops)`
+/// (RNS Link.py). With this 12 s floor, `pending_expiry_secs`'
+/// `max(12, 6*(hops+1))` equals that formula at every hop count — 12 s for the
+/// 1-hop hub, growing per hop for a deep mesh. The floor only governs the
+/// 1-hop case; `pending_expiry_secs` adds the per-hop allowance above it.
+const PENDING_LINK_EXPIRY_SECS: u64 = 12;
 /// Per-hop establishment allowance (RNS `DEFAULT_PER_HOP_TIMEOUT`).
 const PER_HOP_TIMEOUT_SECS: u64 = 6;
 /// Established outbound links idle longer than this are dropped instead of

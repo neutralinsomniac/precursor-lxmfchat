@@ -68,7 +68,8 @@ const PROP_DEADLINE: u64 = 120; // budget for propagation, from escalation (✗)
 const DELIVERY_RETRY: u64 = 10; // re-send opportunistically if no proof yet (LXMF: 10s)
 const MAX_ATTEMPTS: u8 = 5; // opportunistic delivery tries before escalating (LXMF: 5)
 const MAX_ROUTE_TRIES: u8 = 3; // path requests (× KEY_RETRY) before escalating to the PN
-const MAX_LINK_TRIES: u8 = 3; // link requests (each gets its ~20 s answer window) before the PN
+const MAX_LINK_TRIES: u8 = 1; // one link attempt (its ~12 s answer window) before the PN — RNS expires a path after a single establishment_timeout
+const MAX_DIRECT_ROUNDS: u8 = 1; // expire→re-request path→relink cycles before the PN (RNS rediscovers after a failed link)
 /// Whether to sync from the propagation node automatically on first connect.
 /// Runs once per app run, as soon as the node's route resolves; the "Sync
 /// messages" menu remains for manual re-syncs.
@@ -134,6 +135,11 @@ pub struct OutboundMsg {
     /// with its budget already spent — escalating to the propagation node two
     /// seconds after the first "establishing link…".
     pub link_tries: u8,
+    /// Direct re-discovery rounds spent: each is an expire→re-request path→
+    /// relink cycle after a link establishment timed out. RNS expires the path
+    /// and rediscovers before the app escalates, so we give the direct route
+    /// this many fresh attempts on a re-resolved next-hop before the PN.
+    pub direct_rounds: u8,
     /// What the last pump pass found missing: true = the peer's identity key
     /// itself, false = just a fresh route. Only used to phrase the "…— sending"
     /// status honestly when the awaited announce arrives ("key" vs "route" —
@@ -3205,6 +3211,7 @@ pub fn enqueue_outbound(
         attempts: 0,
         route_tries: 0,
         link_tries: 0,
+        direct_rounds: 0,
         awaiting_key: false,
         pn_blob: None,
         next_action: 0,
@@ -3232,7 +3239,11 @@ pub fn outbox_pump_thread(shared: Arc<Shared>, chat_cid: CID) {
         }
     };
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        // 1 s matches RNS `links_check_interval`: it bounds how long after a
+        // link's answer window closes we notice the failure and expire the
+        // path. Idle (empty outbox) ticks just re-sleep, so the cost is one
+        // bare wakeup/s.
+        std::thread::sleep(std::time::Duration::from_secs(1));
         if !plock(&shared.outbox).is_empty() {
             // Mine any pending proof-of-work first (slow, lock-free), so the
             // message/blob is ready when pump_outbox reaches its send step.
@@ -3935,11 +3946,11 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                         // not eat the link budget) and fall back to the
                         // propagation node like the no-route path does, instead
                         // of spinning until the deadline ✗'s the message.
-                        // Escalate only once the LAST request's answer window
-                        // (~20 s, PENDING_LINK_EXPIRY) has also expired — three
-                        // full windows ≈ a minute of honest trying, and a slow
-                        // LRPROOF (this hub's RTT runs seconds) isn't cut off
-                        // at the next 2 s tick.
+                        // Escalate once a single request's answer window
+                        // (~12 s, PENDING_LINK_EXPIRY scaled by hops) has
+                        // expired with no proof, matching RNS: a non-transport
+                        // instance expires the path after one establishment_timeout
+                        // and re-discovers, rather than nursing a dead route.
                         let pending = { plock(&shared.transport).pending_link_to(&peer, now) };
                         if !pending && outbox[i].link_tries >= MAX_LINK_TRIES {
                             // The link won't establish: the cached route leads to
@@ -3949,6 +3960,30 @@ fn pump_outbox(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng) {
                             // request can find a working next-hop — e.g. via a
                             // different interface after a topology change.
                             plock(&shared.transport).expire_path(&peer);
+                            // RNS, after a failed link on a non-transport
+                            // instance, expires the path and rediscovers BEFORE
+                            // the application escalates: the path response
+                            // repopulates the route and the next delivery
+                            // attempt relinks on a possibly-better next-hop.
+                            // Mirror that — give the direct route one fresh
+                            // path-request + link window on the re-resolved
+                            // route before the PN. `has_path` is now false (we
+                            // just expired it), so the next pass re-enters the
+                            // route-discovery branch and re-requests the path;
+                            // resetting `route_tries` restores its full budget.
+                            if outbox[i].direct_rounds < MAX_DIRECT_ROUNDS {
+                                outbox[i].direct_rounds += 1;
+                                outbox[i].link_tries = 0;
+                                outbox[i].route_tries = 0;
+                                outbox[i].next_action = now + 1;
+                                chat::cf_set_status_text(
+                                    chat_cid,
+                                    &format!("{label}: route lost — rediscovering…"),
+                                );
+                                i += 1;
+                                continue;
+                            }
+                            // Direct re-discovery exhausted: fall back to the PN.
                             if !outbox[i].tried_pn && pn.is_some() {
                                 outbox[i].via_pn = true;
                                 outbox[i].deadline = now + PROP_DEADLINE; // fresh budget
