@@ -294,21 +294,30 @@ pub struct Resolver {
     trng: trng::Trng,
     freeze: bool,
 }
+/// Bind the resolver's UDP socket against the *current* interface state. Pulled out of
+/// `Resolver::new` so it can also be used to rebind after a network switch: the socket is
+/// otherwise long-lived, but switching networks changes our IP and leaves the old binding
+/// stale, so sends/recvs fail with NetworkError until a reboot. Rebinding picks up the new IP.
+fn bind_dns_socket(trng: &trng::Trng) -> UdpSocket {
+    #[cfg(target_os = "windows")]
+    let socket = UdpSocket::bind("0.0.0.0:0").expect("couldn't create socket for DNS resolver");
+    #[cfg(not(target_os = "windows"))]
+    let local_port = (49152 + trng.get_u32().unwrap() % 16384) as u16;
+    #[cfg(not(target_os = "windows"))]
+    let socket = UdpSocket::bind(format!("0.0.0.0:{}", local_port))
+        .expect("couldn't create socket for DNS resolver");
+    let timeout = Duration::from_millis(10_000); // 10 seconds for DNS to resolve by default
+    socket.set_read_timeout(Some(timeout)).unwrap();
+    socket.set_nonblocking(false).unwrap(); // we want this to block.
+    // we /could/ do a non-blocking DNS resolver, but...what would you do in the meantime??
+    // blocking is probably what we actually want this time.
+    socket
+}
+
 impl Resolver {
     pub fn new(xns: &xous_names::XousNames) -> Resolver {
         let trng = trng::Trng::new(&xns).unwrap();
-        #[cfg(target_os = "windows")]
-        let socket = UdpSocket::bind("0.0.0.0:0").expect("couldn't create socket for DNS resolver");
-        #[cfg(not(target_os = "windows"))]
-        let local_port = (49152 + trng.get_u32().unwrap() % 16384) as u16;
-        #[cfg(not(target_os = "windows"))]
-        let socket = UdpSocket::bind(format!("0.0.0.0:{}", local_port))
-            .expect("couldn't create socket for DNS resolver");
-        let timeout = Duration::from_millis(10_000); // 10 seconds for DNS to resolve by default
-        socket.set_read_timeout(Some(timeout)).unwrap();
-        socket.set_nonblocking(false).unwrap(); // we want this to block.
-        // we /could/ do a non-blocking DNS resolver, but...what would you do in the meantime??
-        // blocking is probably what we actually want this time.
+        let socket = bind_dns_socket(&trng);
 
         Resolver {
             mgr: net::protocols::DnsServerManager::register(&xns)
@@ -336,7 +345,27 @@ impl Resolver {
     /// this allows us to re-use the TRNG object
     pub fn trng_u32(&self) -> u32 { self.trng.get_u32().unwrap() }
 
+    /// Recreate the resolver's UDP socket. The previous socket can go stale across a network
+    /// switch (our IP changes underneath it), which surfaces as NetworkError on every query
+    /// until reboot; rebinding against the live interface clears that.
+    fn rebind(&mut self) { self.socket = bind_dns_socket(&self.trng); }
+
     pub fn resolve(&mut self, name: &str) -> Result<HashMap<IpAddr, u32>, DnsResponseCode> {
+        // A NetworkError is most often a stale socket left over from a network switch (ping by
+        // IP still works, only the long-lived DNS socket is wedged). Rebind and retry once so
+        // the switch self-heals instead of needing a reboot. NoServerSpecified is left alone —
+        // that's a config gap, not a stale socket.
+        match self.resolve_once(name) {
+            Err(DnsResponseCode::NetworkError) => {
+                log::info!("DNS NetworkError; rebinding resolver socket and retrying once");
+                self.rebind();
+                self.resolve_once(name)
+            }
+            other => other,
+        }
+    }
+
+    fn resolve_once(&mut self, name: &str) -> Result<HashMap<IpAddr, u32>, DnsResponseCode> {
         if let Some(dns_address) = self.mgr.get_random() {
             let dns_port = 53;
             let server = SocketAddr::new(dns_address, dns_port);

@@ -149,6 +149,38 @@ UDP replies silently receives nothing.
   `join_multicast_v6` is an unimplementable stub on Xous, the netstack owns
   group membership).
 
+### 11. services/dns: resolver UDP socket never rebinds — DNS dead after a network switch
+The DNS resolver (`services/dns/src/main.rs`, `Resolver::new`) binds one
+`UdpSocket` at startup and reuses it for every query. Switching WiFi networks
+changes the device's IP underneath that long-lived socket, leaving its binding
+stale: `send_to`/`recv` then fail and every lookup returns
+`DnsResponseCode::NetworkError` — while ping-by-IP still works (Ping uses its own
+socket) and `net debug` shows the DNS server set correctly. Only a reboot (which
+recreates the socket) recovers. The dns service has no IP-change hook to rebind
+on — the server list is managed inside `net::protocols::DnsServerManager`, not
+via dns opcodes.
+- Local fix: `resolve()` retries once on `NetworkError`, rebinding the socket
+  against the live interface first (`bind_dns_socket` helper + `rebind()`);
+  `NoServerSpecified` is left alone (config gap, not a stale socket).
+- Exact sub-mechanism (source IP pinned at bind vs per-socket smoltcp state)
+  unconfirmed on HW, but rebind = what a reboot does for the socket.
+
+### 12. services/net: RX interrupt never re-polled on resume — wifi RX wedges after sleep
+The EC holds its host-interrupt line asserted (level) until the SoC ACKs a
+pending interrupt, but the SoC side only fires on a fresh *edge*
+(`betrusted-ec/sw/src/com_bus.rs`). At startup the net service drains pending
+interrupts with `ints_get_active` right after enabling them
+(`services/net/src/main.rs`), but the **resume** handler only re-enables — it
+never polls. Across the multi-service suspend/resume ordering (net=Early,
+com=Late, plus llio) the EC's set-mask retrigger edge gets lost, so RX/events
+that arrived while suspended are never delivered: the EC RX buffer just fills
+(`net debug` shows `drops` climbing) and DNS/ping replies never reach smoltcp.
+Looks like "can't send" but is "can't receive"; `tx_errs` stays 0 and toggling
+the wifi kill switch (forces a new edge) recovers it, dumping the whole backlog.
+- Local fix: the net resume handler sends itself one `ComInterrupt` after
+  re-enabling, forcing a poll (mirrors startup) that drains the pending vector
+  and restarts the per-packet ack→re-edge chain. No-op when nothing is pending.
+
 ## betrusted-io / betrusted-ec
 
 ### EC net bridge drops all IPv6 — no IPv6 connectivity possible on Precursor wifi
