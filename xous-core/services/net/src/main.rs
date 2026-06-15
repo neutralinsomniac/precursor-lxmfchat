@@ -2081,6 +2081,22 @@ fn main() -> ! {
                 com_int_list.push(ComIntSources::WlanSsidScanFinished);
                 com_int_list.push(ComIntSources::WfxErr);
                 com.ints_enable(&com_int_list);
+
+                // The EC holds its host-interrupt line asserted (level) until we ACK a
+                // pending interrupt, but the SoC side only fires on a fresh *edge*. Across
+                // suspend/resume that re-trigger edge can be lost (the EC's set-mask retrigger
+                // races the COM + llio interrupt re-arm), so RX/events that arrived while we
+                // slept are never delivered: the EC buffer just fills (drops climb) until
+                // something forces a new edge — e.g. toggling the wifi kill switch. Force one
+                // interrupt poll here, exactly like the startup path does after enabling, to
+                // drain the already-pending vector and restart the per-packet ack->re-edge
+                // chain. Harmless when nothing is pending (the handler no-ops on an empty/
+                // timed-out fetch).
+                xous::try_send_message(
+                    net_cid,
+                    Message::new_scalar(Opcode::ComInterrupt.to_usize().unwrap(), 0, 0, 0, 0),
+                )
+                .ok();
             }),
             Some(Opcode::Quit) => {
                 log::warn!("quit received");
