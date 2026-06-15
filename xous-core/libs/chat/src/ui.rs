@@ -103,23 +103,31 @@ pub(crate) struct Ui {
 const DOC_MAX_LINES: usize = 2048;
 /// Vertical space taken by a divider line, total.
 const DOC_DIVIDER_HEIGHT: u32 = 12;
+/// Clip height used only when *measuring* a line's natural wrapped height: a
+/// line must never be reported shorter than it really is just because it would
+/// be clipped on screen, or the pixel scroll math drifts. Big enough that no
+/// real line reaches it.
+const DOC_MEASURE_CLIP: isize = 1 << 20;
 
 pub(crate) struct DocState {
     #[allow(dead_code)]
     title: String,
     lines: Vec<DocLine>,
-    /// lazily-computed line heights (same trick as Post::bounding_box)
+    /// lazily-computed line heights (same trick as Post::bounding_box). This is
+    /// the line's *natural* wrapped height — independent of where it lands on
+    /// screen — which is what makes pixel scrolling exact.
     heights: Vec<Option<u32>>,
-    /// first visible line index
-    top: usize,
-    /// cursor line; when it is a link line it renders highlighted
-    cursor: usize,
-    /// first line at/after `top` that the last draw did NOT render fully (a
-    /// partially-clipped bottom line, or the first undrawn line). Recorded by
-    /// `layout_document` from the real draw so page-down lands here instead of
-    /// recomputing a fits-count that can disagree with what was drawn and skip
-    /// a line. `total` means the whole tail fit (page-down is a no-op).
-    next_top: usize,
+    /// Pixel offset from the top of the document content to the top of the
+    /// viewport. Scrolling is by pixels, not lines: a wrapped line can sit
+    /// half on-screen, and stepping/paging never snap to a line boundary (the
+    /// snapping is what skipped the tail of a wrapped line). Clamped to
+    /// `[0, doc_max_scroll]` on every layout.
+    scroll: u32,
+    /// Selected link line, if any. The cursor *only* ever lands on a link line:
+    /// it highlights that link and is what `Enter` activates, and link nav
+    /// scrolls it into view. It does NOT drive the viewport — `scroll` alone
+    /// does — so it can't make stepping jump by a whole line.
+    cursor: Option<usize>,
 }
 
 #[allow(dead_code)]
@@ -634,9 +642,8 @@ impl Ui {
             title: title.to_owned(),
             lines: Vec::new(),
             heights: Vec::new(),
-            top: 0,
-            cursor: 0,
-            next_top: 0,
+            scroll: 0,
+            cursor: None,
         });
     }
 
@@ -725,134 +732,130 @@ impl Ui {
         self.document.as_ref().and_then(|d| d.lines.get(i)).map(|l| l.kind == DOC_KIND_LINK).unwrap_or(false)
     }
 
-    /// Move the document cursor to the adjacent LINK on the current screen;
-    /// with no further link in that direction, page instead and land on the
-    /// nearest link of the new screen (its edge line when it has none). So
-    /// ↑/↓ alone walk a whole page: hop the visible links, then scroll.
+    /// Move the link selection to the previous/next LINK anywhere in the
+    /// document and scroll it into view. The cursor cares only about links —
+    /// never plain text — so this hops link to link regardless of how the
+    /// surrounding text wraps. From no selection it starts at the top of what's
+    /// on screen, so the first link picked is the one nearest the viewport.
     pub(crate) fn doc_cursor(&mut self, next: bool) {
-        let (top, cursor, total) = match self.document.as_ref() {
-            Some(d) if !d.lines.is_empty() => (d.top, d.cursor, d.lines.len()),
+        let total = match self.document.as_ref() {
+            Some(d) if !d.lines.is_empty() => d.lines.len(),
             _ => return,
         };
-        let end = (top + self.doc_visible_count(top)).min(total); // exclusive
-        let target = if next {
-            ((cursor + 1).max(top)..end).find(|&i| self.doc_is_link(i))
-        } else {
-            (top..cursor.min(end)).rev().find(|&i| self.doc_is_link(i))
+        let anchor = self.doc_first_visible_line();
+        let target = match self.document.as_ref().and_then(|d| d.cursor) {
+            Some(c) if next => ((c + 1)..total).find(|&i| self.doc_is_link(i)),
+            Some(c) => (0..c).rev().find(|&i| self.doc_is_link(i)),
+            None if next => (anchor..total).find(|&i| self.doc_is_link(i)),
+            None => (0..=anchor).rev().find(|&i| self.doc_is_link(i)),
         };
         if let Some(i) = target {
             if let Some(doc) = self.document.as_mut() {
-                doc.cursor = i;
+                doc.cursor = Some(i);
             }
-            return;
+            self.doc_scroll_into_view(i);
         }
-        // No further link this screen: page instead (doc_page focuses the new
-        // screen's nearest link itself, and no-ops at the document's edge).
-        self.doc_page(next);
     }
 
-    /// Scroll the document by one screenful, parking the cursor on the new
-    /// top line (so paging and line-stepping compose predictably).
+    /// Page the document by one screenful. Pure pixel scroll (the same
+    /// mechanism as `doc_line`, just a bigger step), so it can never skip the
+    /// tail of a wrapped line: a line cut at the bottom edge reappears at the
+    /// top of the next page. A one-row overlap carries the boundary line across
+    /// for reading continuity.
     pub(crate) fn doc_page(&mut self, down: bool) {
-        let (top, total, next_top) = match self.document.as_ref() {
-            Some(d) if !d.lines.is_empty() => (d.top, d.lines.len(), d.next_top),
-            _ => return,
-        };
-        let new_top = if down {
-            // Land on the first line the last draw couldn't show in full (see
-            // `next_top`); `max(top + 1)` still advances when a single line is
-            // taller than the whole viewport, so paging never gets stuck.
-            if next_top >= total {
-                return; // whole tail already on screen
-            }
-            next_top.max(top + 1).min(total - 1)
-        } else {
-            // Walk backward until another screenful of (cached) heights is
-            // behind the old top.
-            let (_, bottom, budget) = self.doc_metrics();
-            let mut used = 0u32;
-            let mut i = top;
-            while i > 0 {
-                let h = self.doc_line_height(i - 1, bottom) + self.vp.bubble_space as u32;
-                if used + h > budget {
-                    break;
-                }
-                used += h;
-                i -= 1;
-            }
-            i
-        };
-        if new_top == top {
-            return; // already at the document's edge
-        }
-        if let Some(doc) = self.document.as_mut() {
-            doc.top = new_top;
-        }
-        // Always a plain screenful — never "scroll to a link". But IF the new
-        // screen has one, focus the nearest in the direction of travel; else
-        // the cursor bar just marks the screen's edge line.
-        let new_end = (new_top + self.doc_visible_count(new_top)).min(total);
-        let landing = if down {
-            (new_top..new_end).find(|&i| self.doc_is_link(i))
-        } else {
-            (new_top..new_end).rev().find(|&i| self.doc_is_link(i))
-        };
-        if let Some(doc) = self.document.as_mut() {
-            doc.cursor = landing.unwrap_or(new_top);
-        }
+        let (_, _, budget) = self.doc_metrics();
+        let step = budget.saturating_sub(self.doc_row_step()).max(self.doc_row_step()) as i32;
+        self.doc_scroll_by(if down { step } else { -step });
     }
 
-    /// Step the document one line (j/k). The cursor drives the scroll —
-    /// `layout_document` pulls `top` along to keep the cursor on screen — so
-    /// moving it line-by-line scrolls once it reaches the screen edge.
+    /// Step the document one display row (j/k). Pixel scroll by one glyph row,
+    /// independent of logical lines — so it always moves by the same small
+    /// amount, never by a whole wrapped line.
     pub(crate) fn doc_line(&mut self, down: bool) {
-        let total = match self.document.as_ref() {
-            Some(d) if !d.lines.is_empty() => d.lines.len(),
-            _ => return,
-        };
-        if let Some(doc) = self.document.as_mut() {
-            doc.cursor = if down { (doc.cursor + 1).min(total - 1) } else { doc.cursor.saturating_sub(1) };
-        }
+        let step = self.doc_row_step() as i32;
+        self.doc_scroll_by(if down { step } else { -step });
     }
 
-    /// Jump the document to the top (g) or bottom (G). For the top the cursor
-    /// alone suffices; for the bottom we also pre-set `top` to the final
-    /// screenful (walking back from the end by one viewport of cached heights)
-    /// so `layout_document` doesn't have to scan the whole document forward to
-    /// reveal the last line.
+    /// Jump to the top (g) or bottom (G) of the document. Pure scroll; the link
+    /// selection is dropped (there is no link "edge" to land on).
     pub(crate) fn doc_edge(&mut self, bottom: bool) {
-        let total = match self.document.as_ref() {
-            Some(d) if !d.lines.is_empty() => d.lines.len(),
-            _ => return,
-        };
-        if !bottom {
-            if let Some(doc) = self.document.as_mut() {
-                doc.top = 0;
-                doc.cursor = 0;
-            }
-            return;
-        }
-        let (_, clip_bottom, budget) = self.doc_metrics();
-        let mut used = 0u32;
-        let mut i = total;
-        while i > 0 {
-            let h = self.doc_line_height(i - 1, clip_bottom) + self.vp.bubble_space as u32;
-            if used + h > budget && i < total {
-                break; // keep at least the final line, even if it overflows alone
-            }
-            used += h;
-            i -= 1;
-        }
+        let target = if bottom { self.doc_max_scroll() } else { 0 };
         if let Some(doc) = self.document.as_mut() {
-            doc.top = i;
-            doc.cursor = total - 1;
+            doc.scroll = target;
+            doc.cursor = None;
         }
     }
 
-    /// The link under the cursor, if the cursor line is a link line.
+    /// One display row, in pixels: a glyph line plus the inter-line gap. The
+    /// shared unit behind both line-stepping and paging.
+    fn doc_row_step(&self) -> u32 {
+        blitstr2::glyph_height_hint(GlyphStyle::Regular) as u32 + self.vp.bubble_space as u32
+    }
+
+    /// Apply a signed pixel delta to the scroll offset, clamped to range.
+    fn doc_scroll_by(&mut self, delta: i32) {
+        let max = self.doc_max_scroll() as i64;
+        if let Some(doc) = self.document.as_mut() {
+            doc.scroll = (doc.scroll as i64 + delta as i64).clamp(0, max) as u32;
+        }
+    }
+
+    /// Document-space top (pixels) of line `idx`, summing natural heights and
+    /// the inter-line gap. `idx == lines.len()` gives the total content height.
+    fn doc_line_top(&mut self, idx: usize) -> u32 {
+        let mut y = 0u32;
+        for i in 0..idx {
+            y += self.doc_line_height(i) + self.vp.bubble_space as u32;
+        }
+        y
+    }
+
+    /// Largest valid scroll offset: content taller than the viewport can be
+    /// scrolled until its bottom meets the viewport bottom; shorter content
+    /// can't scroll at all.
+    fn doc_max_scroll(&mut self) -> u32 {
+        let total = self.document.as_ref().map(|d| d.lines.len()).unwrap_or(0);
+        let (_, _, budget) = self.doc_metrics();
+        self.doc_line_top(total).saturating_sub(budget)
+    }
+
+    /// Index of the first line at least partly visible at the current scroll.
+    fn doc_first_visible_line(&mut self) -> usize {
+        let (scroll, total) = match self.document.as_ref() {
+            Some(d) => (d.scroll, d.lines.len()),
+            None => return 0,
+        };
+        let mut y = 0u32;
+        for i in 0..total {
+            y += self.doc_line_height(i) + self.vp.bubble_space as u32;
+            if y > scroll {
+                return i;
+            }
+        }
+        total.saturating_sub(1)
+    }
+
+    /// Nudge the scroll so line `i` is fully on screen, moving the least amount
+    /// needed (and never past the document's end).
+    fn doc_scroll_into_view(&mut self, i: usize) {
+        let (_, _, budget) = self.doc_metrics();
+        let top = self.doc_line_top(i);
+        let h = self.doc_line_height(i);
+        let max = self.doc_max_scroll();
+        if let Some(doc) = self.document.as_mut() {
+            if top < doc.scroll {
+                doc.scroll = top;
+            } else if top + h > doc.scroll + budget {
+                doc.scroll = (top + h).saturating_sub(budget);
+            }
+            doc.scroll = doc.scroll.min(max);
+        }
+    }
+
+    /// The link under the cursor, if a link is selected.
     pub(crate) fn doc_selected_link(&self) -> Option<u16> {
         let doc = self.document.as_ref()?;
-        let line = doc.lines.get(doc.cursor)?;
+        let line = doc.lines.get(doc.cursor?)?;
         if line.kind == DOC_KIND_LINK { Some(line.link_id) } else { None }
     }
 
@@ -899,8 +902,11 @@ impl Ui {
         tv
     }
 
-    /// Height of document line `i`, measured lazily and cached.
-    fn doc_line_height(&mut self, i: usize, clip_bottom: isize) -> u32 {
+    /// Natural (unclipped) wrapped height of document line `i`, measured lazily
+    /// and cached. Measured with a deep clip so where the line happens to fall
+    /// on screen never shortens the cached value — pixel scrolling relies on
+    /// these being the true heights.
+    fn doc_line_height(&mut self, i: usize) -> u32 {
         let Some(doc) = self.document.as_ref() else { return 0 };
         let Some(line) = doc.lines.get(i) else { return 0 };
         if let Some(h) = doc.heights[i] {
@@ -909,7 +915,7 @@ impl Ui {
         let h = if line.kind == DOC_KIND_DIVIDER || line.text.is_empty() {
             DOC_DIVIDER_HEIGHT
         } else {
-            let mut tv = self.doc_textview(line, self.vp.status_height as isize, false, clip_bottom);
+            let mut tv = self.doc_textview(line, self.vp.status_height as isize, false, DOC_MEASURE_CLIP);
             match self.gam.bounds_compute_textview(&mut tv) {
                 Ok(_) => tv.bounds_computed.map(|r| r.height()).unwrap_or(DOC_DIVIDER_HEIGHT),
                 Err(_) => DOC_DIVIDER_HEIGHT,
@@ -942,43 +948,23 @@ impl Ui {
         (y0, bottom, (bottom - y0).max(0) as u32)
     }
 
-    /// Lines [top..] that fit FULLY on screen, by cached heights (no drawing).
-    fn doc_visible_count(&mut self, top: usize) -> usize {
-        let total = self.document.as_ref().map(|d| d.lines.len()).unwrap_or(0);
-        let (_, bottom, budget) = self.doc_metrics();
-        let mut used = 0u32;
-        let mut n = 0;
-        for i in top..total {
-            let h = self.doc_line_height(i, bottom) + self.vp.bubble_space as u32;
-            if used + h > budget && n > 0 {
-                break;
-            }
-            used += h;
-            n += 1;
-        }
-        n.max(1)
-    }
-
-    /// Render the document: scroll `top` to keep the cursor on screen, then
-    /// draw the visible lines (links bordered, cursor-link highlighted) and
-    /// the status bar, mirroring `layout()` for chat.
+    /// Render the document at the current pixel `scroll`: draw every line that
+    /// intersects the viewport (clip handles the partial line at each edge),
+    /// links bordered and the selected link highlighted, then the status bar —
+    /// mirroring `layout()` for chat.
     fn layout_document(&mut self) {
-        let (cursor, total) = match self.document.as_ref() {
-            Some(d) => (d.cursor, d.lines.len()),
+        let total = match self.document.as_ref() {
+            Some(d) => d.lines.len(),
             None => return,
         };
-        // Keep the cursor visible: pull `top` up to it, or walk down until
-        // the visible window (computed from cached heights) reaches it.
-        let mut top = self.document.as_ref().map(|d| d.top).unwrap_or(0).min(total.saturating_sub(1));
-        if cursor < top {
-            top = cursor;
-        }
-        while top + 1 < total && cursor >= top + self.doc_visible_count(top) {
-            top += 1;
-        }
-        if let Some(doc) = self.document.as_mut() {
-            doc.top = top;
-        }
+        // Re-clamp scroll: heights (and thus the max) can shift as new content
+        // streams in or the canvas resizes.
+        let max = self.doc_max_scroll();
+        let (scroll, cursor) = {
+            let doc = self.document.as_mut().unwrap();
+            doc.scroll = doc.scroll.min(max);
+            (doc.scroll, doc.cursor)
+        };
 
         // Clear everything (status bar included; it is redrawn below). Clear to
         // the FULL canvas height, not the (tray-reduced) layout bottom: with the
@@ -998,77 +984,45 @@ impl Ui {
             )
             .expect("can't clear canvas area");
 
-        // Fresh metrics. As we draw, record the first line that does NOT fit
-        // fully (a partially-clipped bottom line, or the first undrawn line):
-        // that is where page-down must land so the cut line is read in full.
-        // Deriving it from the real draw — rather than a separate fits-count —
-        // is what keeps paging from skipping a line. `total` => the tail fit.
-        let mut next_top = total;
-        let mut y = y0;
-        for i in top..total {
-            if y >= bottom {
-                if next_top == total {
-                    next_top = i;
-                }
-                break;
+        // Walk the whole document in document space; draw the lines that
+        // intersect the viewport [scroll, scroll + budget). Each line's screen
+        // y is pure arithmetic (`y0 + doc_y - scroll`), so a wrapped line can
+        // sit partly above the top (negative offset, clipped at the status bar)
+        // or partly below the bottom (clipped at `bottom`). Nothing is ever
+        // skipped, and the on-screen height of a line never feeds back into its
+        // cached natural height.
+        let mut doc_y = 0u32; // top of line i, document space
+        for i in 0..total {
+            let h = self.doc_line_height(i);
+            let line_bottom = doc_y + h;
+            let next_y = line_bottom + self.vp.bubble_space as u32;
+            if line_bottom <= scroll {
+                doc_y = next_y; // entirely above the viewport
+                continue;
+            }
+            let screen_y = y0 + doc_y as isize - scroll as isize;
+            if screen_y >= bottom {
+                break; // this and everything after is below the viewport
             }
             let line = match self.document.as_ref().and_then(|d| d.lines.get(i)) {
                 Some(l) => l.clone(),
                 None => break,
             };
-            let drawn_h = if line.kind == DOC_KIND_DIVIDER {
-                let mid = y + (DOC_DIVIDER_HEIGHT / 2) as isize;
-                let rule = Line::new(
-                    Point::new(self.vp.margin.x, mid),
-                    Point::new(self.vp.layout_screensize.x - self.vp.margin.x, mid),
-                );
-                self.gam.draw_line(self.vp.canvas, rule).ok();
-                DOC_DIVIDER_HEIGHT
-            } else if line.text.is_empty() {
-                DOC_DIVIDER_HEIGHT
-            } else {
-                let highlight = i == cursor && line.kind == DOC_KIND_LINK;
-                let mut tv = self.doc_textview(&line, y, highlight, bottom);
-                match self.gam.post_textview(&mut tv) {
-                    Ok(_) => {
-                        let h = tv.bounds_computed.map(|r| r.height()).unwrap_or(DOC_DIVIDER_HEIGHT);
-                        if let Some(doc) = self.document.as_mut() {
-                            doc.heights[i] = Some(h);
-                        }
-                        h
-                    }
-                    Err(_) => DOC_DIVIDER_HEIGHT,
+            if line.kind == DOC_KIND_DIVIDER {
+                let mid = screen_y + (DOC_DIVIDER_HEIGHT / 2) as isize;
+                if mid >= y0 && mid < bottom {
+                    let rule = Line::new(
+                        Point::new(self.vp.margin.x, mid),
+                        Point::new(self.vp.layout_screensize.x - self.vp.margin.x, mid),
+                    );
+                    self.gam.draw_line(self.vp.canvas, rule).ok();
                 }
-            };
-            // First line whose bottom edge runs past the viewport: it is drawn
-            // (clipped) but not fully readable, so the next page starts here.
-            if next_top == total && y + drawn_h as isize > bottom {
-                next_top = i;
+            } else if !line.text.is_empty() {
+                let highlight = cursor == Some(i) && line.kind == DOC_KIND_LINK;
+                let mut tv = self.doc_textview(&line, screen_y, highlight, bottom);
+                self.gam.post_textview(&mut tv).ok();
             }
-            if i == cursor {
-                // The cursor bar: a solid strip at the left edge of the cursor
-                // line, so your place on the page is visible even when the
-                // cursor isn't on a link (the text anchors at margin.x, so the
-                // bar never overstrikes glyphs).
-                self.gam
-                    .draw_rectangle(
-                        self.vp.canvas,
-                        Rectangle::new_with_style(
-                            Point::new(0, y),
-                            Point::new(3, y + drawn_h as isize),
-                            DrawStyle {
-                                fill_color: Some(PixelColor::Dark),
-                                stroke_color: None,
-                                stroke_width: 0,
-                            },
-                        ),
-                    )
-                    .ok();
-            }
-            y += drawn_h as isize + self.vp.bubble_space;
-        }
-        if let Some(doc) = self.document.as_mut() {
-            doc.next_top = next_top;
+            doc_y = next_y;
         }
 
         // Status bar on top, exactly like the chat layout.
