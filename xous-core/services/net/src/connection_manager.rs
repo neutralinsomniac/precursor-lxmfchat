@@ -118,6 +118,7 @@ pub(crate) fn connection_manager(sid: xous::SID, activity_interval: Arc<AtomicU3
     let mut ssid_attempted = HashSet::<String>::new();
     let mut wait_count = 0;
     let mut scan_count = 0;
+    let mut expedite_poll = false;
 
     let run_sid = xous::create_server().unwrap();
     let run_cid = xous::connect(run_sid).unwrap();
@@ -366,6 +367,20 @@ pub(crate) fn connection_manager(sid: xous::SID, activity_interval: Arc<AtomicU3
                                 _ => continue,
                             }
                             scan_state = SsidScanState::Idle(Instant::now());
+                            // results are in: force a management pass right now so the join is issued
+                            // immediately instead of waiting for the next multi-second poll tick
+                            expedite_poll = true;
+                            send_message(
+                                self_cid,
+                                Message::new_scalar(
+                                    ConnectionManagerOpcode::Poll.to_usize().unwrap(),
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                ),
+                            )
+                            .ok();
                         }
                         ComIntSources::WlanIpConfigUpdate => {
                             log::info!("{:?}", source);
@@ -409,7 +424,11 @@ pub(crate) fn connection_manager(sid: xous::SID, activity_interval: Arc<AtomicU3
             }),
             Some(ConnectionManagerOpcode::Poll) => msg_scalar_unpack!(msg, _, _, _, _, {
                 let interval = current_interval.load(Ordering::SeqCst) as u32;
-                if activity_interval.fetch_add(interval, Ordering::SeqCst) > interval {
+                // an interrupt (e.g. scan-finished) can set expedite_poll to force a management pass
+                // without waiting for the inactivity timer to ramp up
+                let activity_timeout = activity_interval.fetch_add(interval, Ordering::SeqCst) > interval;
+                if activity_timeout || expedite_poll {
+                    expedite_poll = false;
                     log::debug!("wlan activity interval timeout");
                     intervals_without_activity += 1;
                     if rev_ok {
