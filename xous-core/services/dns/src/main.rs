@@ -351,18 +351,31 @@ impl Resolver {
     fn rebind(&mut self) { self.socket = bind_dns_socket(&self.trng); }
 
     pub fn resolve(&mut self, name: &str) -> Result<HashMap<IpAddr, u32>, DnsResponseCode> {
-        // A NetworkError is most often a stale socket left over from a network switch (ping by
-        // IP still works, only the long-lived DNS socket is wedged). Rebind and retry once so
-        // the switch self-heals instead of needing a reboot. NoServerSpecified is left alone —
-        // that's a config gap, not a stale socket.
-        match self.resolve_once(name) {
-            Err(DnsResponseCode::NetworkError) => {
-                log::info!("DNS NetworkError; rebinding resolver socket and retrying once");
-                self.rebind();
-                self.resolve_once(name)
+        // A NetworkError is most often a stale socket: either a network switch changed our IP
+        // underneath the long-lived DNS socket, or we just resumed from sleep and the net stack
+        // is still settling (ping by IP works, only this socket is wedged). Rebind and retry so
+        // it self-heals instead of needing a reboot. One immediate retry covers a network switch
+        // (settled by the time the user acts), but on resume the recovery is asynchronous and the
+        // first retry can land in the same dead window, so we retry a few times with a short
+        // backoff to ride out the settling period. NoServerSpecified is left alone -- that's a
+        // config gap, not a stale socket.
+        const RETRY_BACKOFF_MS: u64 = 500;
+        const MAX_RETRIES: usize = 4;
+        let mut result = self.resolve_once(name);
+        for attempt in 1..=MAX_RETRIES {
+            if !matches!(result, Err(DnsResponseCode::NetworkError)) {
+                break;
             }
-            other => other,
+            log::info!(
+                "DNS NetworkError; rebinding resolver socket and retrying ({}/{})",
+                attempt,
+                MAX_RETRIES
+            );
+            thread::sleep(Duration::from_millis(RETRY_BACKOFF_MS));
+            self.rebind();
+            result = self.resolve_once(name);
         }
+        result
     }
 
     fn resolve_once(&mut self, name: &str) -> Result<HashMap<IpAddr, u32>, DnsResponseCode> {
