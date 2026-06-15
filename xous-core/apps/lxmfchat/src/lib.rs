@@ -384,6 +384,12 @@ impl<'a> LxmfChat<'a> {
                 "hub off — local peers only",
                 "hub disabled",
             );
+            // Peers that reached us through the hub now hold a stale route. If
+            // local peering is still up, re-announce there so they re-learn us
+            // on that path instead of dead-ending until it ages out.
+            if net::any_interface_up(&self.shared) && self.broadcast_announce() {
+                self.chat.set_status_text("hub off — re-announced to local peers");
+            }
         } else {
             self.connect();
         }
@@ -396,13 +402,30 @@ impl<'a> LxmfChat<'a> {
             // Routes learned via a local peer are unreachable once peering is
             // off; drop them so the hub path (or a re-request) is used instead.
             plock(&self.shared.transport).drop_paths_on(PathIface::Auto);
+            // Peers that reached us locally now hold a stale route. If the hub
+            // is up, re-announce there so the ones also reachable through it
+            // re-learn us instead of waiting for the local path to age out.
+            if net::any_interface_up(&self.shared) && self.broadcast_announce() {
+                self.chat.set_status_text("local peers off — re-announced on hub");
+            }
         } else if autoiface::start(&self.shared, self.chat_cid) {
             write_string(&self.pddb, KEY_AUTOIFACE, "1");
         }
     }
 
-    /// Announce our lxmf.delivery destination on the hub.
+    /// Announce our lxmf.delivery destination across every up interface.
     pub fn announce(&mut self) {
+        if self.broadcast_announce() {
+            let name = plock(&self.shared.display_name).clone();
+            self.chat.set_status_text(&format!("announced as {name}"));
+        }
+    }
+
+    /// Build and broadcast a fresh lxmf.delivery announce on every up interface
+    /// (hub + local peers). Returns whether any interface accepted it. Sets no
+    /// status of its own, so callers can describe the context — a manual
+    /// announce, a name change, a link-setting change.
+    fn broadcast_announce(&self) -> bool {
         let mut r5 = [0u8; 5];
         fill_random(&self.trng, &mut r5);
         let name = plock(&self.shared.display_name).clone();
@@ -410,9 +433,7 @@ impl<'a> LxmfChat<'a> {
             let tp = plock(&self.shared.transport);
             tp.make_announce_with("lxmf", &["delivery"], name.as_bytes(), &r5, now())
         };
-        if self.write_framed(&raw) {
-            self.chat.set_status_text(&format!("announced as {name}"));
-        }
+        self.write_framed(&raw)
     }
 
     /// Prompt for and store the display name we announce (what peers see in
