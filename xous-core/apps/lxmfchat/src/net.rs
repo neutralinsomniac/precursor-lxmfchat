@@ -973,7 +973,13 @@ pub(crate) fn handle_frame(
             // is established each retry, but the message itself is de-duplicated),
             // making it look like a message arrived with no content. The delivered
             // message is the real feedback.
-            chat::cf_set_status_text(chat_cid, "incoming message…");
+            //
+            // DIAGNOSTIC: distinct from the delivery toasts below so a stuck
+            // "incoming link…" (and no later toast) means the link established
+            // but the message DATA never arrived — vs an "unreadable"/"too large"
+            // toast naming a decrypt/parse/resource failure on a message that DID
+            // arrive. Lets us tell the branches apart on hardware with no serial.
+            chat::cf_set_status_text(chat_cid, "incoming link — awaiting message…");
         }
         // Direct delivery over a link: the plaintext is already the full LXMF
         // blob. Send the packet proof back so the sender confirms delivery (and
@@ -1135,10 +1141,13 @@ pub(crate) fn handle_frame(
             }
         }
         Event::DataUndecryptable { destination_hash, reason } => {
-            // Log-only — NEVER a persisted post. A repeated undecryptable packet
-            // (stale ratchet, retransmit, AP-hub cross-traffic) would otherwise
-            // flood the dialogue and overflow the PDDB on the next read.
+            // NEVER a persisted post — a repeated undecryptable packet (stale
+            // ratchet, retransmit, AP-hub cross-traffic) would flood the dialogue
+            // and overflow the PDDB on the next read. A TRANSIENT status can't
+            // flood (it's overwritten, not stored), so it's safe and surfaces the
+            // cause of a "notification but no message" on hardware with no serial.
             log::warn!("undecryptable DATA to {}: {}", hex(&destination_hash), reason);
+            chat::cf_set_status_text(chat_cid, &format!("incoming message unreadable: {reason}"));
         }
         // NOTE: link-control / unrouted / dropped frames are logged only, never
         // posted to the chat. Posting them persisted a flood of entries (each
@@ -1259,6 +1268,7 @@ fn inbound_resource(
                 // Oversized / multi-segment / malformed: don't request it; the
                 // sender times out and falls back to the propagation node.
                 log::warn!("inbound resource on link {} rejected: {e}", hex(&link_id));
+                chat::cf_set_status_text(chat_cid, &format!("incoming message too large/blocked: {e}"));
             }
         },
         CONTEXT_RESOURCE => {
@@ -1301,6 +1311,7 @@ fn inbound_resource(
                     Some(p) => p,
                     None => {
                         log::warn!("inbound resource on link {}: stream decrypt failed", hex(&link_id));
+                        chat::cf_set_status_text(chat_cid, "incoming message unreadable (resource decrypt)");
                         return;
                     }
                 }
@@ -1316,7 +1327,10 @@ fn inbound_resource(
                     }
                     deliver_lxmf(shared, chat_cid, pddb, trng, &payload, true);
                 }
-                Err(e) => log::warn!("inbound resource on link {} invalid: {e}", hex(&link_id)),
+                Err(e) => {
+                    log::warn!("inbound resource on link {} invalid: {e}", hex(&link_id));
+                    chat::cf_set_status_text(chat_cid, &format!("incoming message invalid: {e}"));
+                }
             }
         }
         // A hashmap-update page: the transfer is bigger than the advertisement
@@ -1662,6 +1676,13 @@ fn deliver_lxmf(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Trng, l
         }
         refresh_idle_status(shared, chat_cid);
         post_to_chat(shared, chat_cid, &author, ts, &text);
+        // Clear any lingering transient (e.g. "incoming link — awaiting
+        // message…"): refresh_idle_status only sets the *idle* text and doesn't
+        // repaint the displayed line, so without this the establish-time toast
+        // sits there stale even though the message just landed. Overwriting it
+        // with the in-conversation line keeps a stuck "awaiting message…" a
+        // reliable failure signal.
+        chat::cf_set_status_text(chat_cid, &format!("\u{25c9} {}", peer_label(shared, &src_hash)));
     } else {
         // A different contact: do NOT disturb the active conversation. Hold the
         // message and bump that contact's unread badge; it'll be flushed into the
