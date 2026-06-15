@@ -328,6 +328,15 @@ impl<'a> LxmfChat<'a> {
         let browse = self.shared.clone();
         let browse_cid = self.chat_cid;
         std::thread::spawn(move || net::browser_thread(browse, browse_cid));
+        // Tear our hub socket down on suspend and force a fresh dial on wake,
+        // so a connection that died across sleep doesn't sit there looking alive
+        // (hardware-only: suspend isn't delivered in hosted mode).
+        #[cfg(target_os = "xous")]
+        {
+            let susres = self.shared.clone();
+            let susres_cid = self.chat_cid;
+            std::thread::spawn(move || net::suspend_resume_thread(susres, susres_cid));
+        }
         if read_string(&self.pddb, KEY_AUTOIFACE).as_deref() == Some("1") {
             autoiface::start_background(&self.shared, self.chat_cid);
         }

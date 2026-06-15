@@ -1803,6 +1803,68 @@ pub fn keepalive_thread(shared: Arc<Shared>, chat_cid: CID) {
 /// own at its next timeout tick (≤15 s), and the shutdown() errors out any
 /// blocked read/write immediately when the net service honors the abort (it
 /// demonstrably may not for a socket that died across a suspend).
+/// Force a fresh hub dial on every wake.
+///
+/// A TCP socket held across a suspend is dead on the other side but looks alive
+/// to us: the read loop blocks on a connection the hub has long since dropped,
+/// and nothing redials. We disassociate wifi on suspend now (see the net
+/// service's connection manager), so on resume the link is guaranteed new —
+/// just reset to it unconditionally rather than waiting for a stale read to
+/// finally error out (which it may never do). [[wifi-post-sleep-tx-stall]]
+///
+/// The teardown happens on RESUME, not suspend: `force_reconnect`'s
+/// `shutdown()` is a blocking IPC into the net service, which suspends at
+/// `Early` — calling it from a suspend hook (which runs later in the sequence)
+/// deadlocks against the already-suspended net service and times the whole
+/// suspend out. So the suspend side does nothing but acknowledge readiness; the
+/// dead socket is reaped on wake, when the net service is alive again.
+#[cfg(target_os = "xous")]
+pub fn suspend_resume_thread(shared: Arc<Shared>, chat_cid: CID) {
+    let xns = match XousNames::new() {
+        Ok(x) => x,
+        Err(_) => {
+            log::error!("lxmf susres: xns init failed");
+            return;
+        }
+    };
+    let sus_server = xous::create_server().unwrap();
+    let sus_cid = xous::connect(sus_server).unwrap();
+    let mut susres = match susres::Susres::new(Some(susres::SuspendOrder::Late), &xns, 0, sus_cid) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("lxmf susres: couldn't hook suspend/resume: {:?}", e);
+            return;
+        }
+    };
+    let tt = ticktimer_server::Ticktimer::new().unwrap();
+    loop {
+        let msg = xous::receive_message(sus_server).unwrap();
+        xous::msg_scalar_unpack!(msg, token, _, _, _, {
+            // Suspend side: NO network I/O (the net service is already down) —
+            // just report ready so the suspend can proceed.
+            susres.suspend_until_resume(token).expect("couldn't execute suspend/resume");
+            // On wake, give the net service a moment to re-associate + DHCP
+            // before we redial, then force a clean reconnect unconditionally —
+            // whatever socket we had is dead, and the link underneath is new.
+            tt.sleep_ms(1000).ok();
+            // Only redial if the hub is actually enabled — otherwise the
+            // connection manager is intentionally parked, and a force_reconnect
+            // would just paint a misleading "reconnecting…" status + leave a
+            // stale disconnect reason with no socket to even tear down.
+            if shared.hub_enabled.load(core::sync::atomic::Ordering::SeqCst) {
+                force_reconnect(&shared, chat_cid, "reconnecting after wake…", "resumed from suspend");
+            }
+            // Local peers heard before the sleep are stale, and the wifi
+            // reconnect drops our multicast-group membership. Empty the peer map
+            // so the AutoInterface's rejoin fires on its next tick (it's gated on
+            // peers.is_empty()) instead of waiting up to PEERING_TIMEOUT_SECS for
+            // a dead entry to age out — peers re-populate from beacons within a
+            // couple ticks.
+            plock(&shared.auto).peers.clear();
+        });
+    }
+}
+
 pub(crate) fn force_reconnect(shared: &Arc<Shared>, chat_cid: CID, status: &str, reason: &str) {
     use core::sync::atomic::Ordering;
     note_disconnect(shared, reason.to_string());
