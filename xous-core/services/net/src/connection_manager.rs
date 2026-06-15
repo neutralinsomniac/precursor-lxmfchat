@@ -178,13 +178,20 @@ pub(crate) fn connection_manager(sid: xous::SID, activity_interval: Arc<AtomicU3
         move || {
             let sus_server = xous::create_server().unwrap();
             let sus_cid = xous::connect(sus_server).unwrap();
-            let mut susres = susres::Susres::new(Some(susres::SuspendOrder::Late), &xns, 0, sus_cid)
+            // Suspend at Normal, i.e. ahead of the COM service's Late suspend, so the EC link
+            // is still alive when we disassociate below.
+            let mut susres = susres::Susres::new(Some(susres::SuspendOrder::Normal), &xns, 0, sus_cid)
                 .expect("couldn't create suspend/resume object");
+            let mut com = com::Com::new(&xns).unwrap();
             let tt = ticktimer_server::Ticktimer::new().unwrap();
             loop {
                 let msg = xous::receive_message(sus_server).unwrap();
                 xous::msg_scalar_unpack!(msg, token, _, _, _, {
-                    // for now, nothing to do to prepare for suspend...
+                    // Drop the association before sleeping: a lease held across suspend goes stale
+                    // (the AP ages us out, or the lease expires), and the EC keeps reporting
+                    // "connected" so we'd waste many poll intervals before noticing. Resume forces
+                    // a fresh re-associate + DHCP regardless, so always start from a clean slate.
+                    com.wlan_leave().ok();
                     susres.suspend_until_resume(token).expect("couldn't execute suspend/resume");
                     // but on resume, kick a message to the main loop to tell it to recheck its connections!
                     tt.sleep_ms(1000).unwrap(); // wait a full second before kicking out this message, so other services can normalize before attempting a re-connect
@@ -214,91 +221,58 @@ pub(crate) fn connection_manager(sid: xous::SID, activity_interval: Arc<AtomicU3
         log::trace!("got msg: {:?}", msg);
         match FromPrimitive::from_usize(msg.body.id()) {
             Some(ConnectionManagerOpcode::SuspendResume) => xous::msg_scalar_unpack!(msg, _, _, _, _, {
-                // this doesn't follow the usual "suspender" pattern. In fact, we don't do anything special on
-                // suspend; however, on resume, check with the EC and see where the link state
-                // ended up.
+                // We disassociated on suspend, so whatever the EC reports now, our association and
+                // DHCP lease are gone. Trusting a stale "connected" link state here is what used to
+                // make resume take ~20s to notice a dead link (the inactivity heuristic in Poll only
+                // fires after several intervals). Instead, tear down and re-establish immediately.
                 let (res_linkstate, _res_dhcpstate) = com.wlan_sync_state().unwrap();
-                wifi_stats_cache = com.wlan_status().unwrap();
-                match res_linkstate {
-                    LinkState::Connected => {
-                        match wifi_state {
-                            WifiState::Connected => {
-                                // everything is A-OK
-                            }
-                            WifiState::Error => {
-                                // let the error handler do its thing on the next pump cycle
-                            }
-                            _ => {
-                                // somehow, we thought we were disconnected, but then we resumed and we're
-                                // magically connected. it's not clear to me
-                                // how we get into this state, so let's be conservative and just leave the
-                                // link and restart things.
-                                com.wlan_leave().expect("couldn't issue leave command"); // leave the previous config to reset state
-                                netmgr.reset();
-                                send_message(
-                                    self_cid,
-                                    Message::new_scalar(
-                                        ConnectionManagerOpcode::Poll.to_usize().unwrap(),
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                    ),
-                                )
-                                .expect("couldn't kick off next poll");
-                            }
+                if wifi_state == WifiState::Off || res_linkstate == LinkState::ResetHold {
+                    // wifi was intentionally forced off; leave it off.
+                    wifi_state = WifiState::Off;
+                } else {
+                    if res_linkstate == LinkState::WFXError {
+                        log::info!("WFX chipset error detected on resume, resetting WF200");
+                        com.wifi_reset().expect("couldn't reset the wf200 chip");
+                    } else {
+                        com.wlan_leave().ok(); // clear any association the EC still thinks it holds
+                    }
+                    netmgr.reset();
+
+                    // tell subscribers we're disconnected while we re-establish
+                    wifi_stats_cache = WlanStatus::from_ipc(WlanStatusIpc::default());
+                    for &sub in status_subscribers.keys() {
+                        let buf = Buffer::into_buf(com::WlanStatusIpc::from_status(&wifi_stats_cache))
+                            .or(Err(xous::Error::InternalError))
+                            .unwrap();
+                        match buf.send(sub, WifiStateCallback::Update.to_u32().unwrap()) {
+                            Err(e) => log::warn!("Couldn't update wifi state subscriber: {:?}", e),
+                            _ => (),
                         }
                     }
-                    LinkState::WFXError => {
-                        // reset the stats cache, and update subscribers that we're disconnected
-                        wifi_stats_cache = WlanStatus::from_ipc(WlanStatusIpc::default());
-                        for &sub in status_subscribers.keys() {
-                            let buf = Buffer::into_buf(com::WlanStatusIpc::from_status(&wifi_stats_cache))
-                                .or(Err(xous::Error::InternalError))
-                                .unwrap();
-                            match buf.send(sub, WifiStateCallback::Update.to_u32().unwrap()) {
-                                Err(e) => log::warn!("Couldn't update wifi state subscriber: {:?}", e),
-                                _ => (),
-                            }
-                        }
-                        wifi_state = WifiState::Error;
-                    }
-                    LinkState::ResetHold => {
-                        // wifi was manually forced "off", leave it off; presume connection manager is also
-                        // stopped.
-                        wifi_state = WifiState::Off;
-                    }
-                    _ => {
-                        // should approximately be a "disconnected" state.
-                        match wifi_state {
-                            WifiState::Connected => {
-                                // move the wifi into the disconnected state to re-initiate a connection
-                                netmgr.reset();
-                                // reset the stats cache, and update subscribers that we're disconnected
-                                wifi_stats_cache = WlanStatus::from_ipc(WlanStatusIpc::default());
-                                for &sub in status_subscribers.keys() {
-                                    let buf =
-                                        Buffer::into_buf(com::WlanStatusIpc::from_status(&wifi_stats_cache))
-                                            .or(Err(xous::Error::InternalError))
-                                            .unwrap();
-                                    match buf.send(sub, WifiStateCallback::Update.to_u32().unwrap()) {
-                                        Err(e) => {
-                                            log::warn!("Couldn't update wifi state subscriber: {:?}", e)
-                                        }
-                                        _ => (),
-                                    }
-                                }
-                            }
-                            WifiState::Error => {
-                                // let the error handler do its thing on the next pump cycle
-                            }
-                            _ => {
-                                // we were in some intermediate state, just "snap" us to disconnected and let
-                                // the state machine take care of the rest
-                                wifi_state = WifiState::Disconnected;
-                            }
-                        }
-                    }
+
+                    // fresh scan so we rejoin the best AP for wherever we woke up
+                    ssid_list.clear();
+                    ssid_attempted.clear();
+                    com.set_ssid_scanning(true).unwrap();
+                    scan_state = SsidScanState::Scanning;
+
+                    wifi_state = WifiState::Disconnected;
+                    intervals_without_activity = 0;
+                    activity_interval.store(0, Ordering::SeqCst);
+
+                    // expedite so the management pass runs now rather than after the inactivity timer ramps
+                    expedite_poll = true;
+                    send_message(
+                        self_cid,
+                        Message::new_scalar(
+                            ConnectionManagerOpcode::Poll.to_usize().unwrap(),
+                            0,
+                            0,
+                            0,
+                            0,
+                        ),
+                    )
+                    .expect("couldn't kick off next poll");
                 }
             }),
             Some(ConnectionManagerOpcode::ComInt) => msg_scalar_unpack!(msg, ints, raw_arg, 0, 0, {
