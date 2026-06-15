@@ -181,6 +181,22 @@ the wifi kill switch (forces a new edge) recovers it, dumping the whole backlog.
   re-enabling, forcing a poll (mirrors startup) that drains the pending vector
   and restarts the per-packet ack→re-edge chain. No-op when nothing is pending.
 
+### 13. services/net: scan-finished interrupt doesn't expedite the join — slow reassociate
+The connection manager (`services/net/src/connection_manager.rs`) acts on a
+`WlanSsidScanFinished` interrupt only by setting `scan_state = Idle`; the
+actual AP join is issued from the periodic `Poll` management pass, which is
+gated by the inactivity-interval ramp (`activity_interval.fetch_add(interval)
+> interval`). So a scan that finishes during a quiet period (the interval has
+ramped up) waits the better part of the next multi-second tick before the join
+is even attempted — most visible right after resume, where every second of
+dead link is felt (and compounds with the disassociate-on-suspend reassociate
+path).
+- Local fix: on `WlanSsidScanFinished`, set an `expedite_poll` flag and send
+  the manager an immediate `Poll`; `Poll` runs the management pass when
+  `activity_timeout || expedite_poll`, so the join fires right away instead of
+  waiting for the inactivity timer. (Behaviorally a latency fix, not a
+  correctness one — the join always happened eventually.)
+
 ## betrusted-io / betrusted-ec
 
 ### EC net bridge drops all IPv6 — no IPv6 connectivity possible on Precursor wifi
