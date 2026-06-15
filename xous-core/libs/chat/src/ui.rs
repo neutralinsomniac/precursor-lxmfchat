@@ -118,10 +118,11 @@ pub(crate) struct DocState {
     /// screen — which is what makes pixel scrolling exact.
     heights: Vec<Option<u32>>,
     /// Pixel offset from the top of the document content to the top of the
-    /// viewport. Scrolling is by pixels, not lines: a wrapped line can sit
-    /// half on-screen, and stepping/paging never snap to a line boundary (the
-    /// snapping is what skipped the tail of a wrapped line). Clamped to
-    /// `[0, doc_max_scroll]` on every layout.
+    /// viewport. Stored in pixels so a line taller than the screen can still be
+    /// read in pieces, but stepping/paging land it on a line boundary so the
+    /// overlap carried across each move is exactly one line (the drift of free
+    /// pixel scrolling showed an inconsistent one-or-two lines of context).
+    /// Clamped to `[0, doc_max_scroll]` on every layout.
     scroll: u32,
     /// Selected link line, if any. The cursor *only* ever lands on a link line:
     /// it highlights that link and is what `Enter` activates, and link nav
@@ -757,32 +758,150 @@ impl Ui {
         }
     }
 
-    /// Page the document by one screenful. Pure pixel scroll (the same
-    /// mechanism as `doc_line`, just a bigger step), so it can never skip the
-    /// tail of a wrapped line: a line cut at the bottom edge reappears at the
-    /// top of the next page. A one-row overlap carries the boundary line across
-    /// for reading continuity.
+    /// Page the document by one screenful (F2/F3), carrying exactly one line of
+    /// context across the boundary: page-down makes the last fully-visible line
+    /// the new top line, page-up makes the current top line the new bottom line.
+    /// Snapping to line boundaries keeps that overlap exact however the lines
+    /// wrap. A single line taller than the viewport can't be shown at once, so
+    /// it falls back to a pixel page (one-row overlap) and its tail is never
+    /// skipped.
     pub(crate) fn doc_page(&mut self, down: bool) {
+        let total = match self.document.as_ref() {
+            Some(d) if !d.lines.is_empty() => d.lines.len(),
+            _ => return,
+        };
         let (_, _, budget) = self.doc_metrics();
-        let step = budget.saturating_sub(self.doc_row_step()).max(self.doc_row_step()) as i32;
-        self.doc_scroll_by(if down { step } else { -step });
+        let gap = self.vp.bubble_space as u32;
+        let step = self.doc_row_step();
+        let cur = self.document.as_ref().map(|d| d.scroll).unwrap_or(0);
+        let first = self.doc_first_visible_line();
+        let target = if down {
+            // Last line that sits fully on the current page; it becomes the new
+            // top line so it reads on both pages.
+            let mut last = first;
+            let mut y = self.doc_line_top(first);
+            for i in first..total {
+                let h = self.doc_line_height(i);
+                if y >= cur && y + h <= cur + budget {
+                    last = i;
+                }
+                y += h + gap;
+                if y >= cur + budget {
+                    break;
+                }
+            }
+            if last > first {
+                self.doc_line_top(last)
+            } else {
+                cur + budget.saturating_sub(step) // top line overflows the page
+            }
+        } else {
+            // Pick the new top so the current top line lands last on the page.
+            let mut top_line = first;
+            let mut used = self.doc_line_height(first);
+            while top_line > 0 {
+                let h = self.doc_line_height(top_line - 1);
+                if used + gap + h <= budget {
+                    used += gap + h;
+                    top_line -= 1;
+                } else {
+                    break;
+                }
+            }
+            if top_line < first {
+                self.doc_line_top(top_line)
+            } else {
+                cur.saturating_sub(budget.saturating_sub(step))
+            }
+        };
+        self.doc_set_scroll(target);
     }
 
-    /// Step the document one display row (j/k). Pixel scroll by one glyph row,
-    /// independent of logical lines — so it always moves by the same small
-    /// amount, never by a whole wrapped line.
+    /// Step the document by one line (j/k), snapping the viewport top to a line
+    /// boundary so the overlap with the previous view is always exactly one line
+    /// — never the half-line of drift that free pixel scrolling left behind. A
+    /// line taller than the whole viewport is the exception: it can't be shown
+    /// at once, so we pixel-step through that line alone to reach its tail.
     pub(crate) fn doc_line(&mut self, down: bool) {
-        let step = self.doc_row_step() as i32;
-        self.doc_scroll_by(if down { step } else { -step });
+        let total = match self.document.as_ref() {
+            Some(d) if !d.lines.is_empty() => d.lines.len(),
+            _ => return,
+        };
+        let (_, _, budget) = self.doc_metrics();
+        let step = self.doc_row_step();
+        let cur = self.document.as_ref().map(|d| d.scroll).unwrap_or(0);
+        let first = self.doc_first_visible_line();
+        let top = self.doc_line_top(first);
+        let h = self.doc_line_height(first);
+        let target = if down {
+            if h > budget && top + h > cur + budget {
+                // Tall line with more below: step through its tail in row steps.
+                (cur + step).min((top + h).saturating_sub(budget))
+            } else {
+                self.doc_line_top((first + 1).min(total - 1))
+            }
+        } else if cur > top {
+            // Scrolled down into a tall line: step back up toward its top.
+            cur.saturating_sub(step).max(top)
+        } else {
+            self.doc_line_top(first.saturating_sub(1))
+        };
+        self.doc_set_scroll(target);
     }
 
-    /// Jump to the top (g) or bottom (G) of the document. Pure scroll; the link
-    /// selection is dropped (there is no link "edge" to land on).
+    /// Jump to the top (g) or bottom (G) of the document. The link selection is
+    /// dropped here; the next layout re-snaps it to whatever link the landing
+    /// page actually shows.
     pub(crate) fn doc_edge(&mut self, bottom: bool) {
         let target = if bottom { self.doc_max_scroll() } else { 0 };
+        self.doc_set_scroll(target);
         if let Some(doc) = self.document.as_mut() {
-            doc.scroll = target;
             doc.cursor = None;
+        }
+    }
+
+    /// Set the scroll offset, clamped to the valid range.
+    fn doc_set_scroll(&mut self, target: u32) {
+        let max = self.doc_max_scroll();
+        if let Some(doc) = self.document.as_mut() {
+            doc.scroll = target.min(max);
+        }
+    }
+
+    /// Snap the link selection to a link on the current page: keep the selected
+    /// link while it stays fully visible, else select the first fully-visible
+    /// link, else clear the selection. Run on every layout so the cursor never
+    /// points at a link that has scrolled off the page.
+    fn doc_snap_cursor(&mut self) {
+        let total = match self.document.as_ref() {
+            Some(d) => d.lines.len(),
+            None => return,
+        };
+        let (_, _, budget) = self.doc_metrics();
+        let scroll = self.document.as_ref().map(|d| d.scroll).unwrap_or(0);
+        let gap = self.vp.bubble_space as u32;
+        let cur = self.document.as_ref().and_then(|d| d.cursor);
+        let mut first_link = None;
+        let mut keep = false;
+        let mut y = 0u32;
+        for i in 0..total {
+            let h = self.doc_line_height(i);
+            if y >= scroll && y + h <= scroll + budget && self.doc_is_link(i) {
+                if first_link.is_none() {
+                    first_link = Some(i);
+                }
+                if cur == Some(i) {
+                    keep = true;
+                }
+            }
+            y += h + gap;
+            if y >= scroll + budget {
+                break;
+            }
+        }
+        let pick = if keep { cur } else { first_link };
+        if let Some(doc) = self.document.as_mut() {
+            doc.cursor = pick;
         }
     }
 
@@ -960,9 +1079,13 @@ impl Ui {
         // Re-clamp scroll: heights (and thus the max) can shift as new content
         // streams in or the canvas resizes.
         let max = self.doc_max_scroll();
-        let (scroll, cursor) = {
-            let doc = self.document.as_mut().unwrap();
+        if let Some(doc) = self.document.as_mut() {
             doc.scroll = doc.scroll.min(max);
+        }
+        // Keep the link selection on a link the page actually shows.
+        self.doc_snap_cursor();
+        let (scroll, cursor) = {
+            let doc = self.document.as_ref().unwrap();
             (doc.scroll, doc.cursor)
         };
 
