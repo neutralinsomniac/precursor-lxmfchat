@@ -470,7 +470,7 @@ pub(crate) fn connection_manager(sid: xous::SID, activity_interval: Arc<AtomicU3
                                             com.set_ssid_scanning(true).unwrap();
                                             scan_state = SsidScanState::Scanning;
                                         }
-                                        SsidScanState::Idle(_last_scan_time) => {
+                                        SsidScanState::Idle(last_scan_time) => {
                                             scan_count = 0;
                                             if let Some(ssid) =
                                                 get_next_ssid(&mut ssid_list, &mut ssid_attempted, ap_list)
@@ -496,8 +496,14 @@ pub(crate) fn connection_manager(sid: xous::SID, activity_interval: Arc<AtomicU3
                                                     com.wlan_join().expect("couldn't issue join command");
                                                     wifi_state = WifiState::Connecting;
                                                 }
-                                            } else {
-                                                // no SSIDs available, scan again
+                                            } else if last_scan_time.elapsed() > SSID_SCAN_AGING_THRESHOLD {
+                                                // No known SSID in range. Re-scan, but only on the slow
+                                                // poll cadence: a management pass expedited by
+                                                // WlanSsidScanFinished arrives with a fresh result
+                                                // (elapsed ~0), so gating on the aging threshold keeps
+                                                // it from re-kicking a back-to-back scan that storms the
+                                                // WF200 (rapid UI refresh, truncated results, and an
+                                                // eventual chip fault that reads as "wifi turned off").
                                                 log::info!("No SSIDs found, restarting SSID scan...");
                                                 com.set_ssid_scanning(true).unwrap();
                                                 scan_state = SsidScanState::Scanning;
