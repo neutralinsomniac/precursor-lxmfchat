@@ -99,6 +99,21 @@ impl NetManager {
         .expect("couldn't send reset");
     }
 
+    /// Force the net service to poll the EC for pending COM interrupts, exactly as
+    /// a hardware ComInterrupt would. The EC holds its host-IRQ as a level until
+    /// the SoC acks while the SoC's llio fires only on a fresh edge, so an edge can
+    /// be lost and leave received frames (e.g. the gateway's ARP reply) undrained in
+    /// the EC with no further notification. This forces one drain so the watchdog
+    /// can recover a silent link without a full reset/reassociate. Non-blocking and
+    /// idempotent: a spurious poll just re-reads and acks an empty vector.
+    pub fn poll_com_interrupts(&self) {
+        xous::try_send_message(
+            self.netconn.conn(),
+            Message::new_scalar(Opcode::ComInterrupt.to_usize().unwrap(), 0, 0, 0, 0),
+        )
+        .ok();
+    }
+
     /// Subscribe the interface to an IPv6 multicast group (libstd's
     /// `UdpSocket::join_multicast_v6` is a stub on Xous). Ok(false) = group
     /// table full.
