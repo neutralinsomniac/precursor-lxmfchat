@@ -33,6 +33,11 @@ impl InterfaceInner {
             EthernetProtocol::Arp => self.process_arp(self.now, &eth_frame),
             #[cfg(feature = "proto-ipv4")]
             EthernetProtocol::Ipv4 => {
+                // Inbound traffic confirms the L2 sender (notably the gateway)
+                // is reachable; refresh its neighbor entry so an active link
+                // never needs a periodic ARP. (ARP frames refresh via fill.)
+                self.neighbor_cache
+                    .confirm(HardwareAddress::Ethernet(eth_frame.src_addr()), self.now);
                 let ipv4_packet = check!(Ipv4Packet::new_checked(eth_frame.payload()));
 
                 self.process_ipv4(sockets, meta, &ipv4_packet, fragments)
@@ -40,6 +45,8 @@ impl InterfaceInner {
             }
             #[cfg(feature = "proto-ipv6")]
             EthernetProtocol::Ipv6 => {
+                self.neighbor_cache
+                    .confirm(HardwareAddress::Ethernet(eth_frame.src_addr()), self.now);
                 let ipv6_packet = check!(Ipv6Packet::new_checked(eth_frame.payload()));
                 self.process_ipv6(sockets, meta, &ipv6_packet)
                     .map(EthernetPacket::Ip)

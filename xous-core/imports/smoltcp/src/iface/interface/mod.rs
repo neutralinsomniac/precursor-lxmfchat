@@ -1372,7 +1372,12 @@ impl InterfaceInner {
         match self.neighbor_cache.lookup(&dst_addr, self.now) {
             NeighborAnswer::Found(hardware_addr) => return Ok((hardware_addr, tx_token)),
             NeighborAnswer::RateLimited => return Err(DispatchError::NeighborPending),
-            _ => (), // XXX
+            // A usable-but-stale entry whose refresh probe is due, or a genuine
+            // miss: fall through to emit the ARP/NS now. For the stale case this
+            // defers the current packet one round (the upper layer retransmits);
+            // the next lookup is rate-limited and returns Found(addr), so traffic
+            // resumes immediately and never blocks waiting on the reply.
+            NeighborAnswer::StaleProbe(_) | NeighborAnswer::NotFound => (),
         }
 
         match (src_addr, dst_addr) {

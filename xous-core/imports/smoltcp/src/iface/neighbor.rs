@@ -24,6 +24,10 @@ pub struct Neighbor {
 pub(crate) enum Answer {
     /// The neighbor address is in the cache and not expired.
     Found(HardwareAddress),
+    /// The neighbor address is in the cache and still usable, but past its
+    /// reachable lifetime: the caller should keep using the returned address
+    /// while emitting a refresh probe (stale-while-revalidate).
+    StaleProbe(HardwareAddress),
     /// The neighbor address is not in the cache, or has expired.
     NotFound,
     /// The neighbor address is not in the cache, or has expired,
@@ -32,10 +36,10 @@ pub(crate) enum Answer {
 }
 
 impl Answer {
-    /// Returns whether a valid address was found.
+    /// Returns whether a usable address was found (fresh or stale).
     pub(crate) fn found(&self) -> bool {
         match self {
-            Answer::Found(_) => true,
+            Answer::Found(_) | Answer::StaleProbe(_) => true,
             _ => false,
         }
     }
@@ -52,7 +56,16 @@ impl Cache {
     /// Minimum delay between discovery requests, in milliseconds.
     pub(crate) const SILENT_TIME: Duration = Duration::from_millis(1_000);
 
-    /// Neighbor entry lifetime, in milliseconds.
+    /// Reachable lifetime, in milliseconds — really an *idle* threshold, since
+    /// [`confirm`](Self::confirm) resets it on every received frame from the
+    /// neighbor, so an actively-used entry (notably the gateway) never elapses.
+    /// It only matters after this much silence FROM a neighbor, and even then
+    /// the entry isn't dropped: it goes *stale* (still usable, so egress never
+    /// blocks) and [`lookup`](Self::lookup) asks the caller to send a refresh
+    /// probe; a reply re-freshens it via [`fill`](Self::fill). Together these
+    /// avoid the failure where a single lost ARP reply on the lossy SoC<->EC RX
+    /// path wedged ALL outbound traffic for a reconnect cycle. 60s matches the
+    /// upstream default and Linux's `gc_stale_time`.
     pub(crate) const ENTRY_LIFETIME: Duration = Duration::from_millis(60_000);
 
     /// Create a cache.
@@ -152,6 +165,22 @@ impl Cache {
 
     pub(crate) fn limit_rate(&mut self, timestamp: Instant) {
         self.silent_until = timestamp + Self::SILENT_TIME;
+    }
+
+    /// Treat a received frame as proof that the neighbor at `hardware_addr` is
+    /// reachable: reset the reachable lifetime of any cached entry holding that
+    /// address. Called from the ingress path so an active link refreshes its
+    /// neighbor (notably the gateway, which is the L2 source of all routed
+    /// inbound traffic) from ongoing traffic instead of a periodic ARP/NS —
+    /// mirroring how Linux/BSD use inbound traffic as reachability
+    /// confirmation. Unknown addresses are ignored.
+    pub(crate) fn confirm(&mut self, hardware_addr: HardwareAddress, timestamp: Instant) {
+        let expires_at = timestamp + Self::ENTRY_LIFETIME;
+        for neighbor in self.storage.values_mut() {
+            if neighbor.hardware_addr == hardware_addr {
+                neighbor.expires_at = expires_at;
+            }
+        }
     }
 
     pub(crate) fn flush(&mut self) {
