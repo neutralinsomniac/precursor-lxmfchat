@@ -429,17 +429,6 @@ pub(crate) fn connection_manager(sid: xous::SID, activity_interval: Arc<AtomicU3
                                     wifi_stats_cache.ipv4.dhcp
                                 );
                                 netmgr.reset();
-                            } else {
-                                // Link reads Connected and DHCP is Bound, yet we've
-                                // seen no inbound activity for several intervals. The
-                                // usual cause is a lost SoC<->EC RX-interrupt edge:
-                                // frames (e.g. the gateway's ARP reply, which all hub
-                                // TX waits on once the neighbor entry lapses) sit
-                                // undrained in the EC with no further notification.
-                                // Force one interrupt poll to drain them, recovering
-                                // without the cost of a full reset/reassociate.
-                                log::info!("link Connected but silent; forcing a COM interrupt poll");
-                                netmgr.poll_com_interrupts();
                             }
                             intervals_without_activity = 0;
                         }
