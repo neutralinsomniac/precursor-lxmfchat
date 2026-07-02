@@ -1171,7 +1171,14 @@ pub(crate) fn handle_frame(
             // flood (it's overwritten, not stored), so it's safe and surfaces the
             // cause of a "notification but no message" on hardware with no serial.
             log::warn!("undecryptable DATA to {}: {}", hex(&destination_hash), reason);
-            chat::cf_set_status_text(chat_cid, &format!("incoming message unreadable: {reason}"));
+            // "token too short" means the payload can't even hold an IV+HMAC —
+            // that's not a message from anyone, it's junk/cross-traffic the hub
+            // relayed to our hash. Log-only; a real key mismatch (a peer who has
+            // stale keys for us) says "token HMAC verification failed" and IS
+            // worth the status bar.
+            if reason != "token too short" {
+                chat::cf_set_status_text(chat_cid, &format!("incoming message unreadable: {reason}"));
+            }
         }
         // NOTE: link-control / unrouted / dropped frames are logged only, never
         // posted to the chat. Posting them persisted a flood of entries (each
@@ -1798,14 +1805,21 @@ pub fn keepalive_thread(shared: Arc<Shared>, chat_cid: CID) {
     //    perfect silence otherwise: the UI stays up and its interface is a
     //    zombie until an app restart. We can't restart a thread whose sockets
     //    died with it, but we can say so instead of dropping messages mutely.
+    //    Thresholds are sized to ride out a link-recovery storm: every net-service
+    //    IPC (UDP sends, multicast rejoins) blocks while the net service is busy
+    //    reassociating/resetting the WF200, which can back a thread's loop up for
+    //    tens of seconds without the thread being dead. A recovered thread is
+    //    reported as such; only a warning that REPEATS (every 5 min) means the
+    //    thread is actually gone and the app needs a restart.
     const HB_WATCH: [(&str, usize, u32); HB_COUNT] = [
-        ("hub manager", HB_HUB_MGR, 120),
-        ("local data rx", HB_DATA_RX, 60),
-        ("local discovery", HB_DISC_MC, 60),
-        ("local reverse discovery", HB_DISC_UC, 60),
-        ("local announce", HB_ANNOUNCE, 60),
+        ("hub manager", HB_HUB_MGR, 150),
+        ("local data rx", HB_DATA_RX, 90),
+        ("local discovery", HB_DISC_MC, 90),
+        ("local reverse discovery", HB_DISC_UC, 90),
+        ("local announce", HB_ANNOUNCE, 90),
     ];
     let mut hb_warned: [u32; HB_COUNT] = [0; HB_COUNT];
+    let mut hb_stalled: [bool; HB_COUNT] = [false; HB_COUNT];
     let mut ticks: u64 = 0;
     let mut last_wall = now_secs();
     let mut last_probe: u32 = 0;
@@ -1839,15 +1853,26 @@ pub fn keepalive_thread(shared: Arc<Shared>, chat_cid: CID) {
                 continue; // thread not started (e.g. autoiface never enabled)
             }
             let age = (now as u32).saturating_sub(beat);
-            if age > *max_age && (now as u32).saturating_sub(hb_warned[i]) > 300 {
-                hb_warned[i] = now as u32;
-                log::error!(
-                    "net thread '{name}' hasn't run for {age}s — it likely died (panic/wedge); its interface is down until the app restarts"
-                );
-                chat::cf_set_status_text(
-                    chat_cid,
-                    &format!("\u{26a0} {name} thread stalled ({age}s) — restart app if this persists"),
-                );
+            if age > *max_age {
+                hb_stalled[i] = true;
+                if (now as u32).saturating_sub(hb_warned[i]) > 300 {
+                    hb_warned[i] = now as u32;
+                    log::error!(
+                        "net thread '{name}' hasn't run for {age}s — blocked on a busy net service (link recovery) or dead; a repeat of this in 5min means dead"
+                    );
+                    chat::cf_set_status_text(
+                        chat_cid,
+                        &format!("\u{26a0} {name} thread quiet ({age}s) — recovery pending…"),
+                    );
+                }
+            } else if hb_stalled[i] {
+                // It came back: the stall was the net service being busy (a link
+                // recovery), not a dead thread. Say so, or the earlier warning
+                // reads as a permanent failure.
+                hb_stalled[i] = false;
+                hb_warned[i] = 0;
+                log::info!("net thread '{name}' resumed (was quiet, now beating)");
+                chat::cf_set_status_text(chat_cid, &format!("{name} thread recovered"));
             }
         }
         let started = shared.write_started.load(Ordering::SeqCst);
