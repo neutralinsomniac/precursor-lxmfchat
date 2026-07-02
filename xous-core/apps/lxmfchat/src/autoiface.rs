@@ -13,7 +13,20 @@ use reticulum_core::autointerface::{discovery_token, group_discovery_address};
 use reticulum_core::transport::PathIface;
 use xous::CID;
 
-use crate::net::{HB_ANNOUNCE, HB_DATA_RX, HB_DISC_MC, HB_DISC_UC, Shared, hb_beat, plock};
+use crate::net::{HB_ANNOUNCE, HB_DATA_RX, HB_DISC_MC, HB_DISC_UC, Shared, hb_beat, hb_phase, plock};
+
+/// Names for the announce loop's [`Shared::hb_phase`] values: index 0 is the
+/// between-passes state; the rest label the blocking call about to run, so a
+/// heartbeat-stall warning can say exactly where the thread stopped.
+pub const ANNOUNCE_PHASES: [&str; 7] = [
+    "sleeping",
+    "cloning tx socket",
+    "rejoining multicast group",
+    "sending beacon",
+    "posting status",
+    "sending reverse tokens",
+    "building+sending announce",
+];
 
 const GROUP_ID: &[u8] = b"reticulum";
 const DISCOVERY_PORT: u16 = 29716;
@@ -125,13 +138,17 @@ fn join_group(sock: &UdpSocket, group: &Ipv6Addr, scope: u32) -> bool {
 /// Re-assert membership without the socket (it lives in the rx thread). On Xous
 /// the join is iface-level, so this is enough; libstd needs the socket, but a
 /// reconnect there doesn't drop a host-OS membership, so it's a no-op.
+/// Takes the announce thread's long-lived NetManager: constructing a fresh
+/// NetManager (and its XousNames) per call meant an IPC-heavy object pair with
+/// Drop side effects being built and torn down every 15 s, forever — needless
+/// exposure for a thread whose silent death takes local peering with it.
 #[cfg(target_os = "xous")]
-fn rejoin_group(group: &Ipv6Addr) {
-    net::NetManager::new().join_multicast_v6(*group).ok();
+fn rejoin_group(netmgr: &net::NetManager, group: &Ipv6Addr) {
+    netmgr.join_multicast_v6(*group).ok();
 }
 
 #[cfg(not(target_os = "xous"))]
-fn rejoin_group(_group: &Ipv6Addr) {}
+fn rejoin_group(_netmgr: &(), _group: &Ipv6Addr) {}
 
 /// Idempotent. Returns false (reason on the status bar) when there's no
 /// link-local address yet, i.e. wifi isn't up.
@@ -343,7 +360,17 @@ fn data_rx(shared: Arc<Shared>, chat_cid: CID, sock: UdpSocket) {
             log::debug!("data from undiscovered {src_ip}, ignoring");
             continue;
         }
-        crate::net::handle_frame(&shared, chat_cid, &pddb, &trng, &buf[..n], PathIface::Auto);
+        // One malformed/hostile frame must not kill local RX for the rest of
+        // the session (this thread and the hub read loop feed the same decode
+        // path, so a panicking frame arriving via both would otherwise take
+        // down BOTH interfaces at once, silently).
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::net::handle_frame(&shared, chat_cid, &pddb, &trng, &buf[..n], PathIface::Auto);
+        }))
+        .is_err()
+        {
+            log::error!("handle_frame panicked on a {n}-byte local frame from {src_ip} — frame dropped");
+        }
     }
 }
 
@@ -355,94 +382,153 @@ fn announce_loop(shared: Arc<Shared>, chat_cid: CID, group: Ipv6Addr) {
             return;
         }
     };
+    // One NetManager for the thread's lifetime (see rejoin_group).
+    #[cfg(target_os = "xous")]
+    let netmgr = net::NetManager::new();
+    #[cfg(not(target_os = "xous"))]
+    let netmgr = ();
     let mut last_beacon: u64 = 0;
     let mut last_err_status: u64 = 0;
     let mut last_rejoin: u64 = 0;
+    let mut last_panic_log: u64 = 0;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
         hb_beat(&shared, HB_ANNOUNCE);
         if !enabled(&shared) {
             continue;
         }
-        let (our_ll, scope, tx) = {
-            let st = plock(&shared.auto);
-            (st.our_ll, st.scope, st.tx.as_ref().and_then(|s| s.try_clone().ok()))
-        };
-        let (our_ll, tx) = match (our_ll, tx) {
-            (Some(a), Some(t)) => (a, t),
-            _ => continue,
-        };
-        // A wifi reconnect can rebuild the netstack interface and silently drop
-        // our multicast-group membership, leaving discovery one-way until a
-        // manual toggle. While we have no peers, periodically re-assert the join
-        // (idempotent); once peers are present it's clearly intact, so stay quiet.
-        if plock(&shared.auto).peers.is_empty()
-            && now_secs().saturating_sub(last_rejoin) >= REJOIN_INTERVAL_SECS
-        {
-            last_rejoin = now_secs();
-            rejoin_group(&group);
-        }
-        let token = discovery_token(GROUP_ID, &our_ll);
-        if now_secs().saturating_sub(last_beacon) * 1000 >= ANNOUNCE_INTERVAL_MS {
-            last_beacon = now_secs();
-            let dest = SocketAddrV6::new(group, DISCOVERY_PORT, 0, scope);
-            if let Err(e) = tx.send_to(&token, dest) {
-                log::warn!("multicast announce failed: {e}");
-                if now_secs().saturating_sub(last_err_status) > 30 {
-                    last_err_status = now_secs();
-                    chat::cf_set_status_text(chat_cid, &format!("local: beacon failed: {e}"));
-                }
+        // This thread's death silently kills local peering (beacons, reverse
+        // tokens AND peer expiry all live here), so a panic anywhere in the tick
+        // must not end the loop — catch it, name it, and keep ticking. (A panic
+        // that poisoned a shared mutex is still fatal-ish — plock deliberately
+        // panics on poison — but now the log says which tick died and why.)
+        if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            announce_tick(
+                &shared,
+                chat_cid,
+                &trng,
+                &netmgr,
+                &group,
+                &mut last_beacon,
+                &mut last_err_status,
+                &mut last_rejoin,
+            )
+        })) {
+            let why = p
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| p.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic".to_string());
+            let phase = shared.hb_phase[HB_ANNOUNCE].load(Ordering::Relaxed) as usize;
+            log::error!(
+                "announce tick panicked during '{}': {}",
+                ANNOUNCE_PHASES.get(phase).unwrap_or(&"?"),
+                why
+            );
+            if now_secs().saturating_sub(last_panic_log) > 60 {
+                last_panic_log = now_secs();
+                chat::cf_set_status_text(chat_cid, &format!("local announce error: {why}"));
             }
         }
+        hb_phase(&shared, HB_ANNOUNCE, 0);
+    }
+}
 
-        let now = now_secs();
-        let (expired, reverse, due): (Vec<Ipv6Addr>, Vec<Ipv6Addr>, Vec<Ipv6Addr>) = {
-            let mut st = plock(&shared.auto);
-            let expired: Vec<Ipv6Addr> = st
-                .peers
-                .iter()
-                .filter(|(_, p)| now > p.heard + PEERING_TIMEOUT_SECS)
-                .map(|(a, _)| *a)
-                .collect();
-            for a in &expired {
-                st.peers.remove(a);
+fn announce_tick(
+    shared: &Arc<Shared>,
+    chat_cid: CID,
+    trng: &trng::Trng,
+    #[cfg(target_os = "xous")] netmgr: &net::NetManager,
+    #[cfg(not(target_os = "xous"))] netmgr: &(),
+    group: &Ipv6Addr,
+    last_beacon: &mut u64,
+    last_err_status: &mut u64,
+    last_rejoin: &mut u64,
+) {
+    hb_phase(shared, HB_ANNOUNCE, 1); // cloning tx socket
+    let (our_ll, scope, tx) = {
+        let st = plock(&shared.auto);
+        (st.our_ll, st.scope, st.tx.as_ref().and_then(|s| s.try_clone().ok()))
+    };
+    let (our_ll, tx) = match (our_ll, tx) {
+        (Some(a), Some(t)) => (a, t),
+        _ => return,
+    };
+    // A wifi reconnect can rebuild the netstack interface and silently drop
+    // our multicast-group membership, leaving discovery one-way until a
+    // manual toggle. While we have no peers, periodically re-assert the join
+    // (idempotent); once peers are present it's clearly intact, so stay quiet.
+    if plock(&shared.auto).peers.is_empty()
+        && now_secs().saturating_sub(*last_rejoin) >= REJOIN_INTERVAL_SECS
+    {
+        *last_rejoin = now_secs();
+        hb_phase(shared, HB_ANNOUNCE, 2); // rejoining multicast group
+        rejoin_group(netmgr, group);
+    }
+    let token = discovery_token(GROUP_ID, &our_ll);
+    if now_secs().saturating_sub(*last_beacon) * 1000 >= ANNOUNCE_INTERVAL_MS {
+        *last_beacon = now_secs();
+        let dest = SocketAddrV6::new(*group, DISCOVERY_PORT, 0, scope);
+        hb_phase(shared, HB_ANNOUNCE, 3); // sending beacon
+        if let Err(e) = tx.send_to(&token, dest) {
+            log::warn!("multicast announce failed: {e}");
+            if now_secs().saturating_sub(*last_err_status) > 30 {
+                *last_err_status = now_secs();
+                hb_phase(shared, HB_ANNOUNCE, 4); // posting status
+                chat::cf_set_status_text(chat_cid, &format!("local: beacon failed: {e}"));
             }
-            let reverse: Vec<Ipv6Addr> = st
-                .peers
-                .iter_mut()
-                .filter(|(_, p)| now.saturating_sub(p.token_sent) * 1000 >= REVERSE_INTERVAL_MS)
-                .map(|(a, p)| {
-                    p.token_sent = now;
-                    *a
-                })
-                .collect();
-            // Peers discovered long enough ago to have peered us back: send our
-            // announce now (once), so they learn our key without a path request.
-            let due: Vec<Ipv6Addr> = st
-                .peers
-                .iter_mut()
-                .filter(|(_, p)| !p.announced && now >= p.discovered + ANNOUNCE_AFTER_SECS)
-                .map(|(a, p)| {
-                    p.announced = true;
-                    *a
-                })
-                .collect();
-            (expired, reverse, due)
-        };
-        for a in expired {
-            log::info!("local peer timed out: {a}");
         }
-        for a in reverse {
-            let dest = SocketAddrV6::new(a, UNICAST_DISCOVERY_PORT, 0, scope);
-            tx.send_to(&token, dest).ok();
+    }
+
+    let now = now_secs();
+    let (expired, reverse, due): (Vec<Ipv6Addr>, Vec<Ipv6Addr>, Vec<Ipv6Addr>) = {
+        let mut st = plock(&shared.auto);
+        let expired: Vec<Ipv6Addr> = st
+            .peers
+            .iter()
+            .filter(|(_, p)| now > p.heard + PEERING_TIMEOUT_SECS)
+            .map(|(a, _)| *a)
+            .collect();
+        for a in &expired {
+            st.peers.remove(a);
         }
-        if !due.is_empty() {
-            let raw = crate::net::build_announce(&shared, &trng);
-            for a in due {
-                let dest = SocketAddrV6::new(a, DATA_PORT, 0, scope);
-                if tx.send_to(&raw, dest).is_ok() {
-                    log::info!("announced to local peer {a}");
-                }
+        let reverse: Vec<Ipv6Addr> = st
+            .peers
+            .iter_mut()
+            .filter(|(_, p)| now.saturating_sub(p.token_sent) * 1000 >= REVERSE_INTERVAL_MS)
+            .map(|(a, p)| {
+                p.token_sent = now;
+                *a
+            })
+            .collect();
+        // Peers discovered long enough ago to have peered us back: send our
+        // announce now (once), so they learn our key without a path request.
+        let due: Vec<Ipv6Addr> = st
+            .peers
+            .iter_mut()
+            .filter(|(_, p)| !p.announced && now >= p.discovered + ANNOUNCE_AFTER_SECS)
+            .map(|(a, p)| {
+                p.announced = true;
+                *a
+            })
+            .collect();
+        (expired, reverse, due)
+    };
+    for a in expired {
+        log::info!("local peer timed out: {a}");
+    }
+    hb_phase(shared, HB_ANNOUNCE, 5); // sending reverse tokens
+    for a in reverse {
+        let dest = SocketAddrV6::new(a, UNICAST_DISCOVERY_PORT, 0, scope);
+        tx.send_to(&token, dest).ok();
+    }
+    if !due.is_empty() {
+        hb_phase(shared, HB_ANNOUNCE, 6); // building+sending announce
+        let raw = crate::net::build_announce(shared, trng);
+        for a in due {
+            let dest = SocketAddrV6::new(a, DATA_PORT, 0, scope);
+            if tx.send_to(&raw, dest).is_ok() {
+                log::info!("announced to local peer {a}");
             }
         }
     }

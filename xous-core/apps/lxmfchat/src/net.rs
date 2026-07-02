@@ -466,6 +466,13 @@ pub struct Shared {
     /// keepalive thread (the only one whose loop does no blocking I/O) checks
     /// ages and surfaces a stall on the status bar.
     pub hb: [core::sync::atomic::AtomicU32; HB_COUNT],
+    /// Which step of its loop each heartbeat-monitored thread is in (an index
+    /// into that thread's phase-name table; 0 = between passes). Written just
+    /// before every blocking call, so a stall warning can name the exact call
+    /// that never returned instead of leaving us to guess from the age alone.
+    /// Currently only the announce loop reports phases (see
+    /// [`crate::autoiface::ANNOUNCE_PHASES`]).
+    pub hb_phase: [core::sync::atomic::AtomicU32; HB_COUNT],
 }
 
 /// Heartbeat slots in [`Shared::hb`].
@@ -479,6 +486,11 @@ pub const HB_COUNT: usize = 5;
 /// Stamp a thread's liveness slot; call once per loop pass.
 pub(crate) fn hb_beat(shared: &Shared, slot: usize) {
     shared.hb[slot].store(now_secs() as u32, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record which step of its loop a monitored thread is about to run.
+pub(crate) fn hb_phase(shared: &Shared, slot: usize, phase: u32) {
+    shared.hb_phase[slot].store(phase, core::sync::atomic::Ordering::Relaxed);
 }
 
 fn hex(b: &[u8]) -> String { reticulum_core::hex(b) }
@@ -788,7 +800,19 @@ fn read_until_closed(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Tr
                 // keepalive thread's liveness watchdog.
                 shared.last_inbound.store(now_secs() as u32, core::sync::atomic::Ordering::SeqCst);
                 for frame in deframer.push(&buf[..n]) {
-                    handle_frame(shared, chat_cid, pddb, trng, &frame, PathIface::Hub);
+                    // A panicking frame must not kill this thread: it IS the
+                    // connection manager, so its death ends reconnection (and
+                    // hub service) for the rest of the session, silently.
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        handle_frame(shared, chat_cid, pddb, trng, &frame, PathIface::Hub);
+                    }))
+                    .is_err()
+                    {
+                        log::error!(
+                            "handle_frame panicked on a {}-byte hub frame — frame dropped",
+                            frame.len()
+                        );
+                    }
                 }
             }
             // Timeout tick: nothing to do — the top-of-loop check decides
@@ -1857,12 +1881,22 @@ pub fn keepalive_thread(shared: Arc<Shared>, chat_cid: CID) {
                 hb_stalled[i] = true;
                 if (now as u32).saturating_sub(hb_warned[i]) > 300 {
                     hb_warned[i] = now as u32;
+                    // Name the blocking call the thread never returned from, for
+                    // the threads that report phases — "stalled" alone isn't
+                    // diagnosable from the status bar.
+                    let phase = shared.hb_phase[*slot].load(Ordering::Relaxed) as usize;
+                    let doing = if *slot == HB_ANNOUNCE && phase != 0 {
+                        crate::autoiface::ANNOUNCE_PHASES.get(phase).copied().unwrap_or("?")
+                    } else {
+                        ""
+                    };
+                    let during = if doing.is_empty() { String::new() } else { format!(" during '{doing}'") };
                     log::error!(
-                        "net thread '{name}' hasn't run for {age}s — blocked on a busy net service (link recovery) or dead; a repeat of this in 5min means dead"
+                        "net thread '{name}' hasn't run for {age}s{during} — blocked on a busy net service (link recovery) or dead; a repeat of this in 5min means dead"
                     );
                     chat::cf_set_status_text(
                         chat_cid,
-                        &format!("\u{26a0} {name} thread quiet ({age}s) — recovery pending…"),
+                        &format!("\u{26a0} {name} thread quiet ({age}s{during}) — recovery pending…"),
                     );
                 }
             } else if hb_stalled[i] {
