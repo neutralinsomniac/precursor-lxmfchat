@@ -57,6 +57,13 @@ mod implementation {
         pub workqueue: Vec<WorkRequest>,
         busy: bool,
         stby_current: Option<i16>,
+        /// Set whenever a timed read gave up while STATUS_HOLD was still asserted. The EC
+        /// was probably just slow: its reply words land in the FIFO *after* we consumed our
+        /// dummy exchanges, leaving every subsequent multi-word read rotated by the missed
+        /// words — fetched frames arrive byte-shifted (smoltcp drops 100% of RX) and
+        /// interrupt vectors decode as garbage, silently, until something issues LINK_SYNC.
+        /// The main loop checks this flag before dispatching the next opcode and resyncs.
+        pub link_stale: bool,
     }
 
     fn handle_irq(_irq_no: usize, arg: *mut usize) {
@@ -84,6 +91,7 @@ mod implementation {
                 workqueue: Vec::new(),
                 busy: false,
                 stby_current: None,
+                link_stale: false,
             }
         }
 
@@ -135,6 +143,7 @@ mod implementation {
                     if (self.ticktimer.elapsed_ms() - curtime) > to {
                         log::warn!("COM timeout");
                         timed_out = true;
+                        self.link_stale = true;
                     }
                     xous::yield_slice();
                 }
@@ -157,6 +166,7 @@ mod implementation {
                 if (self.ticktimer.elapsed_ms() - curtime) > to {
                     log::warn!("COM timeout");
                     timed_out = true;
+                    self.link_stale = true;
                 }
                 xous::yield_slice();
             }
@@ -255,10 +265,12 @@ mod implementation {
     pub struct XousCom {
         pub workqueue: Vec<WorkRequest>,
         busy: bool,
+        /// hosted stub never times out, so this stays false; exists to mirror the hw impl
+        pub link_stale: bool,
     }
 
     impl XousCom {
-        pub fn new() -> XousCom { XousCom { workqueue: Vec::new(), busy: false } }
+        pub fn new() -> XousCom { XousCom { workqueue: Vec::new(), busy: false, link_stale: false } }
 
         pub fn init(&mut self) {}
 
@@ -411,8 +423,41 @@ fn main() -> ! {
     let mut desired_int_mask = 0;
 
     trace!("starting main loop");
+    let mut last_resync_ms: u64 = 0;
     loop {
         let mut msg = xous::receive_message(com_sid).unwrap();
+        // Lazy link-recovery: if any prior exchange timed out, the EC's reply FIFO may be
+        // skewed relative to our reads (its reply landed after we consumed our dummy
+        // exchanges), which rotates every subsequent multi-word read — RX frames arrive
+        // byte-shifted and interrupt vectors decode as garbage, with no error anywhere.
+        // Nothing at runtime ever issued LINK_SYNC before; only a wifi off/on toggle did.
+        // Resync (and verify with a ping) before dispatching the next opcode.
+        if com.link_stale && ticktimer.elapsed_ms() - last_resync_ms > 1000 {
+            last_resync_ms = ticktimer.elapsed_ms();
+            com.link_stale = false;
+            com.txrx(ComState::LINK_SYNC.verb);
+            ticktimer.sleep_ms(5).unwrap();
+            if ec_tag >= u32::from_be_bytes(ComState::LINK_PING.apilevel) {
+                let ping_value = 0xaeedu16;
+                com.txrx(ComState::LINK_PING.verb);
+                com.txrx(ping_value);
+                let pong = com.wait_txrx(ComState::LINK_READ.verb, Some(500));
+                let phase = com.wait_txrx(ComState::LINK_READ.verb, Some(500));
+                if pong == !ping_value && phase == 0x600d {
+                    log::info!("COM link resynced after a read timeout");
+                    // note: the verify reads above can re-set link_stale on timeout,
+                    // which schedules another attempt — but a good pong overrides it
+                    com.link_stale = false;
+                } else {
+                    log::warn!(
+                        "COM link resync verify failed [{:04x}/{:04x}]; will retry",
+                        pong,
+                        phase
+                    );
+                    com.link_stale = true;
+                }
+            }
+        }
         let opcode: Option<Opcode> = FromPrimitive::from_usize(msg.body.id());
         log::debug!("{:?}", opcode);
         match opcode {

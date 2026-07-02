@@ -233,6 +233,7 @@ impl<'a> LxmfChat<'a> {
             delivery_updates: Mutex::new(delivery_map),
             auto: Mutex::new(autoiface::AutoState::new()),
             auto_enabled: core::sync::atomic::AtomicBool::new(false),
+            hb: Default::default(),
         });
 
         // Open the last conversation we were in (if any), else a welcome thread.

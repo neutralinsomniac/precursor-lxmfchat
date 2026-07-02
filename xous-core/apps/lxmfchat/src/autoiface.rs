@@ -13,7 +13,7 @@ use reticulum_core::autointerface::{discovery_token, group_discovery_address};
 use reticulum_core::transport::PathIface;
 use xous::CID;
 
-use crate::net::{Shared, plock};
+use crate::net::{HB_ANNOUNCE, HB_DATA_RX, HB_DISC_MC, HB_DISC_UC, Shared, hb_beat, plock};
 
 const GROUP_ID: &[u8] = b"reticulum";
 const DISCOVERY_PORT: u16 = 29716;
@@ -192,9 +192,9 @@ pub fn start(shared: &Arc<Shared>, chat_cid: CID) -> bool {
     shared.auto_enabled.store(true, Ordering::SeqCst);
 
     let s = shared.clone();
-    std::thread::spawn(move || discovery_rx(s, chat_cid, discovery_sock));
+    std::thread::spawn(move || discovery_rx(s, chat_cid, discovery_sock, HB_DISC_MC));
     let s = shared.clone();
-    std::thread::spawn(move || discovery_rx(s, chat_cid, unicast_disc_sock));
+    std::thread::spawn(move || discovery_rx(s, chat_cid, unicast_disc_sock, HB_DISC_UC));
     let s = shared.clone();
     std::thread::spawn(move || data_rx(s, chat_cid, data_sock));
     let s = shared.clone();
@@ -242,11 +242,24 @@ pub fn stop(shared: &Arc<Shared>, chat_cid: CID) {
 
 pub fn enabled(shared: &Arc<Shared>) -> bool { shared.auto_enabled.load(Ordering::SeqCst) }
 
-fn discovery_rx(shared: Arc<Shared>, chat_cid: CID, sock: UdpSocket) {
+fn discovery_rx(shared: Arc<Shared>, chat_cid: CID, sock: UdpSocket, hb_slot: usize) {
+    // A bounded read turns the blocking recv into a liveness tick: each pass
+    // (data or timeout) stamps the heartbeat, so the keepalive thread can tell
+    // "quiet network" apart from "this thread is dead".
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(10))).ok();
     let mut buf = [0u8; 1024];
     loop {
+        hb_beat(&shared, hb_slot);
         let (n, src) = match sock.recv_from(&mut buf) {
             Ok(v) => v,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
             Err(_) => {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 continue;
@@ -299,10 +312,21 @@ fn data_rx(shared: Arc<Shared>, chat_cid: CID, sock: UdpSocket) {
             return;
         }
     };
+    // Bounded read for the same liveness-tick reason as discovery_rx.
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(10))).ok();
     let mut buf = [0u8; HW_MTU + 64];
     loop {
+        hb_beat(&shared, HB_DATA_RX);
         let (n, src) = match sock.recv_from(&mut buf) {
             Ok(v) => v,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
             Err(_) => {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 continue;
@@ -336,6 +360,7 @@ fn announce_loop(shared: Arc<Shared>, chat_cid: CID, group: Ipv6Addr) {
     let mut last_rejoin: u64 = 0;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
+        hb_beat(&shared, HB_ANNOUNCE);
         if !enabled(&shared) {
             continue;
         }

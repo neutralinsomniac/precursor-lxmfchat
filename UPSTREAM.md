@@ -197,6 +197,48 @@ path).
   waiting for the inactivity timer. (Behaviorally a latency fix, not a
   correctness one — the join always happened eventually.)
 
+### 14. services/net: socket read/write timeouts never fire while the link is quiet
+The `NetPump` handler early-returned when `iface.poll()` reported no readiness
+change (`if !iface.poll(..) { continue; }`) — but the waiter scan it skipped is
+also the only place `expiry` deadlines are evaluated. On an idle or stalled
+link, poll() returns false on every 900 ms self-pump, so a blocked
+`recv_timeout`/`send` with a timeout simply never returned: reconnect
+watchdogs built on socket timeouts silently never ran, converting any
+transient RX stall into a permanent app-level hang. (This is the mechanism
+that made several of the wifi-drop failure modes *unrecoverable* instead of
+transient.)
+- Local fix: run the waiter/expiry scan on every pump regardless of poll()'s
+  return value (the scan is a few small arrays; cost is negligible).
+
+### 15. services/net + com: silent-drop hardening from the wifi-drop investigation
+A cluster of local fixes (July 2026) after diagnosing random silent drops of
+all connectivity; each is PR material in its own right:
+- `WlanTxErr`/`WlanRxErr` were never unmasked in `set_com_ints` and had no
+  handler arm — a wedged WF200 TX queue was invisible (see the EC section).
+  Now unmasked, logged, and counted.
+- The connection-manager watchdog treated DHCP `Renewing`/`Rebinding` as a
+  mismatch and tore down a healthy link mid-renewal (RFC 2131: the lease is
+  still valid). Now treated as healthy.
+- The Connected-but-silent watchdog branch only force-drained interrupts and
+  never escalated — a zombie association (AP deauth the WF200 never reported)
+  was permanent. Now escalates to `wlan_leave` + reset after 2 fruitless
+  drains.
+- Watchdog liveness was keyed on ANY `WlanRxReady` (broadcast chatter blinds
+  it to unicast-only deafness / TX death). Added a unicast TX-vs-RX zombie
+  detector in the connection manager, fed by per-direction unicast frame
+  counters in the device layer.
+- The COM server never issued `LINK_SYNC` at runtime: one slow EC reply
+  skewed the reply FIFO and every later multi-word read (RX frames, interrupt
+  vectors) decoded as garbage until a wifi toggle. Timed-out reads now mark
+  the link stale and the main loop resyncs (+ ping verify) before the next
+  opcode.
+- The vendored smoltcp neighbor-cache patch (`11fbe44`) had shipped only half
+  the fix: `lookup()` never returned the `StaleProbe` answer the dispatch code
+  was written for, so an expired entry still blocked all egress to that
+  neighbor (gateway ⇒ every TCP flow; LL peer ⇒ local UDP) pending a full
+  ARP/NS round trip over the lossy RX path. The stale-while-revalidate lookup
+  half now exists (covered by `test_stale_while_revalidate`).
+
 ## betrusted-io / betrusted-ec
 
 ### EC net bridge drops all IPv6 — no IPv6 connectivity possible on Precursor wifi

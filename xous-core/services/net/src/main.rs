@@ -46,6 +46,17 @@ pub static IPV4_ADDRESS: AtomicU32 = AtomicU32::new(0);
 // stash the MAC address for inserstion as a loopback target. Coded as big-end bytes.
 pub static MAC_ADDRESS_LSB: AtomicU32 = AtomicU32::new(0);
 pub static MAC_ADDRESS_MSB: AtomicU16 = AtomicU16::new(0);
+/// Rolling counts of *unicast* frames actually fetched from / handed to the radio
+/// (loopback excluded). Raw WlanRxReady interrupts are a bad liveness signal: broadcast
+/// ARP chatter and multicast beacons keep arriving from a link whose unicast path is
+/// dead (TX blackhole, rekey desync), blinding any watchdog keyed on them. The
+/// connection manager compares these instead: unicast TX advancing while unicast RX
+/// stands still means we're talking and nobody answers.
+pub static UNICAST_RX_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static UNICAST_TX_COUNT: AtomicU32 = AtomicU32::new(0);
+/// WF200/EC transmit-error interrupts seen (frames the radio rejected after we handed
+/// them over). Surfaced so TX death is no longer invisible.
+pub static WLAN_TX_ERR_COUNT: AtomicU32 = AtomicU32::new(0);
 
 const PING_DEFAULT_TIMEOUT_MS: u32 = 10_000;
 const PING_IDENT: u16 = 0x22b;
@@ -156,6 +167,11 @@ fn set_com_ints(com_int_list: &mut Vec<ComIntSources>) {
     com_int_list.push(ComIntSources::WlanSsidScanUpdate);
     com_int_list.push(ComIntSources::WlanSsidScanFinished);
     com_int_list.push(ComIntSources::WfxErr);
+    // TX/RX error interrupts were historically masked, making a wedged radio TX queue
+    // (EC-side SendFrameErr) totally invisible to the host: frames silently evaporate
+    // while the link reads Connected. Unmask them so failures at least log and count.
+    com_int_list.push(ComIntSources::WlanTxErr);
+    com_int_list.push(ComIntSources::WlanRxErr);
     com_int_list.push(ComIntSources::Invalid);
 }
 
@@ -1261,6 +1277,16 @@ fn main() -> ! {
                                         }
                                     }
                                 }
+                                ComIntSources::WlanTxErr => {
+                                    let errs = WLAN_TX_ERR_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                                    log::warn!(
+                                        "WF200 rejected a transmit frame (total tx errs: {})",
+                                        errs
+                                    );
+                                }
+                                ComIntSources::WlanRxErr => {
+                                    log::warn!("WF200 reported a receive error");
+                                }
                                 ComIntSources::Invalid => {
                                     com.ints_ack(&com_int_list); // ack everything that's pending
                                     // re-enable the interrupts as we intended
@@ -1321,10 +1347,15 @@ fn main() -> ! {
                 log::trace!("NetPump");
                 let now = timer.elapsed_ms();
                 let timestamp = Instant::from_millis(now as i64);
+                // NOTE: do NOT early-exit when poll() reports no readiness change. All the
+                // waiter processing below doubles as the *timeout* path (`expiry` checks) —
+                // on a stalled or idle link poll() returns false on every 900ms self-pump,
+                // and skipping the scan meant read/write timeouts NEVER fired: a blocked
+                // recv_timeout hung forever, so app-level reconnect watchdogs built on
+                // socket timeouts silently never ran. The scan is cheap (a few small
+                // arrays); run it every pump.
                 if !iface.poll(timestamp, &mut device, &mut sockets) {
-                    // nothing to do, continue on.
                     log::debug!("No change to socket readiness");
-                    continue;
                 } else {
                     log::debug!("Socket readiness changed");
                 }

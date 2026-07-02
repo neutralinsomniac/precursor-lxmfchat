@@ -154,6 +154,16 @@ impl Cache {
             if timestamp < expires_at {
                 return Answer::Found(hardware_addr);
             }
+            // Stale-while-revalidate: the entry is past its reachable lifetime
+            // but still the best answer we have. While the rate limiter is
+            // quiet, ask the caller to emit a refresh probe (deferring only
+            // that one packet); inside the silent window keep answering with
+            // the stale address so egress never blocks on the probe reply.
+            return if timestamp < self.silent_until {
+                Answer::Found(hardware_addr)
+            } else {
+                Answer::StaleProbe(hardware_addr)
+            };
         }
 
         if timestamp < self.silent_until {
@@ -220,12 +230,14 @@ mod test {
         assert!(!cache
             .lookup(&MOCK_IP_ADDR_2, Instant::from_millis(0))
             .found());
-        assert!(!cache
-            .lookup(
+        // Past the lifetime the entry goes stale, not away.
+        assert_eq!(
+            cache.lookup(
                 &MOCK_IP_ADDR_1,
                 Instant::from_millis(0) + Cache::ENTRY_LIFETIME * 2
-            )
-            .found(),);
+            ),
+            Answer::StaleProbe(HADDR_A)
+        );
 
         cache.fill(MOCK_IP_ADDR_1, HADDR_A, Instant::from_millis(0));
         assert!(!cache
@@ -242,12 +254,54 @@ mod test {
             cache.lookup(&MOCK_IP_ADDR_1, Instant::from_millis(0)),
             Answer::Found(HADDR_A)
         );
-        assert!(!cache
-            .lookup(
+        // Expiry demotes to stale (still usable) rather than dropping the entry.
+        assert_eq!(
+            cache.lookup(
                 &MOCK_IP_ADDR_1,
                 Instant::from_millis(0) + Cache::ENTRY_LIFETIME * 2
-            )
-            .found(),);
+            ),
+            Answer::StaleProbe(HADDR_A)
+        );
+    }
+
+    #[test]
+    fn test_stale_while_revalidate() {
+        let mut cache = Cache::new();
+        let expired = Instant::from_millis(0) + Cache::ENTRY_LIFETIME * 2;
+
+        cache.fill(MOCK_IP_ADDR_1, HADDR_A, Instant::from_millis(0));
+
+        // First lookup past the lifetime asks for a refresh probe.
+        assert_eq!(
+            cache.lookup(&MOCK_IP_ADDR_1, expired),
+            Answer::StaleProbe(HADDR_A)
+        );
+
+        // Once the probe is out (rate limiter armed), lookups keep returning
+        // the stale address so traffic never blocks on the reply...
+        cache.limit_rate(expired);
+        assert_eq!(
+            cache.lookup(&MOCK_IP_ADDR_1, expired + Duration::from_millis(100)),
+            Answer::Found(HADDR_A)
+        );
+        // ...while a genuinely unknown neighbor is still rate-limited.
+        assert_eq!(
+            cache.lookup(&MOCK_IP_ADDR_2, expired + Duration::from_millis(100)),
+            Answer::RateLimited
+        );
+
+        // When the silent window lapses without a reply, ask to probe again.
+        assert_eq!(
+            cache.lookup(&MOCK_IP_ADDR_1, expired + Cache::SILENT_TIME * 2),
+            Answer::StaleProbe(HADDR_A)
+        );
+
+        // A reply (fill or confirm) re-freshens the entry.
+        cache.confirm(HADDR_A, expired + Cache::SILENT_TIME * 2);
+        assert_eq!(
+            cache.lookup(&MOCK_IP_ADDR_1, expired + Cache::SILENT_TIME * 2),
+            Answer::Found(HADDR_A)
+        );
     }
 
     #[test]

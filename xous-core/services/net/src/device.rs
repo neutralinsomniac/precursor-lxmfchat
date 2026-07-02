@@ -12,7 +12,7 @@ use smoltcp::wire::{
     Ipv4Packet, Ipv4Repr, /* IpProtocol, TcpPacket, TcpRepr, IpAddress, UdpPacket, UdpRepr */
 };
 
-use crate::{IPV4_ADDRESS, MAC_ADDRESS_LSB, MAC_ADDRESS_MSB};
+use crate::{IPV4_ADDRESS, MAC_ADDRESS_LSB, MAC_ADDRESS_MSB, UNICAST_RX_COUNT, UNICAST_TX_COUNT};
 
 pub struct NetPhy {
     rx_buffer: [u8; NET_MTU],
@@ -80,6 +80,12 @@ impl phy::Device for NetPhy {
                 self.com
                     .wlan_fetch_packet(&mut self.rx_buffer[..rx_len as usize])
                     .expect("Couldn't call wlan_fetch_packet in device adapter");
+                // unicast destination (I/G bit clear) — the radio only delivers our own
+                // MAC as unicast, so this is "someone answered us specifically": the
+                // liveness signal the connection manager's zombie-link check keys on
+                if rx_len >= 6 && self.rx_buffer[0] & 0x01 == 0 {
+                    UNICAST_RX_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
 
                 Some((
                     NetPhyRxToken { buf: &mut self.rx_buffer[..rx_len as usize] },
@@ -397,6 +403,11 @@ impl<'a> phy::TxToken for NetPhyTxToken<'a> {
         }
         // forward the packet on if it's not a loopback (loopback will call return early and exit before
         // getting to this line)
+        if len >= 6 && self.buf[0] & 0x01 == 0 {
+            // unicast egress = a conversation that expects an answer; paired with
+            // UNICAST_RX_COUNT by the connection manager's zombie-link check
+            UNICAST_TX_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
         self.com.wlan_send_packet(&self.buf[..len]).expect("driver error sending WLAN packet");
 
         result

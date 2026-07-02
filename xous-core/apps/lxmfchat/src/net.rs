@@ -458,6 +458,27 @@ pub struct Shared {
     pub auto: Mutex<crate::autoiface::AutoState>,
     /// Atomic so the outbound hot path checks it without a lock.
     pub auto_enabled: core::sync::atomic::AtomicBool,
+    /// Per-thread liveness beats (unix secs of the thread's last loop pass,
+    /// 0 = not started), indexed by the `HB_*` constants. A net thread that
+    /// panics or wedges otherwise dies in perfect silence: the UI stays up,
+    /// sends appear to work, and its interface is a zombie until an app
+    /// restart. Every long-lived net thread stamps its slot each pass; the
+    /// keepalive thread (the only one whose loop does no blocking I/O) checks
+    /// ages and surfaces a stall on the status bar.
+    pub hb: [core::sync::atomic::AtomicU32; HB_COUNT],
+}
+
+/// Heartbeat slots in [`Shared::hb`].
+pub const HB_HUB_MGR: usize = 0; // connection_manager (also the hub read loop)
+pub const HB_DATA_RX: usize = 1; // autoiface data_rx (inbound local packets)
+pub const HB_DISC_MC: usize = 2; // autoiface multicast discovery_rx
+pub const HB_DISC_UC: usize = 3; // autoiface unicast (reverse-peering) discovery_rx
+pub const HB_ANNOUNCE: usize = 4; // autoiface announce_loop (beacons + peer expiry)
+pub const HB_COUNT: usize = 5;
+
+/// Stamp a thread's liveness slot; call once per loop pass.
+pub(crate) fn hb_beat(shared: &Shared, slot: usize) {
+    shared.hb[slot].store(now_secs() as u32, core::sync::atomic::Ordering::Relaxed);
 }
 
 fn hex(b: &[u8]) -> String { reticulum_core::hex(b) }
@@ -576,6 +597,7 @@ pub fn connection_manager(shared: Arc<Shared>, chat_cid: CID) {
     // to diagnose from; this keeps the answer on screen until the next event.
     let mut last_drop: Option<String> = None;
     loop {
+        hb_beat(&shared, HB_HUB_MGR);
         if !shared.hub_enabled.load(core::sync::atomic::Ordering::SeqCst) {
             backoff = 2;
             std::thread::sleep(std::time::Duration::from_secs(3));
@@ -601,6 +623,7 @@ pub fn connection_manager(shared: Arc<Shared>, chat_cid: CID) {
         {
             let mut waited = false;
             while netmgr.get_ipv4_config().is_none() {
+                hb_beat(&shared, HB_HUB_MGR);
                 if !waited {
                     chat::cf_set_status_text(chat_cid, "waiting for wifi…");
                     waited = true;
@@ -744,6 +767,7 @@ fn read_until_closed(shared: &Arc<Shared>, chat_cid: CID, pddb: &Pddb, trng: &Tr
     // and exits the loop on its own.
     stream.set_read_timeout(Some(std::time::Duration::from_secs(15))).ok();
     loop {
+        hb_beat(shared, HB_HUB_MGR);
         // Checked on EVERY iteration, not just the timeout tick: a hub that
         // floods continuously (a full interface's announce stream) keeps every
         // read returning data, so the timeout branch alone never runs — a
@@ -1766,6 +1790,22 @@ pub fn keepalive_thread(shared: Arc<Shared>, chat_cid: CID) {
         // watchdog off rather than reconnect-loop on a healthy quiet hub.
         log::error!("keepalive: TRNG init failed — liveness probing disabled");
     }
+    // 5. THREAD-DEATH DETECTOR (every tick): every long-lived net thread stamps
+    //    a heartbeat slot each loop pass (the blocking RX threads read with a
+    //    10 s timeout so quiet ≠ silent). A thread that panics — e.g. one
+    //    malformed frame taking down handle_frame, which BOTH the hub read loop
+    //    and the local data_rx feed — or wedges on a poisoned lock dies in
+    //    perfect silence otherwise: the UI stays up and its interface is a
+    //    zombie until an app restart. We can't restart a thread whose sockets
+    //    died with it, but we can say so instead of dropping messages mutely.
+    const HB_WATCH: [(&str, usize, u32); HB_COUNT] = [
+        ("hub manager", HB_HUB_MGR, 120),
+        ("local data rx", HB_DATA_RX, 60),
+        ("local discovery", HB_DISC_MC, 60),
+        ("local reverse discovery", HB_DISC_UC, 60),
+        ("local announce", HB_ANNOUNCE, 60),
+    ];
+    let mut hb_warned: [u32; HB_COUNT] = [0; HB_COUNT];
     let mut ticks: u64 = 0;
     let mut last_wall = now_secs();
     let mut last_probe: u32 = 0;
@@ -1775,10 +1815,40 @@ pub fn keepalive_thread(shared: Arc<Shared>, chat_cid: CID) {
         let now = now_secs();
         let gap = now.saturating_sub(last_wall);
         last_wall = now;
-        if gap > SUSPEND_GAP_SECS && shared.connected.load(Ordering::SeqCst) {
-            log::warn!("woke from suspend (clock jumped {gap}s) — reconnecting to the hub");
-            force_reconnect(&shared, chat_cid, "woke from sleep — reconnecting…", "woke from sleep");
-            continue;
+        if gap > SUSPEND_GAP_SECS {
+            // Wall clock jumped across a suspend: every heartbeat predates the
+            // sleep and would read as a stall. Re-stamp them all; a genuinely
+            // dead thread re-trips its threshold within a minute.
+            for h in shared.hb.iter() {
+                h.store(now as u32, Ordering::Relaxed);
+            }
+            if shared.connected.load(Ordering::SeqCst) {
+                log::warn!("woke from suspend (clock jumped {gap}s) — reconnecting to the hub");
+                force_reconnect(
+                    &shared,
+                    chat_cid,
+                    "woke from sleep — reconnecting…",
+                    "woke from sleep",
+                );
+                continue;
+            }
+        }
+        for (i, (name, slot, max_age)) in HB_WATCH.iter().enumerate() {
+            let beat = shared.hb[*slot].load(Ordering::Relaxed);
+            if beat == 0 {
+                continue; // thread not started (e.g. autoiface never enabled)
+            }
+            let age = (now as u32).saturating_sub(beat);
+            if age > *max_age && (now as u32).saturating_sub(hb_warned[i]) > 300 {
+                hb_warned[i] = now as u32;
+                log::error!(
+                    "net thread '{name}' hasn't run for {age}s — it likely died (panic/wedge); its interface is down until the app restarts"
+                );
+                chat::cf_set_status_text(
+                    chat_cid,
+                    &format!("\u{26a0} {name} thread stalled ({age}s) — restart app if this persists"),
+                );
+            }
         }
         let started = shared.write_started.load(Ordering::SeqCst);
         if started != 0 && (now as u32).saturating_sub(started) > WRITE_STUCK_SECS {
@@ -1890,7 +1960,12 @@ pub(crate) fn force_reconnect(shared: &Arc<Shared>, chat_cid: CID, status: &str,
     use core::sync::atomic::Ordering;
     note_disconnect(shared, reason.to_string());
     chat::cf_set_status_text(chat_cid, status);
-    shared.write_started.store(0, Ordering::SeqCst);
+    // Deliberately do NOT clear `write_started` here: only the writer itself clears it,
+    // when its write_all() returns (hub_write). If the stuck write survives the shutdown
+    // below (shutdown demonstrably may not unblock a wedged socket), a zeroed flag would
+    // disarm the stuck-write watchdog for good — the writer mutex stays held, the manager
+    // wedges re-arming `shared.writer`, and no reconnect ever completes. Left armed, the
+    // watchdog re-fires each tick and keeps re-shooting the socket until the write dies.
     shared.connected.store(false, Ordering::SeqCst);
     if let Some(c) = plock(&shared.ctl).take() {
         c.shutdown(std::net::Shutdown::Both).ok();

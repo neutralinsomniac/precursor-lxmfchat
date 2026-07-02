@@ -13,6 +13,7 @@ use xous_ipc::Buffer;
 
 use crate::ComIntSources;
 use crate::api::*;
+use crate::{UNICAST_RX_COUNT, UNICAST_TX_COUNT};
 
 #[allow(dead_code)]
 const BOOT_POLL_INTERVAL_MS: usize = 4_758; // a slightly faster poll during boot so we acquire wifi faster once PDDB is mounted
@@ -21,6 +22,10 @@ const BOOT_POLL_INTERVAL_MS: usize = 4_758; // a slightly faster poll during boo
 #[allow(dead_code)]
 const POLL_INTERVAL_MS: usize = 7_151; // stagger slightly off of an integer-seconds interval to even out loads. impacts rssi update frequency.
 const INTERVALS_BEFORE_RETRY: usize = 3; // how many poll intervals we'll wait before we give up and try a new AP
+const SILENT_POLLS_BEFORE_REASSOCIATE: usize = 2; // forced interrupt-drains allowed before a silent-but-Connected link is torn down and re-associated
+const UNICAST_STALL_POLLS_BEFORE_REASSOCIATE: usize = 12; // ~86s of unicast TX with zero unicast RX before we declare the link a zombie
+const UNICAST_STALL_IDLE_POLLS: usize = 3; // demand gaps longer than this void a partial zombie verdict
+const ZOMBIE_ESCALATION_COOLDOWN: Duration = Duration::from_secs(300); // min spacing of zombie-triggered reassociations (limits flapping on false positives)
 const SCAN_COUNT_MAX: usize = 5;
 const SSID_SCAN_AGING_THRESHOLD: Duration = Duration::from_secs(5); // time before a scan is considered "stale" and needs to be redone
 const SSID_RESULT_AGING_THRESHOLD: Duration = Duration::from_secs(60); // time before an individual scan result is retired for being "too rarely seen"
@@ -109,6 +114,19 @@ pub(crate) fn connection_manager(sid: xous::SID, activity_interval: Arc<AtomicU3
     let mut mounted = false;
     let current_interval = Arc::new(AtomicU32::new(BOOT_POLL_INTERVAL_MS as u32));
     let mut intervals_without_activity = 0;
+    // consecutive watchdog rounds where the link read Connected+Bound yet RX stayed silent even
+    // after a forced interrupt drain; past SILENT_POLLS_BEFORE_REASSOCIATE we tear down and rejoin
+    let mut silent_forced_polls = 0;
+    // zombie-link detector state: the silence watchdog above is blinded by broadcast/multicast
+    // chatter (any WlanRxReady resets the activity timer), so a link whose *unicast* path is dead
+    // — TX blackhole, rekey desync, AP-side deauth the WF200 never reported — evades it while
+    // both the hub TCP and local peering silently die. Compare unicast TX/RX frame counts
+    // instead: TX advancing for many polls while RX stands still means nobody can answer us.
+    let mut last_unicast_tx = UNICAST_TX_COUNT.load(Ordering::Relaxed);
+    let mut last_unicast_rx = UNICAST_RX_COUNT.load(Ordering::Relaxed);
+    let mut unicast_stalled_polls = 0;
+    let mut unicast_idle_polls = 0;
+    let mut last_zombie_escalation: Option<Instant> = None;
     let mut wifi_stats_cache: WlanStatus = WlanStatus::from_ipc(WlanStatusIpc::default());
     let mut status_subscribers = HashMap::<xous::CID, WifiStateSubscription>::new();
     let mut wifi_state = WifiState::Unknown;
@@ -412,34 +430,88 @@ pub(crate) fn connection_manager(sid: xous::SID, activity_interval: Arc<AtomicU3
                         // if the EC reset itself otherwise
                         if intervals_without_activity > 3 {
                             // we'd expect at least an ARP or something...
-                            wifi_stats_cache = com.wlan_status().unwrap();
-                            if wifi_stats_cache.link_state != com_rs::LinkState::Connected {
-                                if wifi_stats_cache.link_state == com_rs::LinkState::WFXError {
-                                    log::info!("WFX chipset error detected, resetting WF200");
-                                    com.wifi_reset().expect("couldn't reset the wf200 chip");
+                            match com.wlan_status() {
+                                Ok(status) => {
+                                    wifi_stats_cache = status;
+                                    if wifi_stats_cache.link_state != com_rs::LinkState::Connected {
+                                        if wifi_stats_cache.link_state == com_rs::LinkState::WFXError {
+                                            log::info!("WFX chipset error detected, resetting WF200");
+                                            if let Err(e) = com.wifi_reset() {
+                                                log::warn!("couldn't reset the wf200 chip: {:?}", e);
+                                            }
+                                        }
+                                        log::info!(
+                                            "Link state mismatch: moving state to disconnected ({:?})",
+                                            wifi_stats_cache.link_state
+                                        );
+                                        silent_forced_polls = 0;
+                                        netmgr.reset();
+                                    } else if !matches!(
+                                        wifi_stats_cache.ipv4.dhcp,
+                                        com_rs::DhcpState::Bound
+                                            | com_rs::DhcpState::Renewing
+                                            | com_rs::DhcpState::Rebinding
+                                    ) {
+                                        // Renewing/Rebinding are NOT mismatches: per RFC 2131 the
+                                        // lease remains fully valid while the EC's client renews,
+                                        // and an idle network can easily be silent for our whole
+                                        // detection window right as a renewal is in flight —
+                                        // resetting here tore down a healthy link.
+                                        log::info!(
+                                            "DHCP state mismatch: moving state to disconnected ({:?})",
+                                            wifi_stats_cache.ipv4.dhcp
+                                        );
+                                        silent_forced_polls = 0;
+                                        netmgr.reset();
+                                    } else if silent_forced_polls < SILENT_POLLS_BEFORE_REASSOCIATE {
+                                        // Link reads Connected and DHCP is Bound, yet we've
+                                        // seen no inbound activity for several intervals. The
+                                        // usual cause is a lost SoC<->EC RX-interrupt edge:
+                                        // frames (e.g. the gateway's ARP reply, which all hub
+                                        // TX waits on once the neighbor entry lapses) sit
+                                        // undrained in the EC with no further notification.
+                                        // Force one interrupt poll to drain them, recovering
+                                        // without the cost of a full reset/reassociate.
+                                        silent_forced_polls += 1;
+                                        log::info!(
+                                            "link Connected but silent; forcing a COM interrupt poll ({}/{})",
+                                            silent_forced_polls,
+                                            SILENT_POLLS_BEFORE_REASSOCIATE
+                                        );
+                                        netmgr.poll_com_interrupts();
+                                    } else {
+                                        // Forced drains didn't bring RX back: the association is
+                                        // a zombie (e.g. the AP deauthed us but the WF200 never
+                                        // delivered a Disconnect event, a rekey desync, or a
+                                        // wedged radio queue). The EC will keep reporting
+                                        // Connected+Bound forever, so nothing below us will ever
+                                        // recover — tear the link down and re-associate.
+                                        silent_forced_polls = 0;
+                                        log::warn!(
+                                            "link still silent after {} forced polls; leaving and re-associating",
+                                            SILENT_POLLS_BEFORE_REASSOCIATE
+                                        );
+                                        if let Err(e) = com.wlan_leave() {
+                                            log::warn!("couldn't issue leave command: {:?}", e);
+                                        }
+                                        netmgr.reset();
+                                        // don't rely on the EcReset round-trip (it's a lossy
+                                        // try_send): drive our own state machine to rejoin,
+                                        // mirroring the Disconnect-interrupt arm
+                                        ssid_list.clear();
+                                        if let Err(e) = com.set_ssid_scanning(true) {
+                                            log::warn!("couldn't restart SSID scan: {:?}", e);
+                                        } else {
+                                            scan_state = SsidScanState::Scanning;
+                                        }
+                                        wifi_state = WifiState::Disconnected;
+                                    }
                                 }
-                                log::info!(
-                                    "Link state mismatch: moving state to disconnected ({:?})",
-                                    wifi_stats_cache.link_state
-                                );
-                                netmgr.reset();
-                            } else if wifi_stats_cache.ipv4.dhcp != com_rs::DhcpState::Bound {
-                                log::info!(
-                                    "DHCP state mismatch: moving state to disconnected ({:?})",
-                                    wifi_stats_cache.ipv4.dhcp
-                                );
-                                netmgr.reset();
-                            } else {
-                                // Link reads Connected and DHCP is Bound, yet we've
-                                // seen no inbound activity for several intervals. The
-                                // usual cause is a lost SoC<->EC RX-interrupt edge:
-                                // frames (e.g. the gateway's ARP reply, which all hub
-                                // TX waits on once the neighbor entry lapses) sit
-                                // undrained in the EC with no further notification.
-                                // Force one interrupt poll to drain them, recovering
-                                // without the cost of a full reset/reassociate.
-                                log::info!("link Connected but silent; forcing a COM interrupt poll");
-                                netmgr.poll_com_interrupts();
+                                Err(e) => {
+                                    // don't let an EC hiccup panic the watchdog thread; a dead
+                                    // connection manager means no recovery path at all
+                                    log::warn!("watchdog couldn't read wlan status ({:?}); skipping this pass", e);
+                                }
                             }
                             intervals_without_activity = 0;
                         }
@@ -598,6 +670,66 @@ pub(crate) fn connection_manager(sid: xous::SID, activity_interval: Arc<AtomicU3
                     last_wifi_state = wifi_state;
                 } else {
                     intervals_without_activity = 0;
+                    silent_forced_polls = 0;
+                }
+
+                // Zombie-link detector: runs on EVERY poll tick, deliberately outside the
+                // activity_timeout gate above — broadcast/multicast RX keeps that gate shut
+                // on exactly the failures this catches (unicast-only deafness / TX death).
+                if wifi_state == WifiState::Connected && rev_ok {
+                    let tx_now = UNICAST_TX_COUNT.load(Ordering::Relaxed);
+                    let rx_now = UNICAST_RX_COUNT.load(Ordering::Relaxed);
+                    if rx_now != last_unicast_rx {
+                        // someone answered us: the unicast path is alive
+                        unicast_stalled_polls = 0;
+                        unicast_idle_polls = 0;
+                    } else if tx_now != last_unicast_tx {
+                        unicast_stalled_polls += 1;
+                        unicast_idle_polls = 0;
+                        if unicast_stalled_polls > UNICAST_STALL_POLLS_BEFORE_REASSOCIATE {
+                            unicast_stalled_polls = 0;
+                            let cooled_down = last_zombie_escalation
+                                .map(|t| t.elapsed() >= ZOMBIE_ESCALATION_COOLDOWN)
+                                .unwrap_or(true);
+                            if cooled_down {
+                                last_zombie_escalation = Some(Instant::now());
+                                log::warn!(
+                                    "unicast TX flowing but zero unicast RX for {} polls; link is a zombie — re-associating",
+                                    UNICAST_STALL_POLLS_BEFORE_REASSOCIATE
+                                );
+                                if let Err(e) = com.wlan_leave() {
+                                    log::warn!("couldn't issue leave command: {:?}", e);
+                                }
+                                netmgr.reset();
+                                ssid_list.clear();
+                                if let Err(e) = com.set_ssid_scanning(true) {
+                                    log::warn!("couldn't restart SSID scan: {:?}", e);
+                                } else {
+                                    scan_state = SsidScanState::Scanning;
+                                }
+                                wifi_state = WifiState::Disconnected;
+                            } else {
+                                log::warn!(
+                                    "unicast stall persists but last re-associate was <{}s ago; holding off",
+                                    ZOMBIE_ESCALATION_COOLDOWN.as_secs()
+                                );
+                            }
+                        }
+                    } else {
+                        // no unicast demand this tick: no evidence either way, but a verdict
+                        // built on stale demand shouldn't survive a long quiet gap
+                        unicast_idle_polls += 1;
+                        if unicast_idle_polls > UNICAST_STALL_IDLE_POLLS {
+                            unicast_stalled_polls = 0;
+                        }
+                    }
+                    last_unicast_tx = tx_now;
+                    last_unicast_rx = rx_now;
+                } else {
+                    unicast_stalled_polls = 0;
+                    unicast_idle_polls = 0;
+                    last_unicast_tx = UNICAST_TX_COUNT.load(Ordering::Relaxed);
+                    last_unicast_rx = UNICAST_RX_COUNT.load(Ordering::Relaxed);
                 }
 
                 if wifi_state == WifiState::Connected {
@@ -723,6 +855,7 @@ pub(crate) fn connection_manager(sid: xous::SID, activity_interval: Arc<AtomicU3
                 com.set_ssid_scanning(true).unwrap();
                 scan_state = SsidScanState::Scanning;
                 intervals_without_activity = 0;
+                silent_forced_polls = 0;
                 scan_count = 0;
                 // this will force the UI to transition from 'WiFi Off' -> 'Not connected'
                 wifi_stats_cache = WlanStatus {
@@ -824,6 +957,7 @@ pub(crate) fn connection_manager(sid: xous::SID, activity_interval: Arc<AtomicU3
                 com.set_ssid_scanning(true).unwrap();
                 scan_state = SsidScanState::Scanning;
                 intervals_without_activity = 0;
+                silent_forced_polls = 0;
                 scan_count = 0;
             }),
             Some(ConnectionManagerOpcode::Quit) => msg_blocking_scalar_unpack!(msg, _, _, _, _, {
