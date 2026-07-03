@@ -338,6 +338,13 @@ impl<'a> LxmfChat<'a> {
             let susres = self.shared.clone();
             let susres_cid = self.chat_cid;
             std::thread::spawn(move || net::suspend_resume_thread(susres, susres_cid));
+            // Subscribe to wifi state pushes so an AP switch / reconnect redials
+            // the hub and refreshes local peering immediately, instead of waiting
+            // for the dead socket to be noticed (hardware-only: hosted mode rides
+            // the host OS network and gets no wifi events).
+            let watch = self.shared.clone();
+            let watch_cid = self.chat_cid;
+            std::thread::spawn(move || net::wifi_watch_thread(watch, watch_cid));
         }
         if read_string(&self.pddb, KEY_AUTOIFACE).as_deref() == Some("1") {
             autoiface::start_background(&self.shared, self.chat_cid);

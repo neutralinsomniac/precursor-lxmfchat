@@ -2015,6 +2015,98 @@ pub fn suspend_resume_thread(shared: Arc<Shared>, chat_cid: CID) {
     }
 }
 
+/// React to wifi link transitions pushed by the net service's connection
+/// manager — the same subscription feed the status bar uses. An AP switch or
+/// reconnect otherwise surfaces only indirectly: the hub TCP socket dies and
+/// the keepalive's silence probe notices minutes later, and local peering
+/// re-forms only after stale peers age out. Subscribed, we hear about the
+/// transition within one status push: redial the hub right away and clear the
+/// local peer map, which makes the AutoInterface re-join its multicast group
+/// on its next tick and re-run discovery — each rediscovered peer then gets
+/// our deferred re-announce, and the hub reconnect re-announces us there.
+#[cfg(target_os = "xous")]
+pub fn wifi_watch_thread(shared: Arc<Shared>, chat_cid: CID) {
+    use core::sync::atomic::Ordering;
+    const OP_UPDATE: u32 = 0;
+    let sid = xous::create_server().expect("wifi watch: couldn't create server");
+    let cb_cid = xous::connect(sid).unwrap();
+    // Held for the thread's lifetime: NetManager's Drop unsubscribes us.
+    let mut netmgr = net::NetManager::new();
+    if let Err(e) = netmgr.wifi_state_subscribe(cb_cid, OP_UPDATE) {
+        log::error!("wifi watch: subscribe failed ({:?}); AP-switch reaction disabled", e);
+        return;
+    }
+    // The (ssid, address) identity of the last known-up link; None while down.
+    let mut last_up: Option<(String, [u8; 4])> = None;
+    // Whether we've received any update yet: the very first push after boot
+    // describes a link the connection manager is already dialing into, so it
+    // must not trigger a redial of its own.
+    let mut ever_seen = false;
+    let mut last_reaction: u64 = 0;
+    loop {
+        let msg = xous::receive_message(sid).unwrap();
+        if msg.body.id() as u32 != OP_UPDATE {
+            continue;
+        }
+        let status = {
+            let Some(mem) = msg.body.memory_message() else { continue };
+            let buffer = unsafe { Buffer::from_memory_message(mem) };
+            match buffer.to_original::<com::WlanStatusIpc, _>() {
+                Ok(ipc) => com::WlanStatus::from_ipc(ipc),
+                Err(_) => continue,
+            }
+        };
+        // return the lent page to the relay before doing any slow reaction
+        drop(msg);
+        let up = status.link_state == com_rs::LinkState::Connected
+            && matches!(
+                status.ipv4.dhcp,
+                com_rs::DhcpState::Bound | com_rs::DhcpState::Renewing | com_rs::DhcpState::Rebinding
+            );
+        if up {
+            let cur = (
+                status.ssid.as_ref().map(|s| s.name.clone()).unwrap_or_default(),
+                status.ipv4.addr,
+            );
+            // RSSI-only pushes leave (ssid, addr) unchanged and are ignored.
+            let is_transition = match &last_up {
+                Some(prev) => *prev != cur,
+                None => ever_seen, // down -> up, but not the boot-time first push
+            };
+            // rate-limit so a flapping link can't turn into a redial storm
+            if is_transition && now_secs().saturating_sub(last_reaction) > 10 {
+                last_reaction = now_secs();
+                log::info!(
+                    "wifi transition: now on '{}' at {:?} (was {:?}) — redialing hub, refreshing local peers",
+                    cur.0,
+                    cur.1,
+                    last_up
+                );
+                // Peers heard on the old network are stale; an empty map fires
+                // the peerless multicast re-join on the announce loop's next tick.
+                plock(&shared.auto).peers.clear();
+                if shared.hub_enabled.load(Ordering::SeqCst) && shared.connected.load(Ordering::SeqCst) {
+                    force_reconnect(
+                        &shared,
+                        chat_cid,
+                        "wifi changed — redialing hub…",
+                        "wifi network changed",
+                    );
+                }
+                // If the hub is currently disconnected the manager's retry loop
+                // redials on its own now that the interface is back.
+            }
+            last_up = Some(cur);
+        } else {
+            if last_up.is_some() {
+                log::info!("wifi link down ({:?}, dhcp {:?})", status.link_state, status.ipv4.dhcp);
+            }
+            last_up = None;
+        }
+        ever_seen = true;
+    }
+}
+
 pub(crate) fn force_reconnect(shared: &Arc<Shared>, chat_cid: CID, status: &str, reason: &str) {
     use core::sync::atomic::Ordering;
     note_disconnect(shared, reason.to_string());
